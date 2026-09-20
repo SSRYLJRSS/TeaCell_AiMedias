@@ -14,6 +14,7 @@ import { useHoverIntent } from "@/hooks/useHoverIntent";
 import { useDoubleAction } from "@/hooks/useDoubleAction";
 import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
 import { acquireVideoSlot } from "@/utils/videoSlot";
+import { displayBasename } from "@/utils/pathDisplay";
 import { useAppearance } from "@/hooks/useAppearance";
 import { CELL_STEPS } from "@/types/settings";
 import { currentAppearance, useSettingsStore } from "@/stores/settingsStore";
@@ -29,7 +30,8 @@ export function formatSize(bytes: number): string {
 }
 
 function fileName(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
+  // X-18：分隔符按平台判定，Unix 反斜杠是合法文件名字符
+  return displayBasename(path);
 }
 
 /** 懒加载缩略图：进入视口才请求，淡入过渡；失败显示类型占位。

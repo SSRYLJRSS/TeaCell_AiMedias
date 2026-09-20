@@ -8,6 +8,7 @@ import Button from "@/components/common/Button";
 import ProgressBar from "@/components/common/ProgressBar";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
+import { displayBasename } from "@/utils/pathDisplay";
 import { openFileExternal } from "@/api/import";
 import {
   cancelImport,
@@ -210,7 +211,11 @@ export default function ImportPage() {
             onChange={setRenamePattern}
             disabled={!libraryRoot}
             collection={collection.trim()}
-            sampleStem={plan?.items[0]?.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ?? ""}
+            sampleStem={
+            plan?.items[0]?.path
+              ? displayBasename(plan.items[0].path).replace(/\.[^.]+$/, "")
+              : ""
+          }
             sampleExt={plan?.items[0]?.path.split(".").pop() ?? ""}
           />
         </div>

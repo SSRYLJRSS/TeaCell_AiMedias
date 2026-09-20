@@ -9,6 +9,7 @@ import { useShallow } from "zustand/react/shallow";
 import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
+import { displayBasename } from "@/utils/pathDisplay";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
 import { backupDb, clearThumbnailCache, exportDiagnostics, getDataDir, openDataDir, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
@@ -1486,7 +1487,7 @@ function BackupRestorePanel({ notify, fail }: { notify: (m: string) => void; fai
       {confirmStep === 1 && picked && (
         <div className="rounded-md border border-[var(--color-danger)] px-3 py-2 text-xs leading-5">
           <p className="font-medium text-[var(--color-danger)]">
-            即将用备份文件覆盖当前素材库：{picked.split(/[\\/]/).pop()}
+            即将用备份文件覆盖当前素材库：{displayBasename(picked)}
           </p>
           <p className="mt-1 text-[var(--color-text-secondary)]">
             当前库里「备份之后」新做的入库、打标、评级等改动会全部丢失。有运行中的入库/导出/打标任务时恢复会被拒绝。建议先点「备份数据库」存一份当前状态。

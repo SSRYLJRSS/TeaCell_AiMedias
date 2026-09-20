@@ -9,6 +9,7 @@
  */
 import clsx from "clsx";
 import ProgressBar from "@/components/common/ProgressBar";
+import { displayBasename } from "@/utils/pathDisplay";
 import type { AiTaggingUiState } from "@/types/ai";
 
 export function aiLedText(state: AiTaggingUiState, currentAssetName?: string | null): string | null {
@@ -38,9 +39,10 @@ function isScrollingPhase(state: AiTaggingUiState): boolean {
   return state.phase === "starting" || state.phase === "running";
 }
 
-/** 由 assetPath 取文件名（页面层使用，避免组件内重复拆分逻辑） */
+/** 由 assetPath 取文件名（页面层使用，避免组件内重复拆分逻辑）。
+ *  X-18：分隔符按平台判定，Unix 反斜杠是合法文件名字符，不能一律当分隔符。 */
 export function assetFileLabel(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
+  return displayBasename(path);
 }
 
 export default function AiTaggingProgress({

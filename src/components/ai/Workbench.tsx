@@ -10,6 +10,7 @@ import TagChip from "@/components/library/TagChip";
 import FacetTagInput from "@/components/ai/FacetTagInput";
 import { getAsset } from "@/api/assets";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
+import { displayBasename } from "@/utils/pathDisplay";
 import type { AiSuggestion, CategorizedTags } from "@/types/ai";
 import type { Asset } from "@/types/asset";
 import type { WorkbenchFacet } from "@/types/tag";
@@ -168,7 +169,7 @@ export default function Workbench({
   };
 
   const totalTags = Object.values(tags).reduce((n, l) => n + l.length, 0);
-  const fileName = s.assetPath.split(/[\\/]/).pop() ?? s.assetPath;
+  const fileName = displayBasename(s.assetPath);
   const exif = exifLine(asset);
 
   const handleConfirm = useCallback(async () => {

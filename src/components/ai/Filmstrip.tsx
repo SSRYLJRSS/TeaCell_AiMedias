@@ -6,6 +6,7 @@ import clsx from "clsx";
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
+import { displayBasename } from "@/utils/pathDisplay";
 import type { AiSuggestion } from "@/types/ai";
 
 interface FilmstripProps {
@@ -54,7 +55,7 @@ function Thumb({ s, active, selected, onPick }: { s: AiSuggestion; active: boole
             ? "border-[var(--color-status)] opacity-100"
             : "border-transparent opacity-70 hover:opacity-100",
       )}
-      title={s.assetPath.split(/[\\/]/).pop()}
+      title={displayBasename(s.assetPath)}
     >
       {url && !failed ? (
         <img
