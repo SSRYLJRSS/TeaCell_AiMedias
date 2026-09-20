@@ -157,51 +157,109 @@ pub async fn restore_db(
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
     tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
-        let db_path = data_dir.join("library.db");
-        let old_path = data_dir.join("library.db.old");
         let mut guard = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        // 旧连接收尾：checkpoint 截断 WAL → 换入内存占位连接 → 关闭旧连接释放文件句柄
-        //（Windows 上文件被占用时 rename/copy 会失败，必须先关）
-        let old = std::mem::replace(
-            &mut *guard,
-            rusqlite::Connection::open_in_memory()
-                .map_err(|e| AppError::msg(format!("占位连接创建失败: {e}")))?,
-        );
-        let _ = old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        let _ = old.close();
-        // ④ .old 保底：覆盖失败/新库打不开时能回滚回现库
-        if old_path.exists() {
-            let _ = std::fs::remove_file(&old_path);
-        }
-        std::fs::rename(&db_path, &old_path)
-            .map_err(|e| AppError::msg(format!("现库改名保底失败: {e}")))?;
-        if let Err(e) = std::fs::copy(&source, &db_path) {
-            let _ = std::fs::rename(&old_path, &db_path);
-            return Err(AppError::msg(format!("覆盖库文件失败: {e}")));
-        }
-        // ⑤ 打开新库（老版本备份在此自动迁移升级）
-        match crate::db::init(&db_path) {
-            Ok(new_conn) => {
-                *guard = new_conn;
-            }
-            Err(e) => {
-                // 回滚：新库打不开 → 还原 .old（保证应用重启后仍是原库）
-                let _ = std::fs::remove_file(&db_path);
-                let _ = std::fs::rename(&old_path, &db_path);
-                if let Ok(recovered) = crate::db::init(&db_path) {
-                    *guard = recovered;
-                }
-                return Err(AppError::msg(format!(
-                    "恢复后的库无法打开（已还原原库）：{e}"
-                )));
-            }
-        }
-        Ok(())
+        perform_restore(&mut guard, &data_dir, &source)
     })
     .await
     .map_err(|e| AppError::msg(format!("恢复线程异常: {e}")))??;
     // ⑥ 冷启动衔接：恢复成功即重启进程加载新库（restart 不返回）
     app.restart()
+}
+
+/// 恢复核心（B4/X-09）：换文件 + 换连接，纯文件系统 + 连接操作，可用临时库做故障注入测试。
+///
+/// 不变量：函数返回时（无论成功或失败），只要磁盘上的 `library.db` 是完好的，`guard` 就必须
+/// 持有指向它的**可验证真实连接**，绝不把空的内存占位连接当作真实库留下；只有连真实库都打不开
+/// 时才保留占位连接并返回明确错误（提示重启/进入恢复），文案不得谎报“已还原”。
+fn perform_restore(
+    guard: &mut rusqlite::Connection,
+    data_dir: &std::path::Path,
+    source: &std::path::Path,
+) -> AppResult<()> {
+    let db_path = data_dir.join("library.db");
+    let old_path = data_dir.join("library.db.old");
+
+    // 磁盘 library.db 完好时，重开可验证连接放回 guard；返回还原状态便于拼装用户可读文案。
+    fn reopen_into(guard: &mut rusqlite::Connection, path: &std::path::Path) -> Result<(), String> {
+        match crate::db::init(path) {
+            Ok(conn) => {
+                *guard = conn;
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    // 旧连接收尾：checkpoint 截断 WAL → 换入内存占位连接 → 关闭旧连接释放文件句柄
+    //（Windows 上文件被占用时 rename/copy 会失败，必须先关）
+    let old = std::mem::replace(
+        &mut *guard,
+        rusqlite::Connection::open_in_memory()
+            .map_err(|e| AppError::msg(format!("占位连接创建失败: {e}")))?,
+    );
+    // checkpoint 是尽力而为（失败不阻断），但要留痕而非静默吞掉。
+    if let Err(e) = old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::warn!("恢复备份：旧库 WAL checkpoint 失败（继续收尾）：{e}");
+    }
+    // close 失败意味着文件句柄可能未释放，Windows 上后续 rename/copy 会连带失败——必须留痕。
+    if let Err((conn, e)) = old.close() {
+        drop(conn);
+        tracing::warn!("恢复备份：旧库连接关闭失败（文件句柄可能未释放）：{e}");
+    }
+
+    // ④ .old 保底：覆盖失败/新库打不开时能回滚回现库
+    if old_path.exists() {
+        let _ = std::fs::remove_file(&old_path);
+    }
+    // 改名保底失败：磁盘上的 library.db 原封未动，重开它放回 guard 后再报错。
+    if let Err(e) = std::fs::rename(&db_path, &old_path) {
+        let reopen = reopen_into(guard, &db_path);
+        return Err(AppError::msg(match reopen {
+            Ok(()) => format!("现库改名保底失败（未改动原库，已继续使用原库）：{e}"),
+            Err(re) => {
+                format!("现库改名保底失败：{e}；且原库重新打开失败：{re}。请重启应用进入恢复。")
+            }
+        }));
+    }
+    // 覆盖失败：把 .old 还原回 library.db，再重开它放回 guard。
+    if let Err(e) = std::fs::copy(source, &db_path) {
+        let _ = std::fs::remove_file(&db_path);
+        let restored = std::fs::rename(&old_path, &db_path);
+        let msg = match (restored, reopen_into(guard, &db_path)) {
+            (Ok(()), Ok(())) => format!("覆盖库文件失败（已还原原库）：{e}"),
+            (Ok(()), Err(re)) => format!(
+                "覆盖库文件失败：{e}；原库文件已还原但重新打开失败：{re}。请重启应用进入恢复。"
+            ),
+            (Err(rre), _) => format!(
+                "覆盖库文件失败：{e}；且原库还原失败：{rre}。原库文件保留在 {}，请勿覆盖并联系支持。",
+                old_path.display()
+            ),
+        };
+        return Err(AppError::msg(msg));
+    }
+    // ⑤ 打开新库（老版本备份在此自动迁移升级）
+    match crate::db::init(&db_path) {
+        Ok(new_conn) => {
+            *guard = new_conn;
+        }
+        Err(e) => {
+            // 回滚：新库打不开 → 还原 .old（保证应用重启后仍是原库）
+            let _ = std::fs::remove_file(&db_path);
+            let restored = std::fs::rename(&old_path, &db_path);
+            let msg = match (restored, reopen_into(guard, &db_path)) {
+                (Ok(()), Ok(())) => format!("恢复后的库无法打开（已还原原库）：{e}"),
+                (Ok(()), Err(re)) => format!(
+                    "恢复后的库无法打开：{e}；原库文件已还原但重新打开失败：{re}。请重启应用进入恢复。"
+                ),
+                (Err(rre), _) => format!(
+                    "恢复后的库无法打开：{e}；且原库还原失败：{rre}。原库文件保留在 {}，请勿覆盖并联系支持。",
+                    old_path.display()
+                ),
+            };
+            return Err(AppError::msg(msg));
+        }
+    }
+    Ok(())
 }
 
 /// 重置前运行中任务守卫。
@@ -349,5 +407,78 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("AI 打标批次进行中"));
+    }
+
+    // ---- B4/X-09：restore 故障注入（临时库，不碰用户真实库）----
+
+    /// 判别真实库 vs 空内存占位：真实 library.db 有业务表，占位连接无表。
+    fn table_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    }
+
+    /// 在目录里建一个真实库文件并返回其打开的连接（用作 guard 当前库）。
+    fn make_library(dir: &std::path::Path) -> rusqlite::Connection {
+        let p = dir.join("library.db");
+        // 先建库释放句柄，再重新打开，模拟运行时 guard 持有的活动连接。
+        crate::db::init(&p).unwrap();
+        crate::db::init(&p).unwrap()
+    }
+
+    #[test]
+    fn restore_happy_path_leaves_working_connection() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut guard = make_library(data_dir.path());
+        // 有效备份源：另建一个真实库文件，释放句柄后取其路径。
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("backup.db");
+        drop(crate::db::init(&src).unwrap());
+
+        perform_restore(&mut guard, data_dir.path(), &src).unwrap();
+        // 成功后 guard 必须是指向新库的真实连接（有业务表）。
+        assert!(table_count(&guard) > 0, "恢复成功后 guard 应为真实库连接");
+    }
+
+    #[test]
+    fn restore_copy_failure_rolls_back_and_reopens_real_db() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut guard = make_library(data_dir.path());
+        let before = table_count(&guard);
+        // 源不存在 → std::fs::copy 失败 → 必须还原 .old 并重开真实库。
+        let missing = data_dir.path().join("does-not-exist.db");
+
+        let err = perform_restore(&mut guard, data_dir.path(), &missing).unwrap_err();
+        assert!(
+            err.to_string().contains("已还原原库"),
+            "文案应说明已还原：{err}"
+        );
+        // 关键不变量：guard 不是空占位，而是重开的真实原库。
+        assert_eq!(table_count(&guard), before, "回滚后 guard 应重开原库");
+        // .old 已被还原回 library.db，不应残留。
+        assert!(!data_dir.path().join("library.db.old").exists());
+        assert!(data_dir.path().join("library.db").exists());
+    }
+
+    #[test]
+    fn restore_unopenable_new_db_rolls_back_and_reopens_real_db() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut guard = make_library(data_dir.path());
+        let before = table_count(&guard);
+        // 源可复制但不是合法 sqlite（复制成功、db::init 失败）→ 回滚还原原库。
+        let src_dir = tempfile::tempdir().unwrap();
+        let garbage = src_dir.path().join("garbage.db");
+        std::fs::write(&garbage, b"this is definitely not a sqlite database").unwrap();
+
+        let err = perform_restore(&mut guard, data_dir.path(), &garbage).unwrap_err();
+        assert!(
+            err.to_string().contains("已还原原库"),
+            "文案应说明已还原：{err}"
+        );
+        assert_eq!(table_count(&guard), before, "回滚后 guard 应重开原库");
+        assert!(!data_dir.path().join("library.db.old").exists());
     }
 }
