@@ -189,7 +189,16 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
                     </span>
                   </div>
                   <div className="mt-0.5 truncate text-[10px] text-[var(--color-text-secondary)]">
-                    {c.baseUrl || "未填地址"} · {c.model || "未选模型"} · {c.hasKey ? "密钥已配置" : "密钥未配置"}
+                    {c.baseUrl || "未填地址"} · {c.model || "未选模型"} ·{" "}
+                    {c.credentialStatus === "unavailable" ? (
+                      <span className="text-[var(--color-danger)]">
+                        {c.credentialMessage || "系统密钥服务不可用"}
+                      </span>
+                    ) : c.credentialStatus === "configured" || (c.credentialStatus == null && c.hasKey) ? (
+                      "密钥已配置"
+                    ) : (
+                      "密钥未配置"
+                    )}
                   </div>
                   {testResult[c.id] && (
                     <div className={clsx("text-[10px]", testResult[c.id]?.startsWith("连接失败") ? "text-[var(--color-danger)]" : "text-[var(--color-status)]")}>

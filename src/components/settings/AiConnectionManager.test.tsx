@@ -26,8 +26,8 @@ beforeEach(() => {
 });
 
 const fakeConns: AiConnection[] = [
-  { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, enabled: true },
-  { id: "c2", name: "本地 Ollama", deployment: "local", protocol: "openai_chat", baseUrl: "http://localhost:11434/v1", model: "llama3.2-vision", hasKey: false, enabled: true },
+  { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, credentialStatus: "configured", enabled: true },
+  { id: "c2", name: "本地 Ollama", deployment: "local", protocol: "openai_chat", baseUrl: "http://localhost:11434/v1", model: "llama3.2-vision", hasKey: false, credentialStatus: "missing", enabled: true },
 ];
 
 describe("AiConnectionManager（§6.3）", () => {

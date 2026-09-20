@@ -177,6 +177,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
         baseUrl: "https://api.agnes-ai.cn/v1",
         model: "agnes-3.0-flash",
         hasKey: true,
+        credentialStatus: "configured",
         enabled: true,
       },
     ]);

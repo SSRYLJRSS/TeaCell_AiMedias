@@ -53,10 +53,20 @@ rawler = "=0.7.2"
 # Phase 2 F02：HEIC/HEIF 解码（预编译静态链接 libheif+libde265，免 vcpkg；
 # Apache-2.0 封装；libheif 本体 LGPL-3 静态链接——闭源分发合规见 docs/ARCHITECTURE.md）
 heif-rs = "26.7"
-# 指导书 §6.3：API Key 系统凭据存储（Windows Credential Manager 后端；service/username 见 credentials.rs）
-keyring = { version = "3", features = ["windows-native"] }
 kmeans_colors = "=0.6"
 palette = "=0.7"
+
+# 指导书 §6.3 / 三端复核 B3：API Key 系统凭据存储（service/username 见 credentials.rs）。
+# 按目标 OS 精确选择原生后端，禁用默认 feature 避免误带 mock 进 production。
+# 不能用 cfg(unix) 代替 linux（会命中 macOS）。feature 名对应 keyring 3.6.3。
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -19,40 +19,61 @@ pub struct AiConnectionView {
     pub protocol: String,
     pub base_url: String,
     pub model: String,
-    /// 是否已配置 API 密钥（不回显 plaintext；只暴露已配置/未配置）
+    /// 是否已配置 API 密钥（不回显 plaintext；兼容旧 UI，等价 credentialStatus=="configured"）。
     pub has_key: bool,
+    /// 三态凭据状态（B3）：configured|missing|unavailable。UI 三态以此为准。
+    pub credential_status: String,
+    /// 仅 unavailable 时的可执行文案（不含密钥值）。
+    pub credential_message: Option<String>,
     pub enabled: bool,
 }
 
-fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
-}
-
-/// 列出全部连接档案（含 key 配置状态）。
-#[tauri::command]
-pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnectionView>> {
-    let conn = lock_db(&state)?;
-    let rows = ai_connections::list(&conn)?;
-    let mut out = Vec::new();
-    for c in rows {
-        let has_key = match &c.api_key_ref {
-            Some(id) => credentials::get_api_key(id)?
-                .map(|k| !k.is_empty())
-                .unwrap_or(false),
-            None => false,
-        };
-        out.push(AiConnectionView {
+impl AiConnectionView {
+    fn from_row(c: ai_connections::AiConnection, status: credentials::CredentialStatus) -> Self {
+        Self {
             id: c.id,
             name: c.name,
             deployment: c.deployment,
             protocol: c.protocol,
             base_url: c.base_url,
             model: c.model,
-            has_key,
+            has_key: status.has_key(),
+            credential_status: status.tag().to_string(),
+            credential_message: status.message().map(str::to_owned),
             enabled: c.enabled,
-        });
+        }
     }
-    Ok(out)
+}
+
+fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+    state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
+}
+
+/// 列出全部连接档案（含 key 三态状态）。
+///
+/// B3：先短锁读取行、立即释放锁，再在阻塞工作线程逐个探测 keyring；
+/// 一条不可读只标该条 unavailable，其它连接仍可编辑使用（不再让 `?` 中断整个列表）。
+#[tauri::command]
+pub async fn list_ai_connections(state: State<'_, AppState>) -> AppResult<Vec<AiConnectionView>> {
+    // 短锁取行后释放
+    let rows = {
+        let conn = lock_db(&state)?;
+        ai_connections::list(&conn)?
+    };
+    // keyring 访问在阻塞线程（锁外）
+    tauri::async_runtime::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|c| {
+                let status = match &c.api_key_ref {
+                    Some(id) => credentials::probe_status(id),
+                    None => credentials::CredentialStatus::Missing,
+                };
+                AiConnectionView::from_row(c, status)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("凭据状态探测任务失败: {e}")))
 }
 
 /// 保存连接档案。api_key 为 Some(非空) 时写入系统凭据（keyring）并置 api_key_ref；
@@ -60,8 +81,8 @@ pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnection
 // 参数即 IPC 契约（前端 invoke 按字段名传参），收进结构体会破坏前端调用，故平铺并豁免。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn save_ai_connection(
-    state: State<AppState>,
+pub async fn save_ai_connection(
+    state: State<'_, AppState>,
     id: String,
     name: String,
     deployment: String,
@@ -76,43 +97,57 @@ pub fn save_ai_connection(
     if base_url.trim().is_empty() {
         return Err(AppError::msg("服务地址不能为空"));
     }
-    let conn = lock_db(&state)?;
-    // 新 key 只在 keyring 写成功后才引用
+    let id_owned = id.trim().to_string();
+    // B3：先在 DB 锁**之外**写 keyring 并读校验；新 key 只有确认可读回后才引用。
+    // 空/None 保留原 key（不当删除）。
     let mut api_key_ref: Option<String> = None;
     if let Some(k) = &api_key {
-        if !k.trim().is_empty() {
-            credentials::save_api_key(&id, k.trim())?;
-            api_key_ref = Some(id.clone());
+        let trimmed = k.trim();
+        if !trimmed.is_empty() {
+            let id_for_key = id_owned.clone();
+            let key_for_write = trimmed.to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                credentials::save_api_key(&id_for_key, &key_for_write)?;
+                // 写后读校验：确认凭据可读回，避免「保存显示成功但实际未落盘」。
+                match credentials::probe_status(&id_for_key) {
+                    credentials::CredentialStatus::Configured => Ok(()),
+                    credentials::CredentialStatus::Missing => {
+                        Err(AppError::msg("凭据写入后无法读回，请检查系统密钥服务"))
+                    }
+                    credentials::CredentialStatus::Unavailable(m) => Err(AppError::unauthorized(m)),
+                }
+            })
+            .await
+            .map_err(|e| AppError::msg(format!("凭据写入任务失败: {e}")))??;
+            api_key_ref = Some(id_owned.clone());
         }
     }
-    ai_connections::upsert(
-        &conn,
-        id.trim(),
-        name.trim(),
-        &deployment,
-        &protocol,
-        base_url.trim(),
-        model.trim(),
-        api_key_ref.as_deref(),
-    )?;
-    let c =
-        ai_connections::get(&conn, id.trim())?.ok_or_else(|| AppError::msg("保存后读取失败"))?;
-    let has_key = match &c.api_key_ref {
-        Some(id) => credentials::get_api_key(id)?
-            .map(|k| !k.is_empty())
-            .unwrap_or(false),
-        None => false,
+    // 短锁写 DB 并读回行
+    let row = {
+        let conn = lock_db(&state)?;
+        ai_connections::upsert(
+            &conn,
+            &id_owned,
+            name.trim(),
+            &deployment,
+            &protocol,
+            base_url.trim(),
+            model.trim(),
+            api_key_ref.as_deref(),
+        )?;
+        ai_connections::get(&conn, &id_owned)?.ok_or_else(|| AppError::msg("保存后读取失败"))?
     };
-    Ok(AiConnectionView {
-        id: c.id,
-        name: c.name,
-        deployment: c.deployment,
-        protocol: c.protocol,
-        base_url: c.base_url,
-        model: c.model,
-        has_key,
-        enabled: c.enabled,
-    })
+    // 凭据状态探测在锁外
+    let status = match &row.api_key_ref {
+        Some(ref_id) => {
+            let ref_id = ref_id.clone();
+            tauri::async_runtime::spawn_blocking(move || credentials::probe_status(&ref_id))
+                .await
+                .map_err(|e| AppError::msg(format!("凭据状态探测任务失败: {e}")))?
+        }
+        None => credentials::CredentialStatus::Missing,
+    };
+    Ok(AiConnectionView::from_row(row, status))
 }
 
 /// 删除连接档案（同时删除用途绑定与系统凭据）。
