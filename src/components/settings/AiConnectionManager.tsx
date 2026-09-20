@@ -19,6 +19,7 @@ import {
   type AiDeployment,
   type AiProtocol,
 } from "@/api/connections";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 
 interface Props {
   /** 当前部署模式（在线/本地）：新增连接默认按此部署，列表只显示该部署的连接 */
@@ -48,7 +49,12 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, string | null>>({});
 
-  const visible = conns.filter((c) => c.deployment === deployment);
+  // R1（三端复核 X-05）：非托管平台没有「本机服务」tab，从 Windows 迁移来的旧
+  // deployment=local 档案必须仍能在在线服务列表里看到/编辑，否则会被过滤丢失。
+  const managedOllama = usePlatformStore(selectManagedOllama);
+  const visible = conns.filter((c) =>
+    managedOllama ? c.deployment === deployment : true,
+  );
 
   const refresh = useCallback(async () => {
     setError(null);

@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
 import { deleteAiConnection, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
+import { usePlatformStore } from "@/stores/platformStore";
 
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn(),
@@ -23,6 +24,21 @@ import type { AiConnection } from "@/api/connections";
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal("crypto", { randomUUID: () => "new-conn-1" });
+  // R1（三端复核）：这些用例编码 Windows（托管）契约——按部署过滤本机/在线。
+  // 平台 store 置 ready+windows；非托管平台「旧 local 档案仍可见」由 X-05 逻辑另测。
+  usePlatformStore.setState({
+    status: "ready",
+    error: null,
+    capabilities: {
+      schemaVersion: 1,
+      os: "windows",
+      arch: "x86_64",
+      managedOllama: true,
+      nativeWindowControls: false,
+      primaryModifier: "ctrl",
+      libraryTransferVersion: null,
+    },
+  });
 });
 
 const fakeConns: AiConnection[] = [
@@ -139,5 +155,28 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() =>
       expect(screen.getByText(/连接失败：服务可达，但密钥无效/)).toBeInTheDocument(),
     );
+  });
+
+  // X-05：非托管平台（macOS）没有本机服务 tab，从 Windows 迁移来的旧 local 档案
+  // 必须仍在在线服务列表可见/可编辑，不被部署过滤丢失。
+  it("非托管平台：旧 deployment=local 档案在在线列表仍可见", async () => {
+    usePlatformStore.setState({
+      status: "ready",
+      error: null,
+      capabilities: {
+        schemaVersion: 1,
+        os: "macos",
+        arch: "aarch64",
+        managedOllama: false,
+        nativeWindowControls: true,
+        primaryModifier: "meta",
+        libraryTransferVersion: null,
+      },
+    });
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    // 云档案与旧 local 档案都应出现（不因 deployment=cloud 过滤丢失 local）
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    expect(screen.getByText("本地 Ollama")).toBeInTheDocument();
   });
 });
