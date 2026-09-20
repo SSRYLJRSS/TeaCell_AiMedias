@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "test:unit": "vitest run",
     "tauri": "tauri",
-    "test:ignored": "cd src-tauri && cargo test -- --ignored"
+    "test:ignored": "cd src-tauri && cargo test --test perf_probe -- --ignored"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.10.0",
