@@ -376,6 +376,8 @@ pub fn run() {
             commands::ollama_delete_model,
             commands::ollama_model_dir,
             commands::ollama_open_model_dir,
+            // 平台能力（三端复核 R0）
+            commands::get_platform_capabilities,
             // 设置
             commands::get_settings,
             commands::save_settings,

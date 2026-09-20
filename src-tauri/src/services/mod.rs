@@ -9,6 +9,7 @@ pub mod importer;
 pub mod kinship;
 pub mod media_refill;
 pub mod ollama_installer;
+pub mod platform;
 pub mod ollama_runtime;
 pub mod ollama_setup;
 // FB2-08：算法提色（Lab k-means），见 §14.5
