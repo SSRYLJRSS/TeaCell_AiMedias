@@ -9,6 +9,7 @@ import { useState } from "react";
 import clsx from "clsx";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
 import LocalModelGroup from "@/components/settings/LocalModelGroup";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 import type { Settings } from "@/types/settings";
 
 interface Props {
@@ -20,8 +21,15 @@ interface Props {
 }
 
 export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, notify, fail }: Props) {
+  // R1（三端复核）：仅 Windows 提供应用管理的本机 Ollama；其余平台只显示在线服务，
+  // 引导用户自部署并填写兼容 API 地址。未就绪时保守视为不支持（不猜 Windows）。
+  const managedOllama = usePlatformStore(selectManagedOllama);
   const [deployment, setDeployment] = useState<"cloud" | "local">("cloud");
   const [bindVersion, setBindVersion] = useState(0); // 连接变化后刷新列表
+
+  // 非托管平台强制在线服务：即使残留 local 状态也回落 cloud，避免空的本机向导。
+  const effectiveDeployment: "cloud" | "local" = managedOllama ? deployment : "cloud";
+  const positions = managedOllama ? (["cloud", "local"] as const) : (["cloud"] as const);
 
   return (
     <div className="flex flex-col gap-3">
@@ -29,16 +37,16 @@ export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, n
       <div className="flex items-center gap-4 px-4 pt-3">
         <span className="text-xs text-[var(--color-text-secondary)]">服务位置</span>
         <div className="flex items-center gap-1 rounded-md border border-[var(--color-border)] p-0.5">
-          {(["cloud", "local"] as const).map((d) => (
+          {positions.map((d) => (
             <button
               key={d}
               type="button"
               role="tab"
-              aria-selected={deployment === d}
+              aria-selected={effectiveDeployment === d}
               onClick={() => setDeployment(d)}
               className={clsx(
                 "rounded px-3 py-1 text-sm transition-colors",
-                deployment === d
+                effectiveDeployment === d
                   ? "bg-[var(--color-surface-hover)] font-medium text-[var(--color-text)]"
                   : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
               )}
@@ -51,13 +59,13 @@ export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, n
 
       <div className="px-4">
         <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-          {deployment === "cloud"
+          {effectiveDeployment === "cloud"
             ? "通过在线服务分析素材；素材会按所选服务发送。服务配置只在这里维护。"
             : "仅在本机处理，不会上传素材。可安装引擎、下载模型，并管理本机服务。"}
         </p>
       </div>
 
-      {deployment === "local" && (
+      {effectiveDeployment === "local" && (
         <LocalModelGroup
           draft={draft}
           onPatchAi={onPatchAi}
@@ -68,8 +76,8 @@ export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, n
       )}
 
       <AiConnectionManager
-        key={`${deployment}-${bindVersion}`}
-        deployment={deployment}
+        key={`${effectiveDeployment}-${bindVersion}`}
+        deployment={effectiveDeployment}
         notify={notify}
         fail={fail}
         onChanged={() => setBindVersion((v) => v + 1)}

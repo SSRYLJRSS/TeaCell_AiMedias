@@ -3,6 +3,7 @@
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import LocalModelGroup from "@/components/settings/LocalModelGroup";
+import { usePlatformStore } from "@/stores/platformStore";
 import type { Settings } from "@/types/settings";
 
 vi.mock("@/api/ollama", () => ({
@@ -48,7 +49,25 @@ const draft = {
 const noop = () => {};
 
 describe("LocalModelGroup", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // R1（三端复核）：本组件的托管 Ollama 行为编码 Windows 契约；
+    // 平台能力 store 置 ready+windows，本机探针 effect 才会运行。
+    // 非托管平台的「不触发探针」行为由 platformStore 单测覆盖。
+    usePlatformStore.setState({
+      status: "ready",
+      error: null,
+      capabilities: {
+        schemaVersion: 1,
+        os: "windows",
+        arch: "x86_64",
+        managedOllama: true,
+        nativeWindowControls: false,
+        primaryModifier: "ctrl",
+        libraryTransferVersion: null,
+      },
+    });
+  });
 
   it("未安装 Ollama 时渲染一键安装入口", async () => {
     render(
@@ -62,5 +81,38 @@ describe("LocalModelGroup", () => {
     );
     expect(await screen.findByText("未检测到 Ollama 本地引擎")).toBeTruthy();
     expect(screen.getByText(/一键安装 Ollama/)).toBeTruthy();
+  });
+
+  it("非托管平台（macOS）：不触发任何 Ollama 探针命令", async () => {
+    const { ollamaInstallStatus, ollamaListSources, ollamaRuntimeStatus } = await import(
+      "@/api/ollama"
+    );
+    usePlatformStore.setState({
+      status: "ready",
+      error: null,
+      capabilities: {
+        schemaVersion: 1,
+        os: "macos",
+        arch: "aarch64",
+        managedOllama: false,
+        nativeWindowControls: true,
+        primaryModifier: "meta",
+        libraryTransferVersion: null,
+      },
+    });
+    render(
+      <LocalModelGroup
+        draft={draft}
+        onPatchAi={noop}
+        onPatchSettings={noop}
+        notify={noop}
+        fail={noop}
+      />,
+    );
+    // 挂载后给 effect 一个时机；不应有任何管理探针发出
+    await Promise.resolve();
+    expect(ollamaInstallStatus).not.toHaveBeenCalled();
+    expect(ollamaListSources).not.toHaveBeenCalled();
+    expect(ollamaRuntimeStatus).not.toHaveBeenCalled();
   });
 });

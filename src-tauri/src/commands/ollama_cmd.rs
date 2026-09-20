@@ -9,6 +9,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 
+use crate::commands::platform_cmd::require_managed_ollama_supported;
 use crate::db::settings as db_settings;
 use crate::error::{AppError, AppResult};
 use crate::services::ollama_installer as installer;
@@ -34,6 +35,7 @@ pub struct HardwareReport {
 
 #[tauri::command]
 pub async fn ollama_probe_hardware() -> AppResult<HardwareReport> {
+    require_managed_ollama_supported()?;
     tauri::async_runtime::spawn_blocking(|| {
         let gpu = ollama_setup::probe_gpu();
         let recommendations = ollama_setup::recommend(gpu.vram_gb);
@@ -49,6 +51,7 @@ pub async fn ollama_probe_hardware() -> AppResult<HardwareReport> {
 /// 一键拉取：流式进度走 ollama://pull-progress 事件；不写 settings（前端收终态后保存）
 #[tauri::command]
 pub async fn ollama_pull(app: AppHandle, base_url: String, model: String) -> AppResult<()> {
+    require_managed_ollama_supported()?;
     if model.trim().is_empty() {
         return Err(AppError::msg("未指定模型名"));
     }
@@ -101,6 +104,7 @@ pub struct InstallStatus {
 
 #[tauri::command]
 pub async fn ollama_install_status() -> AppResult<InstallStatus> {
+    require_managed_ollama_supported()?;
     tauri::async_runtime::spawn_blocking(|| {
         let d = installer::detect_installed();
         let st = ollama_setup::ping(installer::LOCAL_BASE_URL);
@@ -142,6 +146,7 @@ fn read_custom_sources(state: &State<AppState>) -> AppResult<Vec<installer::Down
 /// 列出全部下载源：内置 3 + 自定义（preferred 下拉数据）
 #[tauri::command]
 pub fn ollama_list_sources(state: State<AppState>) -> AppResult<Vec<installer::DownloadSource>> {
+    require_managed_ollama_supported()?;
     let custom = read_custom_sources(&state)?;
     Ok(installer::all_sources(&custom))
 }
@@ -152,6 +157,7 @@ pub async fn ollama_probe_sources(
     state: State<'_, AppState>,
     ids: Option<Vec<String>>,
 ) -> AppResult<Vec<installer::SourceProbe>> {
+    require_managed_ollama_supported()?;
     let all = installer::all_sources(&read_custom_sources(&state)?);
     let targets: Vec<_> = match ids.as_ref().filter(|v| !v.is_empty()) {
         Some(list) => all.into_iter().filter(|s| list.contains(&s.id)).collect(),
@@ -173,6 +179,7 @@ pub async fn ollama_download_install(
     state: State<'_, AppState>,
     preferred_source_id: String,
 ) -> AppResult<()> {
+    require_managed_ollama_supported()?;
     let preferred = if preferred_source_id.is_empty() {
         "auto".to_string()
     } else {
@@ -285,6 +292,7 @@ pub fn ollama_add_custom_source(
     label: String,
     url: String,
 ) -> AppResult<installer::DownloadSource> {
+    require_managed_ollama_supported()?;
     installer::validate_custom_source(&label, &url)?;
     let id = format!("custom-{}", uuid::Uuid::new_v4());
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -307,6 +315,7 @@ pub fn ollama_add_custom_source(
 /// 删除自定义下载源（即时落库；id 无效则忽略不报错）
 #[tauri::command]
 pub fn ollama_remove_custom_source(state: State<AppState>, id: String) -> AppResult<()> {
+    require_managed_ollama_supported()?;
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let mut s = db_settings::get_settings(&conn)?;
     db_settings::remove_custom_source(&mut s, &id);
@@ -317,6 +326,7 @@ pub fn ollama_remove_custom_source(state: State<AppState>, id: String) -> AppRes
 /// 删除已缓存的 Ollama 安装包（释放空间；需要时重新一键下载）
 #[tauri::command]
 pub async fn ollama_remove_installer() -> AppResult<bool> {
+    require_managed_ollama_supported()?;
     tauri::async_runtime::spawn_blocking(installer::remove_installer)
         .await
         .map_err(|e| AppError::msg(format!("删除任务异常: {e}")))?
@@ -327,6 +337,7 @@ pub async fn ollama_remove_installer() -> AppResult<bool> {
 pub async fn ollama_list_local_models(
     base_url: String,
 ) -> AppResult<Vec<ollama_setup::LocalModelInfo>> {
+    require_managed_ollama_supported()?;
     tauri::async_runtime::spawn_blocking(move || ollama_setup::list_models(&base_url))
         .await
         .map_err(|e| AppError::msg(format!("模型列表任务异常: {e}")))?
@@ -335,6 +346,7 @@ pub async fn ollama_list_local_models(
 /// 删除本地已下载模型（释放磁盘空间）；服务端错误（含模型不存在）原样透传
 #[tauri::command]
 pub async fn ollama_delete_model(base_url: String, model: String) -> AppResult<()> {
+    require_managed_ollama_supported()?;
     tauri::async_runtime::spawn_blocking(move || ollama_setup::delete_model(&base_url, &model))
         .await
         .map_err(|e| AppError::msg(format!("删除任务异常: {e}")))?
@@ -343,12 +355,14 @@ pub async fn ollama_delete_model(base_url: String, model: String) -> AppResult<(
 /// 探测本地模型存储目录（OLLAMA_MODELS 优先，其次默认 ~/.ollama/models）
 #[tauri::command]
 pub fn ollama_model_dir() -> AppResult<String> {
+    require_managed_ollama_supported()?;
     ollama_setup::model_dir()
 }
 
 /// 在系统文件管理器中打开本地模型存储目录
 #[tauri::command]
 pub fn ollama_open_model_dir(app: AppHandle) -> AppResult<()> {
+    require_managed_ollama_supported()?;
     let dir = ollama_setup::model_dir()?;
     app.opener()
         .open_path(&dir, None::<&str>)
@@ -361,6 +375,7 @@ pub fn ollama_open_model_dir(app: AppHandle) -> AppResult<()> {
 /// Child/pid 为 AppOwned（防重复启动）；返回运行态快照。
 #[tauri::command]
 pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<OllamaRuntimeSnapshot> {
+    require_managed_ollama_supported()?;
     // 命令层读设置（拿代理），逻辑仍在 services（拉起+复检）
     let proxy = {
         let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -419,6 +434,7 @@ pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<Ollam
 /// 当前 Ollama 本地服务运行态（§8.5 高级信息 + L2 观测）
 #[tauri::command]
 pub async fn ollama_runtime_status(state: State<'_, AppState>) -> AppResult<OllamaRuntimeSnapshot> {
+    require_managed_ollama_supported()?;
     let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     tauri::async_runtime::spawn_blocking(move || {
         runtime
@@ -434,6 +450,7 @@ pub async fn ollama_runtime_status(state: State<'_, AppState>) -> AppResult<Olla
 /// 返回停止前 ownership 与是否执行了停止动作。
 #[tauri::command]
 pub async fn ollama_stop_service(state: State<'_, AppState>) -> AppResult<OllamaStopResult> {
+    require_managed_ollama_supported()?;
     let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     tauri::async_runtime::spawn_blocking(move || {
         let mut rt = runtime

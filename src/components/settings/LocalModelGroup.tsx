@@ -33,6 +33,7 @@ import {
 } from "@/api/ollama";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useOllamaPull } from "@/hooks/useOllama";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 import type { ApiProfile, CustomSource, Settings } from "@/types/settings";
 
 const DEFAULT_LOCAL_BASE = "http://localhost:11434/v1";
@@ -71,6 +72,10 @@ interface Props {
 }
 
 export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, notify, fail }: Props) {
+    // R1（三端复核）：组件层防御性 guard。仅 Windows 支持应用管理的 Ollama；
+    // 非托管平台不触发任何安装态/模型目录/运行态探针、轮询与命令（不能只用 CSS 隐藏）。
+    // ServiceManagement 已在非托管平台不挂载本组件，这里是第二重保护，防止未来直接引用绕过。
+    const managedOllama = usePlatformStore(selectManagedOllama);
     const [status, setStatus] = useState<InstallStatus | null>(null);
     const [detectError, setDetectError] = useState(false);
     const [hw, setHw] = useState<HardwareReport | null>(null);
@@ -164,9 +169,11 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     }, []);
 
     useEffect(() => {
+        // 非托管平台：不发起任何 Ollama 管理探针。
+        if (!managedOllama) return;
         void refresh();
         void loadSources();
-    }, [refresh, loadSources]);
+    }, [managedOllama, refresh, loadSources]);
 
     // ---- 已装模型管理：服务就绪（且为 Ollama）时加载列表与存储目录 ----
     const loadModels = useCallback(async () => {
