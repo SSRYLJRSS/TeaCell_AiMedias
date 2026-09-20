@@ -683,6 +683,20 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             if !is_new {
                 return ProcResult::Duplicate;
             }
+            // 三端复核 X-18：非 UTF-8 源文件名不静默有损入库。首版明确拒绝并保留原文件
+            //（导入只复制不移动，原文件本就不动），后续再做无损 OsString 协议。
+            // 在暂存复制前判定，避免产生无法正确记录路径的孤儿副本。
+            if let Err(e) = path::encode_native_path(file) {
+                tracing::warn!(
+                    operation = "import",
+                    task_id = %task_id,
+                    stage = "encode_name",
+                    file = %file.display(),
+                    error = %e,
+                    "跳过：文件名非 UTF-8，首版暂不支持无损入库"
+                );
+                return ProcResult::Failed(format!("{}: {e}", file.display()));
+            }
             // 锁外：托管复制
             let staged = match stage_file(file, opts, idx + 1) {
                 Ok(p) => p,
