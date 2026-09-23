@@ -37,10 +37,12 @@ export default function AssetInfoPanel({ asset, onRefreshed }: { asset: Asset; o
   const [rescanning, setRescanning] = useState(false);
   const [rescanMsg, setRescanMsg] = useState<string | null>(null);
 
-  // 切张时按素材类型重置默认标签（手动选择在本次会话内保留到切张）
+  // 切张时按素材类型重置默认标签（手动选择在本次会话内保留到切张）。
+  // 只按 asset.id 触发：切到不同素材才重置 tab；同一素材的其它字段变化不应重置用户当前 tab。
   useEffect(() => {
     setActiveTab(defaultTab(asset));
     setRescanMsg(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset.id]);
 
   const common = useMemo(() => buildCommonFields(asset), [asset]);

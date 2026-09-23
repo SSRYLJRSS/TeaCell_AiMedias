@@ -26,6 +26,7 @@ import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import { removeTags } from "@/api/tags";
 import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { usePlatformStore, selectPreferredVideoProxy } from "@/stores/platformStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAppearance } from "@/hooks/useAppearance";
 import { isEditableTarget, isInsidePlayer, isViewerNativeFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
@@ -78,6 +79,12 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
   const [proxyError, setProxyError] = useState<string | null>(null);
   const [proxying, setProxying] = useState(false);
   const proxyAttempted = useRef(false);
+  // P1-03：generation 递增作废旧变体/素材的迟到响应，杜绝 H.264 响应覆盖 WebM 状态。
+  const proxyGeneration = useRef(0);
+  // 代理变体统一从平台 store 取（Linux 用 WebM，其余 MP4），ensure/status/cancel 共用同一值。
+  const proxyVariant = usePlatformStore(selectPreferredVideoProxy);
+  // P1-03：平台能力就绪前不发起 ensure，避免按错误默认变体生成/复用。
+  const platformReady = usePlatformStore((s) => s.status === "ready");
 
   // 详情开关：左属性栏显隐（§2.3 工具栏「信息开关」；FB3-04 改名，职责不变）
   const [detailsOpen, setDetailsOpen] = useState(true);
@@ -196,23 +203,30 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
     [items, total, loadMore],
   );
 
-  // 切张：重置视频源与代理尝试标记（§8.1 播放决策顺序：原文件优先，失败再走代理）
+  // 切张 / 变体变化：重置视频源与代理尝试标记（§8.1 播放决策顺序：原文件优先，失败再走代理）。
+  // P1-03：variant 也在依赖内——能力从默认恢复为 Linux WebM 时，取消旧请求并允许按正确变体重来。
   useEffect(() => {
     proxyAttempted.current = false;
+    proxyGeneration.current += 1; // 作废在途响应
     setProxyError(null);
     setProxying(false);
     setVideoSrc(convertFileSrc(current.filePath));
-  }, [current.id, current.filePath]);
+  }, [current.id, current.filePath, proxyVariant]);
 
   // §8.1：原文件播放失败 → 按需生成兼容代理；代理失败给出可解释原因与操作建议
   const handleVideoError = useCallback(async () => {
-    if (proxyAttempted.current) return;
+    // P1-03：平台能力未就绪前不请求代理（避免错误默认变体）。
+    if (!platformReady || proxyAttempted.current) return;
     proxyAttempted.current = true;
     const id = current.id;
+    const generation = ++proxyGeneration.current;
+    const requestedVariant = proxyVariant;
     setProxying(true);
     setProxyError(null);
     try {
-      const proxy = await ensureVideoProxy(id, "h264_mp4");
+      const proxy = await ensureVideoProxy(id, proxyVariant);
+      // 素材/变体已变或有更新请求 → 丢弃旧响应，避免覆盖当前变体状态。
+      if (generation !== proxyGeneration.current || proxy.variant !== requestedVariant) return;
       if (proxy.status === "ready" && proxy.path) {
         setVideoSrc(toProxyFileUrl(proxy.path));
         setProxyError(null);
@@ -220,14 +234,16 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
         setProxyError(proxy.error ?? "视频编码不兼容，且没有可用的兼容代理");
       }
     } catch (e) {
+      if (generation !== proxyGeneration.current) return;
       setProxyError(e instanceof Error ? e.message : String(e));
     } finally {
-      setProxying(false);
+      if (generation === proxyGeneration.current) setProxying(false);
     }
-  }, [current.id]);
+  }, [current.id, proxyVariant, platformReady]);
 
   const handleCancelProxy = () => {
-    void cancelVideoProxy(current.id, "h264_mp4").catch(() => undefined);
+    // ensure/cancel 使用完全相同的 variant（同一 selector 取值）。
+    void cancelVideoProxy(current.id, proxyVariant).catch(() => undefined);
     setProxyError("已取消生成代理");
   };
 

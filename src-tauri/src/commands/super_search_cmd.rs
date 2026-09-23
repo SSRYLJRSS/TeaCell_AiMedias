@@ -42,25 +42,49 @@ pub async fn ai_parse_search_query(
             )));
         }
         // 2. 短锁读取 AI 档案（用途绑定优先）+ 分面 + 标签词典 + 库能力摘要，读取后立即放锁
-        let (cfg, facets, dict, capabilities) = {
+        let (mut cfg, super_search_key_ref, facets, dict, capabilities) = {
             let conn = lock_db(&db)?;
             let mut s = settings::get_settings(&conn)?;
+            // P1-01：先解析用途绑定，再判断「是否有可用配置」。
+            // 新安装用户可能只用「服务连接 + 用途绑定」而没有任何 legacy profile；
+            // 若先检查 s.ai.active() 会在解析绑定前就误报「请先添加 API 配置」。
+            // §4.4/§10：超级搜索按用途绑定读取连接档案；db 锁内只注入不含明文密钥的 profile，
+            //           无绑定时回退 legacy active 档案（升级兼容），密钥引用留到锁外补全。
+            let key_ref = match crate::db::ai_connections::usage_profile_ref(&conn, "super_search")
+            {
+                Ok(Some(bref)) => {
+                    let r = bref.api_key_ref.clone();
+                    // apply_profile_to_cfg 会把绑定档案设为 active，使后续 active() 命中。
+                    crate::db::ai_connections::apply_profile_to_cfg(&mut s.ai, bref.profile);
+                    r
+                }
+                // 无绑定：回退 legacy active 档案（其明文密钥已在 settings 中，
+                // 不走 keyring 补全，返回 None 保留原 api_key）。
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("超级搜索读取用途绑定失败: {e}");
+                    return Err(e);
+                }
+            };
+            // 绑定与 legacy 都没有可用档案时，才返回明确的配置错误。
             if s.ai.active().is_none() {
-                return Err(AppError::not_found("请先在设置页添加 API 配置（中转站）"));
+                return Err(AppError::not_found(
+                    "请先在设置页添加服务连接并把「超级搜索」用途绑定到该连接",
+                ));
             }
-            // §4.4：超级搜索按用途绑定读取连接档案；无绑定时回退默认 active 档案。
-            let _ =
-                crate::db::ai_connections::apply_usage_binding(&conn, "super_search", &mut s.ai)
-                    .map_err(|e| {
-                        tracing::warn!("超级搜索读取用途绑定失败，回退默认档案: {e}");
-                        e
-                    })?;
             let facets = tag_facets::build_prompt_context(&conn, "all")?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             // C-3：实时库能力摘要（缓存 60s，只告知不改写）；失败时静默给空串不阻塞搜索
             let capabilities = super_search_ai::library_capabilities(&conn).unwrap_or_default();
-            (s.ai, facets, dict, capabilities)
+            (s.ai, key_ref, facets, dict, capabilities)
         };
+        // §10：DB 锁已释放，用 keyring 补全 super_search 绑定档案的明文密钥（锁外阻塞调用）。
+        if let Some(id) = super_search_key_ref {
+            let key = crate::services::credentials::get_api_key(&id)?.unwrap_or_default();
+            if let Some(active) = cfg.profiles.iter_mut().find(|p| p.id == id) {
+                active.api_key = key;
+            }
+        }
         // 3. 锁外网络请求 + V3 解析（V3→V2→关键词 三层降级；配置错误仍真报错）。
         //    degrade_parse_v3 已含 sanitize + guard_preferred + validate。
         let (intent, ai_warnings): (SearchIntentV3, Vec<String>) =

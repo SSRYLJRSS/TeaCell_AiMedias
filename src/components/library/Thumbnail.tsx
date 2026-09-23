@@ -76,6 +76,9 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fi
     io.observe(el);
     return () => {
       io.disconnect();
+      // gen 是"代际"守卫：cleanup 里自增即作废本效果发起的在途请求（.then 内以 gen.current !== my 拦截）。
+      // 这里刻意读写 gen.current 本身，不适用"复制到局部变量"的告警建议。
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       gen.current++;
     };
   }, [assetId, hdUrl, size]);

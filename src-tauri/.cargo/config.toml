@@ -1,6 +1,11 @@
-# Phase 2 F02：heif-rs 的预编译 libheif 静态库（本机无法直连 GitHub，
-# 二进制已手动下载解压到仓库根 heif-bin/；含 include/ + lib/，详见 docs/ARCHITECTURE.md）。
-# 注意：relative 路径相对本文件所在目录（src-tauri/.cargo）解析。
-# 若在无 heif-bin 目录的机器上构建，删除此段让 build.rs 自动联网下载即可。
-[env]
-HEIF_BINARIES_DIR = { value = "../heif-bin", relative = true }
+# 三端复核 §7：不再无条件注入 HEIF_BINARIES_DIR。
+#
+# 历史做法在这里硬写 `HEIF_BINARIES_DIR = ../heif-bin`（Windows `.lib` 方案），
+# macOS/Linux 构建会读到错误 ABI，且要求开发者"没有目录就手工删段落"——不可重复。
+#
+# 现由统一构建入口 scripts/desktop.mjs 按实际 target triple 决定：
+#   - Windows x64 且 native/heif/x86_64-pc-windows-msvc 结构与哈希匹配时，才导出 HEIF_BINARIES_DIR；
+#   - macOS/Linux 使用各自独立目录或系统库，绝不复用 Windows 目录；
+#   - 目录缺失时给出明确错误（含 target、期望路径、准备命令）。
+#
+# 本文件保持无 HEIF env，避免跨平台污染。

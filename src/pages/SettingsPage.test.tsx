@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
-import { useSettingsStore } from "@/stores/settingsStore";
+import { useSettingsStore, __resetSettingsModuleStateForTest } from "@/stores/settingsStore";
 import { usePlatformStore } from "@/stores/platformStore";
 import { useTagStore } from "@/stores/tagStore";
 import { exportDiagnostics, getSettings, resetAppData, saveSettings } from "@/api/settings";
@@ -59,6 +59,10 @@ vi.mock("@/api/settings", () => ({
     searchStateReset: false,
     cacheFilesDeleted: 0,
     logFilesDeleted: 0,
+    credentialsDeleteAttempted: 0,
+    credentialsDeleted: 0,
+    credentialsDeleteFailed: 0,
+    credentialsDeleteErrorKinds: [],
   }),
 }));
 vi.mock("@/api/ollama", () => ({
@@ -175,6 +179,10 @@ const emptyStore = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // 复位 settingsStore 模块级共享状态（single-flight promise / 防抖定时器 / 待落库副本），
+  // 否则上个用例遗留的防抖 save 定时器会在本用例触发一次额外 getSettings（回读对账），
+  // 造成断言次数偏多的顺序相关 flaky（指导书 §13.3）。
+  __resetSettingsModuleStateForTest();
   useSettingsStore.setState(emptyStore);
   // R1（三端复核）：这些回归编码 Windows（托管 Ollama）契约——本机服务 tab 可见。
   // 平台能力 store 置为 ready+windows；非托管平台的隐藏行为由 platformStore 单测覆盖。
@@ -186,9 +194,7 @@ beforeEach(() => {
       os: "windows",
       arch: "x86_64",
       managedOllama: true,
-      nativeWindowControls: false,
-      primaryModifier: "ctrl",
-      libraryTransferVersion: null,
+      preferredVideoProxy: "h264_mp4",
     },
   });
   // 默认：getSettings 成功返回一份完整设置
@@ -596,6 +602,10 @@ describe("存储与维护 · 重置数据", () => {
       searchStateReset: false,
       cacheFilesDeleted: 512,
       logFilesDeleted: 0,
+      credentialsDeleteAttempted: 0,
+      credentialsDeleted: 0,
+      credentialsDeleteFailed: 0,
+      credentialsDeleteErrorKinds: [],
     });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     await openData();
@@ -648,6 +658,35 @@ describe("存储与维护 · 重置数据", () => {
     expect(libraryMocks.refresh).not.toHaveBeenCalled();
   });
 
+  it("P2-01：凭据部分清理失败时显示可见提示（数据库已重置，但残留系统凭据）", async () => {
+    vi.mocked(resetAppData).mockResolvedValue({
+      assetsDeleted: 0,
+      assetFilesDeleted: 0,
+      assetFilesFailed: 0,
+      exportTasksDeleted: 0,
+      tagsDeleted: 0,
+      aiTasksDeleted: 0,
+      connectionsDeleted: 2,
+      preferencesReset: false,
+      searchStateReset: false,
+      cacheFilesDeleted: 0,
+      logFilesDeleted: 0,
+      credentialsDeleteAttempted: 2,
+      credentialsDeleted: 1,
+      credentialsDeleteFailed: 1,
+      credentialsDeleteErrorKinds: ["backend_unavailable"],
+    });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    await openData();
+    // 勾选「AI 服务配置」触发凭据清理路径
+    fireEvent.click(screen.getByText("AI 服务配置"));
+    fireEvent.click(screen.getByRole("button", { name: "重置所选数据" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
+    await waitFor(() =>
+      expect(screen.getAllByText(/有\s*1\s*个系统凭据未能清理/).length).toBeGreaterThan(0),
+    );
+  });
+
   it("reset_clears_super_search_persist：重置成功后同步清除 localStorage 里的超级搜索条件", async () => {
     vi.mocked(resetAppData).mockResolvedValue({
       assetsDeleted: 259,
@@ -661,6 +700,10 @@ describe("存储与维护 · 重置数据", () => {
       searchStateReset: false,
       cacheFilesDeleted: 512,
       logFilesDeleted: 0,
+      credentialsDeleteAttempted: 0,
+      credentialsDeleted: 0,
+      credentialsDeleteFailed: 0,
+      credentialsDeleteErrorKinds: [],
     });
     // 预置陈旧条件（旧 epoch 日期格式的 expr 会让 hydrate 报错 —— 这正是要清掉的场景）
     localStorage.setItem("super-search-conditions", JSON.stringify({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: 1722508800000 } } } }));
@@ -690,6 +733,10 @@ describe("存储与维护 · 重置数据", () => {
       searchStateReset: false,
       cacheFilesDeleted: 3,
       logFilesDeleted: 0,
+      credentialsDeleteAttempted: 0,
+      credentialsDeleted: 0,
+      credentialsDeleteFailed: 0,
+      credentialsDeleteErrorKinds: [],
     });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     await openData();
@@ -731,6 +778,10 @@ describe("存储与维护 · 重置数据", () => {
       searchStateReset: true,
       cacheFilesDeleted: 0,
       logFilesDeleted: 0,
+      credentialsDeleteAttempted: 0,
+      credentialsDeleted: 0,
+      credentialsDeleteFailed: 0,
+      credentialsDeleteErrorKinds: [],
     });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     await openData();

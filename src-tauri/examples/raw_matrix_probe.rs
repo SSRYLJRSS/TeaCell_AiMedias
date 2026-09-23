@@ -19,7 +19,7 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use bagertea_ai_media_v2_lib::services::{imaging, raw_decode};
+use bagertea_ai_media_v2_lib::services::imaging;
 
 fn env_or(key: &str, def: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| def.to_string())
@@ -150,8 +150,8 @@ fn main() {
 
     println!("发现 {} 个 RAW 文件\n", files.len());
     println!(
-        "  {:<6} {:<42} {:>8} {:>12} {:>12} {:>9}  {}",
-        "扩展名", "文件", "体积", "像素尺寸", "解码输出", "耗时", "判定"
+        "  {:<6} {:<42} {:>8} {:>12} {:>12} {:>9}  判定",
+        "扩展名", "文件", "体积", "像素尺寸", "解码输出", "耗时"
     );
 
     let mut rows = Vec::new();
@@ -214,14 +214,14 @@ fn main() {
         let (a, b, c, d) = agg[ext];
         panic_total += c;
         let mark = if c > 0 { " ⚠" } else { "" };
-        println!(
-            "  {:<6} {:>6} {:>8} {:>10} {:>8}{}",
-            ext, a, b, c, d, mark
-        );
+        println!("  {:<6} {:>6} {:>8} {:>10} {:>8}{}", ext, a, b, c, d, mark);
     }
 
     let pass = rows.iter().filter(|r| r.verdict == Verdict::FullOk).count();
-    let dim = rows.iter().filter(|r| r.verdict == Verdict::DimOnly).count();
+    let dim = rows
+        .iter()
+        .filter(|r| r.verdict == Verdict::DimOnly)
+        .count();
     let cf = rows
         .iter()
         .filter(|r| r.verdict == Verdict::CleanFail)

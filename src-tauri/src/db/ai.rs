@@ -433,7 +433,9 @@ pub fn create_batch_with_retag(
         if !sync {
             asset_ids.to_vec()
         } else {
-            // 读全部 (id, file_path)，按 kinship_key 分组，每组保留非 RAW（若无非 RAW 保留第一个）
+            // §11：只有「恰好 1 RAW + 1 非 RAW」的组才折叠（去重后由 assign_inner 同步回 RAW）。
+            // 多 RAW / 多非 RAW / X.RAW+X.JPG+X.PNG 等歧义组合不自动折叠——每个成员独立进批，
+            // 避免不对称同步（去重规则与标签/数值分面同步共用同一分类收口）。
             let mut stmt =
                 tx.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
             let rows: Vec<(i64, String)> = stmt
@@ -441,36 +443,30 @@ pub fn create_batch_with_retag(
                 .filter_map(|r| r.ok())
                 .collect();
             drop(stmt);
-            let path_by_id: std::collections::HashMap<i64, &str> =
-                rows.iter().map(|(id, p)| (*id, p.as_str())).collect();
-            let mut group_best: std::collections::HashMap<String, i64> = Default::default();
+            // 按 kinship_key 完整分组（含未被选中的成员，供分类判断组形状）。
+            let mut groups: std::collections::HashMap<String, Vec<(i64, bool)>> =
+                Default::default();
             for (id, path) in &rows {
                 let (key, is_raw) = crate::services::kinship::kinship_key(path);
-                let selected = asset_ids.contains(id);
-                if !selected {
-                    continue;
-                }
-                match group_best.get(&key) {
-                    Some(&cur) => {
-                        // 已有代表：非 RAW 优先替换
-                        let cur_raw = path_by_id
-                            .get(&cur)
-                            .map(|p| crate::services::kinship::kinship_key(p).1)
-                            .unwrap_or(false);
-                        if cur_raw && !is_raw {
-                            group_best.insert(key, *id);
-                        }
-                    }
-                    None => {
-                        group_best.insert(key, *id);
+                groups.entry(key).or_default().push((*id, is_raw));
+            }
+            // 对每个被选中的素材判定：其组是 Paired 且自身为 RAW 时，被折叠掉（保留非 RAW 代表）。
+            let mut drop_ids: std::collections::HashSet<i64> = Default::default();
+            for members in groups.values() {
+                if let crate::services::kinship::KinshipGroup::Paired { raw, non_raw } =
+                    crate::services::kinship::classify_kinship_group(members)
+                {
+                    // 仅当两者都被选中时才折叠 RAW（只选了 RAW 时不能凭空丢弃用户选择）。
+                    if asset_ids.contains(&raw) && asset_ids.contains(&non_raw) {
+                        drop_ids.insert(raw);
                     }
                 }
             }
-            // 保持用户传入顺序（去重不重排）
+            // 保持用户传入顺序，仅去掉被折叠的 RAW 代表。
             asset_ids
                 .iter()
                 .copied()
-                .filter(|id| group_best.values().any(|v| v == id))
+                .filter(|id| !drop_ids.contains(id))
                 .collect()
         }
     };

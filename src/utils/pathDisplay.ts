@@ -10,20 +10,36 @@
  * 顶多少截一层目录，绝不把合法文件名截断）。
  */
 import { usePlatformStore } from "@/stores/platformStore";
+import type { PlatformCapabilities } from "@/types/platform";
 
-/** 当前平台的路径分隔符正则：Windows 认 `\` 和 `/`，其余只认 `/`。 */
-function separatorRegex(): RegExp {
-  const os = usePlatformStore.getState().capabilities?.os;
+type OsName = PlatformCapabilities["os"] | undefined;
+
+/** 给定 OS 的路径分隔符正则：Windows 认 `\` 和 `/`，其余只认 `/`。 */
+function separatorRegexFor(os: OsName): RegExp {
   return os === "windows" ? /[\\/]/ : /\//;
 }
 
 /**
  * 取路径最后一段作为展示用文件名。空段（尾部分隔符）回退到原字符串。
  * 不做规范化、不访问文件系统，纯字符串处理。
+ *
+ * P3-02：`os` 可显式传入（纯函数、可测、随调用组件订阅的平台值重渲染）；
+ * 省略时退回从 store 非响应式读取（向后兼容既有调用点）。响应式调用请用
+ * `useDisplayBasename`，避免组件被 memo 化后不随平台 ready 刷新。
  */
-export function displayBasename(path: string): string {
+export function displayBasename(path: string, os?: OsName): string {
   if (!path) return path;
-  const parts = path.split(separatorRegex());
+  const resolvedOs = os ?? usePlatformStore.getState().capabilities?.os;
+  const parts = path.split(separatorRegexFor(resolvedOs));
   const last = parts[parts.length - 1];
   return last && last.length > 0 ? last : path;
+}
+
+/**
+ * 响应式版本（P3-02）：订阅平台 store 的 `os`，平台从 idle→ready 变化时组件重渲染，
+ * Windows 路径不会在 ready 前短暂显示完整反斜杠路径并卡住。
+ */
+export function useDisplayBasename(path: string): string {
+  const os = usePlatformStore((s) => s.capabilities?.os);
+  return displayBasename(path, os);
 }

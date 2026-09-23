@@ -151,11 +151,25 @@ pub async fn save_ai_connection(
 }
 
 /// 删除连接档案（同时删除用途绑定与系统凭据）。
+///
+/// §10：DB 锁内只做数据库删除；凭据删除在锁外执行。数据库删除成功、凭据删除失败时，
+/// 连接已从列表消失（不再可用），残留 keyring 项不含引用、只是惰性垃圾，记录 warning
+/// 供后续排查即可，不因凭据删除失败反过来判定整体失败。
 #[tauri::command]
-pub fn delete_ai_connection(state: State<AppState>, id: String) -> AppResult<()> {
-    let conn = lock_db(&state)?;
-    ai_connections::delete(&conn, &id)?;
-    let _ = credentials::delete_api_key(&id);
+pub async fn delete_ai_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    {
+        let conn = lock_db(&state)?;
+        ai_connections::delete(&conn, &id)?;
+    }
+    // 锁已释放：keyring 删除是阻塞系统调用，放锁外线程。
+    let id_for_key = id.clone();
+    let cred =
+        tauri::async_runtime::spawn_blocking(move || credentials::delete_api_key(&id_for_key))
+            .await
+            .map_err(|e| AppError::msg(format!("凭据删除任务失败: {e}")))?;
+    if let Err(e) = cred {
+        tracing::warn!("连接 {id} 已删除，但系统凭据清理失败（残留项不含引用，可忽略）: {e}");
+    }
     Ok(())
 }
 
@@ -212,27 +226,30 @@ pub async fn test_ai_connection(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> AppResult<crate::services::ai_cloud::AiConnectionTestResult> {
-    // DB 与 keyring 都是阻塞调用：先在当前任务提取需要的数据（短锁），网络测试放 spawn_blocking。
-    // State 不能 move 进 'static 闭包，所以这里克隆 Arc 后释放。
-    let (base_url, protocol, model, api_key, is_local) = {
+    // §10：DB 锁内只读不含 plaintext 的连接 DTO；keyring 访问一律在锁外。
+    // 先短锁复制连接行，释放锁，再读 keyring，最后 spawn_blocking 做网络测试。
+    let (base_url, protocol, model, api_key_ref, is_local) = {
         let conn = lock_db(&state)?;
         let c = ai_connections::get(&conn, &connection_id)?
             .ok_or_else(|| AppError::msg("连接档案不存在"))?;
         if c.base_url.trim().is_empty() {
             return Err(AppError::msg("该服务未填写地址，请先编辑并保存"));
         }
-        // 从 keyring 读取密钥；未配置时按空串处理（本地服务通常无需密钥）
-        let api_key = match &c.api_key_ref {
-            Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
-            None => String::new(),
-        };
         (
             c.base_url,
             c.protocol,
             c.model,
-            api_key,
+            c.api_key_ref,
             c.deployment == "local",
         )
+    };
+    // 锁已释放：从 keyring 读密钥（阻塞）；未配置时按空串处理（本地服务通常无需密钥）。
+    let api_key = match api_key_ref {
+        Some(id) => tauri::async_runtime::spawn_blocking(move || credentials::get_api_key(&id))
+            .await
+            .map_err(|e| AppError::msg(format!("凭据读取任务失败: {e}")))??
+            .unwrap_or_default(),
+        None => String::new(),
     };
     tauri::async_runtime::spawn_blocking(move || {
         Ok(crate::services::ai_cloud::test_connection(
@@ -258,26 +275,17 @@ pub async fn discover_ai_models(
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> AppResult<Vec<String>> {
-    let (base_url, protocol, deployment, key) = {
+    // §10：DB 锁内只读不含 plaintext 的连接 DTO（含 api_key_ref），keyring 读取移到锁外。
+    let (base_url, protocol, deployment, api_key_ref) = {
         let conn = lock_db(&state)?;
         if let Some(cid) = &connection_id {
             let c =
                 ai_connections::get(&conn, cid)?.ok_or_else(|| AppError::msg("连接档案不存在"))?;
-            // keyring 读取（阻塞）在短锁内完成；未配置时按空串处理（本地服务通常无需密钥）
-            let saved_key = match &c.api_key_ref {
-                Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
-                None => String::new(),
-            };
-            // 草稿 key 优先于 saved key（§13.5）
-            let key = match &api_key {
-                Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-                _ => saved_key,
-            };
             (
                 base_url.unwrap_or(c.base_url),
                 protocol.unwrap_or(c.protocol),
                 deployment.unwrap_or(c.deployment),
-                key,
+                c.api_key_ref,
             )
         } else {
             let b = base_url.ok_or_else(|| AppError::msg("请先填写服务地址"))?;
@@ -285,9 +293,20 @@ pub async fn discover_ai_models(
                 b,
                 protocol.unwrap_or_else(|| "openai_chat".to_string()),
                 deployment.unwrap_or_else(|| "cloud".to_string()),
-                api_key.unwrap_or_default(),
+                None,
             )
         }
+    };
+    // 锁已释放：草稿 key 优先于 keyring 保存值（§13.5）；keyring 读取（阻塞）在锁外完成。
+    let key = match &api_key {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => match api_key_ref {
+            Some(id) => tauri::async_runtime::spawn_blocking(move || credentials::get_api_key(&id))
+                .await
+                .map_err(|e| AppError::msg(format!("凭据读取任务失败: {e}")))??
+                .unwrap_or_default(),
+            None => String::new(),
+        },
     };
     tauri::async_runtime::spawn_blocking(move || {
         crate::services::ai_cloud::discover_models(

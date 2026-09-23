@@ -12,6 +12,7 @@
 use serde::Serialize;
 
 /// 前端消费的平台能力 DTO。字段名 camelCase 与 TS `PlatformCapabilities` 对齐。
+/// 只保留当前实际会消费的字段：不含未使用的窗口控制/修饰键/迁移能力。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlatformCapabilities {
@@ -20,12 +21,9 @@ pub struct PlatformCapabilities {
     pub arch: &'static str,
     /// 仅 Windows 提供应用管理的 Ollama（用户批准的唯一平台差异）。
     pub managed_ollama: bool,
-    /// macOS 使用原生窗口按钮（红黄绿）；Windows/Linux 沿用现有控制方式。
-    pub native_window_controls: bool,
-    /// 主修饰键：macOS 为 meta（⌘），其余为 ctrl。
-    pub primary_modifier: &'static str,
-    /// 迁移协议版本；只有 M4 验收完成后才置 Some(1)。当前为 None。
-    pub library_transfer_version: Option<u32>,
+    /// 首选视频兼容代理变体：Windows/macOS 用 H.264 MP4，Linux 用 VP8 WebM。
+    /// 前端所有 ensure/status/cancel 调用从同一 selector 取 variant，不允许组件硬编码。
+    pub preferred_video_proxy: &'static str,
 }
 
 /// 编译期确定的操作系统名。
@@ -57,6 +55,15 @@ pub const fn managed_ollama_supported() -> bool {
     cfg!(target_os = "windows")
 }
 
+/// 首选视频兼容代理变体：Linux 缺少 H.264 专利许可，回退到 VP8/WebM；其余用 H.264 MP4。
+pub const fn preferred_video_proxy() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "vp8_webm"
+    } else {
+        "h264_mp4"
+    }
+}
+
 /// 计算当前构建目标的静态能力。纯函数、零副作用。
 pub fn capabilities() -> PlatformCapabilities {
     let os = current_os();
@@ -65,14 +72,7 @@ pub fn capabilities() -> PlatformCapabilities {
         os,
         arch: current_arch(),
         managed_ollama: managed_ollama_supported(),
-        native_window_controls: cfg!(target_os = "macos"),
-        primary_modifier: if cfg!(target_os = "macos") {
-            "meta"
-        } else {
-            "ctrl"
-        },
-        // M4 验收前迁移能力不对外声明为可用。
-        library_transfer_version: None,
+        preferred_video_proxy: preferred_video_proxy(),
     }
 }
 
@@ -86,16 +86,12 @@ mod tests {
         assert_eq!(c.schema_version, 1);
         // managed_ollama 当且仅当 Windows
         assert_eq!(c.managed_ollama, cfg!(target_os = "windows"));
-        // 原生窗口按钮当且仅当 macOS
-        assert_eq!(c.native_window_controls, cfg!(target_os = "macos"));
-        // 主修饰键与平台一致
-        if cfg!(target_os = "macos") {
-            assert_eq!(c.primary_modifier, "meta");
+        // 视频代理变体与平台一致：Linux WebM，其余 MP4
+        if cfg!(target_os = "linux") {
+            assert_eq!(c.preferred_video_proxy, "vp8_webm");
         } else {
-            assert_eq!(c.primary_modifier, "ctrl");
+            assert_eq!(c.preferred_video_proxy, "h264_mp4");
         }
-        // 迁移协议 M4 前不可用
-        assert_eq!(c.library_transfer_version, None);
         // os/arch 不为 unknown（在受支持首发目标上编译时）
         assert_ne!(c.os, "");
     }

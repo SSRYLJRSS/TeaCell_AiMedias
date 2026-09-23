@@ -62,9 +62,7 @@ describe("LocalModelGroup", () => {
         os: "windows",
         arch: "x86_64",
         managedOllama: true,
-        nativeWindowControls: false,
-        primaryModifier: "ctrl",
-        libraryTransferVersion: null,
+        preferredVideoProxy: "h264_mp4",
       },
     });
   });
@@ -95,9 +93,7 @@ describe("LocalModelGroup", () => {
         os: "macos",
         arch: "aarch64",
         managedOllama: false,
-        nativeWindowControls: true,
-        primaryModifier: "meta",
-        libraryTransferVersion: null,
+        preferredVideoProxy: "h264_mp4",
       },
     });
     render(

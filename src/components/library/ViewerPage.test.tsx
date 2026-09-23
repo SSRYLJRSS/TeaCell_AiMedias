@@ -6,6 +6,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";import ViewerPage from "@/components/library/ViewerPage";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { usePlatformStore } from "@/stores/platformStore";
 import { ensureVideoProxy } from "@/api/video";
 import type { Asset } from "@/types/asset";
 
@@ -72,6 +73,19 @@ beforeEach(() => {
     },
   });
   (useLibraryStore.getState() as unknown as { loadMore: () => void }).loadMore = vi.fn();
+  // P1-03：视频代理仅在平台能力 ready 后请求。默认置为 Windows ready（h264_mp4），
+  // 使既有代理测试沿用 h264_mp4；Linux 变体时序另有专门用例覆盖。
+  usePlatformStore.setState({
+    status: "ready",
+    error: null,
+    capabilities: {
+      schemaVersion: 1,
+      os: "windows",
+      arch: "x86_64",
+      managedOllama: true,
+      preferredVideoProxy: "h264_mp4",
+    },
+  });
 });
 
 describe("ViewerPage 视频识别（§7.1）", () => {

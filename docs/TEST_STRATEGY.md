@@ -1,12 +1,12 @@
 # 测试策略
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-22
 >
 > 本文档定义测试分层、自动化门禁、数据要求和发布标准。详细真机步骤见 [QA_PLAYBOOK.md](QA_PLAYBOOK.md)。
 
 ## 1. 目标
 
-测试要守住六条产品承诺：
+测试要守住七条产品承诺：
 
 1. 用户文件不因删除、移动、导出或恢复而静默丢失。
 2. 数据库、FTS、标签计数和磁盘状态保持一致。
@@ -14,6 +14,7 @@
 4. 长任务可取消、可恢复，并有真实进度。
 5. 数万级素材下列表和搜索可用。
 6. 云端 AI 和本地模型失败时能解释、降级或安全停止。
+7. Windows、macOS 和 Linux 从同一代码主线构建，平台差异不会破坏核心五步闭环。
 
 ## 2. 测试分层
 
@@ -47,6 +48,7 @@
 | 日志/诊断 | 脱敏、长度限制、日志保留/截断、诊断包内容、关联 ID、panic/fatal、级别切换 | Rust 单测 + 前端组件测试 + UAT |
 | UI | 主题、窄窗、键盘、长文本、无重叠 | 组件测试 + 视觉走查 |
 | 安全 | 路径穿越、SQL 注入、凭据存储 | 单元、代码审查、UAT |
+| 平台 | 路径/编码、目标依赖、能力门控、安装启动、核心五步闭环 | 三端 CI + 目标真机 UAT |
 
 ## 4. 自动化门禁
 
@@ -77,7 +79,25 @@ npm run build
 pwsh ./scripts/smoke.ps1
 ```
 
-CI 对应 `.github/workflows/smoke.yml`。网络 mock 类目标允许按脚本设计串行重试一次，其他失败不自动忽略。
+Windows 本地对应 `.github/workflows/smoke.yml`。网络 mock 类目标允许按脚本设计串行重试一次，其他失败不自动忽略。
+桌面发布构建另需先通过 `npm run desktop:check:strict -- --target <triple>`，再由
+`.github/workflows/release-candidate.yml` 生成安装包和 per-target manifest；缺 sidecar、编码器、
+许可证、安装包或校验和时必须失败。
+
+### 4.3 跨平台门禁目标
+
+每个合并候选至少包含：
+
+| 平台 | 合并前必需证据 |
+|---|---|
+| Windows 10/11 x64 | 完整前端门禁、Rust fmt/clippy/test、现有 smoke、严格桌面构建 |
+| Apple Silicon macOS | 前端门禁、Rust fmt/clippy/test、目标平台编译和平台专属测试、严格桌面构建 |
+| Ubuntu 24.04 x64 | 安装系统依赖后执行前端门禁、Rust fmt/clippy/test、平台专属测试、严格桌面构建 |
+
+候选发布另需三个平台实际打包。日常 PR 可以不生成安装包，但不能跳过目标平台编译与测试。
+具体支持范围见 [PLATFORM.md](PLATFORM.md)。当前 `code-gate.yml` 与 `release-candidate.yml` 已在
+工作树中配置，但尚未由 GitHub runner 实际运行；在真实运行前仍只能把它们作为待执行门禁，不能
+把工作流文件存在写成三端已通过。
 
 ## 5. 定向测试要求
 
@@ -109,7 +129,8 @@ CI 对应 `.github/workflows/smoke.yml`。网络 mock 类目标允许按脚本�
 | 搜索 | 只命中 must、只命中 should A/B、同时命中、全不命中、被 mustNot 排除 |
 | 规模 | 1000 条用于快速回归；3 万条用于性能和虚拟滚动 |
 
-真实素材不得提交到仓库。探针通过本机路径读取，测试库应在每轮 UAT 前可重置。
+小型、无隐私且许可明确的合成样本可以提交到仓库。大型 RAW/HEIC/视频与真实素材包放在仓库外，
+记录版本、文件清单和校验值；探针通过本机路径读取。测试库应在每轮 UAT 前可重置。
 
 ### 6.2 搜索 UAT 证据
 
@@ -140,12 +161,16 @@ CI 对应 `.github/workflows/smoke.yml`。网络 mock 类目标允许按脚本�
 - 黄金用户旅程和真实素材搜索 UAT 完成。
 - 性能清单通过或明确记录目标机器限制。
 - 安装包、数据目录、日志、备份和回滚步骤已复核。
+- 三个平台候选包来自同一提交；Windows 完整 UAT 通过，macOS/Linux 当前版本的核心五步闭环
+  已在目标真机通过。
 
 任何一项未完成，状态只能是“未放行”。
 
 ## 8. CI
 
-GitHub Actions 在 push/PR 到 `main` 时执行冒烟：
+当前 `main` 的既有 workflow 仍只在 Windows runner 执行以下冒烟；三目标 `code-gate.yml` 与候选
+打包 workflow 目前在隔离工作树中，尚未由 GitHub runner 实际跑过，不能把草稿当成已接入门禁。
+候选包工作流首轮只允许手动 `workflow_dispatch`，真实运行稳定后再评估标签触发：
 
 1. Rust 稳定组。
 2. AI/Ollama mock 网络组，串行并允许一次 flaky 重试。

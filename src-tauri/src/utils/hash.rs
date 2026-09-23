@@ -1,4 +1,4 @@
-//! 文件哈希：sha256 取前 16 字节 hex（入库去重/重复提示用，T03 起用）
+//! 文件哈希：sha256 取前 16 字节 hex（入库去重/重复提示用，T03 起用）。
 
 use std::fs::File;
 use std::io::{BufReader, Read};

@@ -1056,10 +1056,10 @@ describe("Phase 4 · 数值输入统一", () => {
     clickMustFirstCondition();
     pickField(label);
   }
-  function leafFilter(): any {
+  function leafFilter(): Record<string, unknown> | undefined {
     const e = useSuperSearchStore.getState().expr;
     if (!e || e.op !== "leaf" || e.cond.type !== "metadata") return undefined;
-    return e.cond.filter;
+    return e.cond.filter as unknown as Record<string, unknown>;
   }
 
   it("valueInput_respects_domain_bounds：数值输入 clamp 到 NumericDomain 的 min/max", () => {

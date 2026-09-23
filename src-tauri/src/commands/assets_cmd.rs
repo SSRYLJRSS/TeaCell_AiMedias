@@ -154,11 +154,9 @@ fn delete_assets_blocking(
             .filter_map(|&id| {
                 // 删除只需要路径；不要为全库重置加载完整 Asset 与标签，
                 // 否则素材量大时会额外占用大量内存和查询时间。
-                conn.query_row(
-                    "SELECT file_path FROM assets WHERE id = ?1",
-                    [id],
-                    |row| row.get::<_, String>(0),
-                )
+                conn.query_row("SELECT file_path FROM assets WHERE id = ?1", [id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .ok()
                 .map(|path| (id, PathBuf::from(path)))
             })

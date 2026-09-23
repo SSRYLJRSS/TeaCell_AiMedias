@@ -140,3 +140,18 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 function tracingWarn(msg: string) {
   logger.warn(`[settingsStore] ${msg}`);
 }
+
+/**
+ * 测试专用：复位所有模块级共享状态（single-flight promise、防抖定时器、待落库副本）。
+ *
+ * 这些是模块作用域变量，不随 `useSettingsStore.setState(...)` 复位。测试之间只重置 store
+ * 状态、却漏掉这里，会造成上一个用例遗留的防抖 save 定时器在后续用例里触发一次额外的
+ * getSettings（回读对账），表现为「第一次完整运行断言次数偏多」的顺序相关 flaky。
+ * 生产不调用本函数。
+ */
+export function __resetSettingsModuleStateForTest() {
+  loadPromise = null;
+  if (appearanceTimer) clearTimeout(appearanceTimer);
+  appearanceTimer = null;
+  pendingSave = null;
+}

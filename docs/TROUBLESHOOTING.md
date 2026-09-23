@@ -129,7 +129,10 @@ CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 
 - `heif-bin/` 是否存在。
 - `.cargo/config.toml` 是否指向预编译库。
 - LLVM/libclang 是否可用。
-- MSVC STL 版本与 shim 是否匹配。
+- MSVC STL 版本与 shim 是否匹配。`msvc_stl_shim.cpp` 仅在 `_MSC_VER < 1945`
+  （Build Tools 14.45 之前）提供 `__std_*` 补符号；14.45+ 已由 STL 提供这些符号，
+  会自动跳过 shim。若远端升级工具链后出现 `C2733` 重复声明，先确认工作树包含这条
+  版本门控，而不是重新添加一份 extern "C" 实现。
 - 网络下载失败时是否使用了完整、未损坏的预编译包。
 
 ## 4. 搜索
@@ -315,7 +318,7 @@ Windows 上优先在 PowerShell 运行 cargo。若 GNU `link` 抢占 MSVC linker
 
 ### 9.4 后端没有重新编译
 
-确认 cargo watcher 进程存在。不确定时结束旧的 `npm run tauri dev`，然后重新启动。
+确认 cargo watcher 进程存在。不确定时结束旧的 `npm run desktop:dev`，然后重新启动。
 
 ### 9.5 测试/构建产物污染 Git 状态
 

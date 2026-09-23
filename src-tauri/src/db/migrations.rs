@@ -1836,6 +1836,9 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     // + ai_suggestion_items 数值两列。无条件幂等段（逐列容错 ALTER + IF NOT EXISTS），
     // 不推进 user_version（与 V23 同理；存量库每次启动自愈补齐）。
     migrate_v24(conn)?;
+    // V25（P1-05）：视频代理缓存指纹列（source/encoder/tool 指纹 + 诊断 source_path）。
+    // 无条件幂等段（逐列容错 ALTER），不推进 user_version；不改 V14 已发布建表。
+    migrate_v25_video_proxy_fingerprints(conn)?;
     // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
@@ -1904,6 +1907,42 @@ CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value,
     }
     if !item_cols.iter().any(|c| c == "num_value") {
         conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN num_value REAL")?;
+    }
+    Ok(())
+}
+
+/// V25（P1-05）：视频代理缓存指纹列。**不修改已发布迁移**（V14 建表不动），只在
+/// `video_proxies` 上幂等追加四列，供服务层判定「源内容 / 编码策略 / 工具版本」是否变化：
+///  - `source_fingerprint TEXT`：源素材内容指纹（内容 hash 优先，回退 size+mtime）；
+///  - `encoder_version INTEGER`：编码策略版本常量（改 codec/码率/像素格式/容器/兼容参数时递增）；
+///  - `tool_fingerprint TEXT`：已验证 ffmpeg 版本 + 二进制指纹；
+///  - `source_path TEXT`：诊断用（原路径，非判定依据）。
+///
+/// 逐列容错 ALTER（SQLite ALTER 无 IF NOT EXISTS）；无条件幂等段，不推进 user_version
+/// （与 V23/V24 同理，存量库每次启动自愈补齐）。旧 ready 记录三列为 NULL，服务层视为
+/// 「指纹缺失 = 不匹配」→ 重新生成，绝不把旧代理当有效。
+fn migrate_v25_video_proxy_fingerprints(conn: &Connection) -> AppResult<()> {
+    for (ddl, col) in [
+        (
+            "ALTER TABLE video_proxies ADD COLUMN source_fingerprint TEXT",
+            "source_fingerprint",
+        ),
+        (
+            "ALTER TABLE video_proxies ADD COLUMN encoder_version INTEGER",
+            "encoder_version",
+        ),
+        (
+            "ALTER TABLE video_proxies ADD COLUMN tool_fingerprint TEXT",
+            "tool_fingerprint",
+        ),
+        (
+            "ALTER TABLE video_proxies ADD COLUMN source_path TEXT",
+            "source_path",
+        ),
+    ] {
+        if !has_column(conn, "video_proxies", col)? {
+            conn.execute_batch(ddl)?;
+        }
     }
     Ok(())
 }
@@ -2047,6 +2086,61 @@ mod tests {
         .unwrap();
         c.pragma_update(None, "user_version", 14).unwrap();
         c
+    }
+
+    /// P1-05：V25 视频代理指纹列。老库（只有 V14 建的 video_proxies）升级后：
+    ///  - 四列存在；
+    ///  - 旧 ready 记录三项指纹为 NULL（服务层据此判定不新鲜、重新生成）；
+    ///  - 重复执行幂等。
+    #[test]
+    fn v25_adds_video_proxy_fingerprint_columns_idempotently() {
+        let c = mem();
+        // 模拟 V14 建的旧 video_proxies（无指纹列）+ 一条旧 ready 记录
+        c.execute_batch(
+            "CREATE TABLE assets (id INTEGER PRIMARY KEY, file_path TEXT);
+             CREATE TABLE video_proxies (
+               asset_id   INTEGER NOT NULL,
+               variant    TEXT    NOT NULL DEFAULT 'h264_mp4',
+               status     TEXT    NOT NULL DEFAULT 'queued',
+               path       TEXT,
+               error      TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY (asset_id, variant));
+             INSERT INTO assets (id, file_path) VALUES (1, '/v.mp4');
+             INSERT INTO video_proxies (asset_id, variant, status, path, created_at, updated_at)
+               VALUES (1, 'h264_mp4', 'ready', '/proxy/1_h264_mp4.mp4', 1, 1);",
+        )
+        .unwrap();
+        assert!(!has_column(&c, "video_proxies", "source_fingerprint").unwrap());
+
+        migrate_v25_video_proxy_fingerprints(&c).unwrap();
+        // 幂等：再跑一次无副作用
+        migrate_v25_video_proxy_fingerprints(&c).unwrap();
+
+        for col in [
+            "source_fingerprint",
+            "encoder_version",
+            "tool_fingerprint",
+            "source_path",
+        ] {
+            assert!(
+                has_column(&c, "video_proxies", col).unwrap(),
+                "V25 应补列 {col}"
+            );
+        }
+        // 旧 ready 记录三项指纹为 NULL：服务层视为不新鲜
+        let (sf, ev, tf): (Option<String>, Option<i64>, Option<String>) = c
+            .query_row(
+                "SELECT source_fingerprint, encoder_version, tool_fingerprint
+                   FROM video_proxies WHERE asset_id=1 AND variant='h264_mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sf, None);
+        assert_eq!(ev, None);
+        assert_eq!(tf, None);
     }
 
     /// v15 迁移：每个 profile 迁入连接表、apiMode→protocol 映射正确、active 绑定两用途。

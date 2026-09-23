@@ -94,7 +94,7 @@ export function WindowControls() {
         onClick={close}
         aria-label="关闭"
         title="关闭"
-        className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[#e81123] hover:text-white"
+        className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-danger)] hover:text-white"
       >
         <X size={16} strokeWidth={1.75} aria-hidden="true" />
       </button>
@@ -103,6 +103,8 @@ export function WindowControls() {
 }
 
 export default function TitleBar() {
+  // 三端统一自绘标题栏（decorations:false 全平台不变）：始终渲染 WindowControls，
+  // 不按平台隐藏，避免 macOS 上既无原生标题栏又无自绘按钮的矛盾。
   return (
     <header
       data-tauri-drag-region
@@ -129,7 +131,7 @@ export default function TitleBar() {
       {/* 中间空白拖拽区 */}
       <div data-tauri-drag-region className="min-w-0 flex-1" />
 
-      {/* 右侧：窗口控制（只保留最小化/最大化/关闭） */}
+      {/* 右侧：窗口控制（只保留最小化/最大化/关闭）。三端统一渲染。 */}
       <WindowControls />
     </header>
   );

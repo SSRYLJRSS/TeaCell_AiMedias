@@ -5,8 +5,11 @@
 // 的 STL 尚无这些符号，链接报 LNK2019。此处按 STL ABI 语义手工补齐，
 // 与 MSVC 后续版本内置实现行为等价。
 //
-// 当本机 Build Tools 升级到 14.45+ 后本文件可整体删除（届时内置实现会接管，
-// 符号重复定义需同步删掉 build.rs 的 cc 编译段）。
+// Build Tools 14.45+ 已经自带这些符号，不能再定义一份同名的 extern "C"
+// 实现，否则新版 STL 头文件和链接阶段都会报重复定义。因此保留本文件和
+// build.rs 的统一入口，但只在旧工具链（< 14.45）上编译下面的实现。
+
+#if !defined(_MSC_VER) || _MSC_VER < 1945
 
 #include <algorithm>
 #include <cstdint>
@@ -72,3 +75,5 @@ extern "C" uint32_t* __std_unique_4(uint32_t* first, uint32_t* last) {
     }
     return out + 1;
 }
+
+#endif // !defined(_MSC_VER) || _MSC_VER < 1945

@@ -45,6 +45,75 @@ pub fn is_kinship(a: &str, b: &str) -> bool {
     ka == kb && ra != rb
 }
 
+/// 同源组分类结果（三端复核 §11）。
+///
+/// 只有「恰好一个 RAW + 恰好一个非 RAW」才是可自动同步的配对（`Paired`）；其余任何组合
+/// （单独一个、多 RAW、多非 RAW、`X.RAW + X.JPG + X.PNG` 等）都是 `Ambiguous`，
+/// AI 去重、标签同步、数值分面同步、去重排除一律不得自动扩散。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KinshipGroup {
+    /// 恰好一个 RAW + 恰好一个非 RAW：可安全双向同步。
+    Paired { raw: i64, non_raw: i64 },
+    /// 其他组合：不自动扩散。携带排序后的全部成员 id 供调用方展示/诊断。
+    Ambiguous(Vec<i64>),
+}
+
+/// 对同 `kinship_key` 的**完整组**一次分类（§11）。
+///
+/// `members` 是同一组的全部 `(asset_id, is_raw)`。调用方必须先按 `kinship_key` 完整分组，
+/// 不允许两两比较后再拼装——两两关系在 `1 RAW + 2 非 RAW` 等组合下会产生不对称同步。
+pub fn classify_kinship_group(members: &[(i64, bool)]) -> KinshipGroup {
+    let raws: Vec<i64> = members
+        .iter()
+        .filter(|(_, r)| *r)
+        .map(|(id, _)| *id)
+        .collect();
+    let non_raws: Vec<i64> = members
+        .iter()
+        .filter(|(_, r)| !*r)
+        .map(|(id, _)| *id)
+        .collect();
+    if raws.len() == 1 && non_raws.len() == 1 {
+        KinshipGroup::Paired {
+            raw: raws[0],
+            non_raw: non_raws[0],
+        }
+    } else {
+        let mut ids: Vec<i64> = members.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        KinshipGroup::Ambiguous(ids)
+    }
+}
+
+/// 从完整 `(id, file_path)` 列表中取 `asset_id` 的**唯一同源兄弟**（§11）。
+///
+/// 仅当 `asset_id` 所在组恰好是「一个 RAW + 一个非 RAW」时返回对方 id；其余组合返回
+/// `None`（Ambiguous 不自动扩散）。这是标签同步 / 数值分面同步的统一收口，禁止各调用点
+/// 再自行比较 key。
+pub fn paired_sibling(all: &[(i64, String)], asset_id: i64) -> Option<i64> {
+    let target_path = all.iter().find(|(id, _)| *id == asset_id)?.1.as_str();
+    let (target_key, _) = kinship_key(target_path);
+    let members: Vec<(i64, bool)> = all
+        .iter()
+        .filter_map(|(id, p)| {
+            let (k, r) = kinship_key(p);
+            (k == target_key).then_some((*id, r))
+        })
+        .collect();
+    match classify_kinship_group(&members) {
+        KinshipGroup::Paired { raw, non_raw } => {
+            if asset_id == raw {
+                Some(non_raw)
+            } else if asset_id == non_raw {
+                Some(raw)
+            } else {
+                None
+            }
+        }
+        KinshipGroup::Ambiguous(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +164,90 @@ mod tests {
         );
         // 一 RAW 一 JPG：算
         assert!(is_kinship("d:/a/X.JPG", "d:/a/X.RW2"));
+    }
+
+    /// §11：只有 1 RAW + 1 非 RAW 才 Paired；其余组合 Ambiguous，不自动扩散。
+    #[test]
+    fn classify_group_only_pairs_exactly_one_raw_one_non_raw() {
+        // 1 RAW + 1 非 RAW → Paired
+        assert_eq!(
+            classify_kinship_group(&[(1, true), (2, false)]),
+            KinshipGroup::Paired { raw: 1, non_raw: 2 }
+        );
+        // 顺序无关
+        assert_eq!(
+            classify_kinship_group(&[(2, false), (1, true)]),
+            KinshipGroup::Paired { raw: 1, non_raw: 2 }
+        );
+        // 单独一个 → Ambiguous
+        assert_eq!(
+            classify_kinship_group(&[(9, false)]),
+            KinshipGroup::Ambiguous(vec![9])
+        );
+        // 1 RAW + 2 非 RAW（X.RAW + X.JPG + X.PNG）→ Ambiguous
+        assert_eq!(
+            classify_kinship_group(&[(1, true), (2, false), (3, false)]),
+            KinshipGroup::Ambiguous(vec![1, 2, 3])
+        );
+        // 2 RAW + 1 非 RAW → Ambiguous
+        assert_eq!(
+            classify_kinship_group(&[(1, true), (2, true), (3, false)]),
+            KinshipGroup::Ambiguous(vec![1, 2, 3])
+        );
+        // 2 RAW + 2 非 RAW → Ambiguous
+        assert_eq!(
+            classify_kinship_group(&[(1, true), (2, true), (3, false), (4, false)]),
+            KinshipGroup::Ambiguous(vec![1, 2, 3, 4])
+        );
+    }
+
+    /// §11：paired_sibling 只在恰好配对时返回对方，Ambiguous 一律 None。
+    #[test]
+    fn paired_sibling_covers_group_shapes() {
+        // 1+1：互为兄弟
+        let all = vec![(1, "d:/a/X.RW2".to_string()), (2, "d:/a/X.JPG".to_string())];
+        assert_eq!(paired_sibling(&all, 1), Some(2));
+        assert_eq!(paired_sibling(&all, 2), Some(1));
+
+        // 1 RAW + 2 非 RAW：全部 None（不对称同步的根因组合）
+        let all = vec![
+            (1, "d:/a/X.RW2".to_string()),
+            (2, "d:/a/X.JPG".to_string()),
+            (3, "d:/a/X.PNG".to_string()),
+        ];
+        assert_eq!(paired_sibling(&all, 1), None);
+        assert_eq!(paired_sibling(&all, 2), None);
+        assert_eq!(paired_sibling(&all, 3), None);
+
+        // 2 RAW + 1 非 RAW：全部 None
+        let all = vec![
+            (1, "d:/a/X.RW2".to_string()),
+            (2, "d:/a/X.DNG".to_string()),
+            (3, "d:/a/X.JPG".to_string()),
+        ];
+        assert_eq!(paired_sibling(&all, 3), None);
+
+        // 同目录不同 stem：不同组，None
+        let all = vec![(1, "d:/a/X.RW2".to_string()), (2, "d:/a/Y.JPG".to_string())];
+        assert_eq!(paired_sibling(&all, 1), None);
+
+        // 同 stem 不同目录：不同组，None
+        let all = vec![(1, "d:/a/X.RW2".to_string()), (2, "d:/b/X.JPG".to_string())];
+        assert_eq!(paired_sibling(&all, 1), None);
+
+        // Windows 盘符 + 大小写主干名折叠：1+1 仍配对
+        let all = vec![
+            (1, "C:/all/ABC.RW2".to_string()),
+            (2, "C:/all/abc.jpg".to_string()),
+        ];
+        assert_eq!(paired_sibling(&all, 1), Some(2));
+
+        // 文件名含反斜杠（Unix 合法字符）：不同 stem，None
+        let all = vec![
+            (1, "/home/a\\b.RW2".to_string()),
+            (2, "/home/a\\b.JPG".to_string()),
+        ];
+        // a\b 作为完整 stem 在两条上一致 → 1+1 配对
+        assert_eq!(paired_sibling(&all, 1), Some(2));
     }
 }

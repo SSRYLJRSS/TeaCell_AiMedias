@@ -4,6 +4,14 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 
 export type VideoProxyStatus = "queued" | "running" | "ready" | "failed" | "canceled";
 
+/**
+ * 代理变体（三端复核 R2）：与后端 services/video.rs 的 ProxyVariant 严格枚举对齐。
+ *  - h264_mp4：Windows/macOS 首选（H.264/AAC MP4）；
+ *  - vp8_webm：Linux 缺 H.264 解码器时的回退（VP8/Vorbis WebM）。
+ * 后端只接受这两个值，其余一律 invalid_arg。
+ */
+export type ProxyVariant = "h264_mp4" | "vp8_webm";
+
 export interface VideoProxy {
   assetId: number;
   variant: string;
@@ -13,16 +21,20 @@ export interface VideoProxy {
   updatedAt: number;
 }
 
-/** 确保生成 H.264/AAC MP4 兼容代理（已存在则直接返回；转码在后台线程）。 */
-export function ensureVideoProxy(assetId: number, variant = "h264_mp4"): Promise<VideoProxy> {
+/**
+ * 确保生成兼容代理（已存在则直接返回；转码在后台线程）。
+ * P1-03：API 层**不再硬编码跨平台默认**。variant 省略时不传，由后端按平台默认决定
+ * （Linux→vp8_webm，Windows/macOS→h264_mp4）；显式传入时透传，后端严格枚举校验。
+ */
+export function ensureVideoProxy(assetId: number, variant?: ProxyVariant): Promise<VideoProxy> {
   return invoke<VideoProxy>("ensure_video_proxy", { assetId, variant });
 }
 
-export function getVideoProxyStatus(assetId: number, variant = "h264_mp4"): Promise<VideoProxy | null> {
+export function getVideoProxyStatus(assetId: number, variant?: ProxyVariant): Promise<VideoProxy | null> {
   return invoke<VideoProxy | null>("get_video_proxy_status", { assetId, variant });
 }
 
-export function cancelVideoProxy(assetId: number, variant = "h264_mp4"): Promise<void> {
+export function cancelVideoProxy(assetId: number, variant?: ProxyVariant): Promise<void> {
   return invoke<void>("cancel_video_proxy", { assetId, variant });
 }
 

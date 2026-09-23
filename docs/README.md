@@ -1,6 +1,6 @@
 # 文档中心
 
-> 更新日期：2026-09-13
+> 更新日期：2026-09-22
 >
 > 本文档只维护“当前有效信息”和阅读路径。一次性实施方案、阶段报告、修复稿、旧版测试报告不再长期保留，历史内容以 Git 历史为准。
 
@@ -21,7 +21,8 @@ AI 或新开发者进入项目时，默认只读以下最小集合：
 1. `AGENTS.md`
 2. `docs/ARCHITECTURE.md`
 3. `docs/DEVELOPMENT.md`
-4. 任务相关的产品、UI、契约或测试文档
+4. 涉及操作系统资源或分发时读取 `docs/PLATFORM.md`
+5. 任务相关的产品、UI、契约或测试文档
 
 不要在未确认任务相关性时加载整批历史文档，也不要读取本地 AI 工具的历史缓存来补全项目事实。
 
@@ -33,6 +34,7 @@ AI 或新开发者进入项目时，默认只读以下最小集合：
 | [PROJECT_PLAN.md](PROJECT_PLAN.md) | 当前交付状态、里程碑、下一阶段、发布阻塞 | 排期、发布、阶段复盘时 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 前后端结构、模块职责、数据流、关键机制、设计约束 | 改代码前必读，结构变化时同步 |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | 环境、命令、分层、代码规范、测试、迁移、AI 协作流程 | 所有开发任务 |
+| [PLATFORM.md](PLATFORM.md) | 支持系统、支持等级、能力矩阵、平台差异边界 | 路径、进程、凭据、原生依赖、打包和跨平台发布 |
 | [UI_DESIGN_SYSTEM.md](UI_DESIGN_SYSTEM.md) | 视觉令牌、布局、控件、状态、响应式和可访问性 | 新增或修改 UI 时 |
 | [CONTRACTS.md](CONTRACTS.md) | 搜索、分面、AI 查询协议的索引和不变量 | 修改搜索或标签协议前 |
 | [contracts/search-plan-v3.md](contracts/search-plan-v3.md) | SearchPlanV3 执行契约 | 超级搜索执行链路 |
@@ -59,6 +61,7 @@ AI 或新开发者进入项目时，默认只读以下最小集合：
 | 里程碑、状态、发布阻塞 | `PROJECT_PLAN.md` |
 | 模块、数据流、关键机制、设计约束 | `ARCHITECTURE.md` |
 | 命令行、规范、测试门禁、迁移流程 | `DEVELOPMENT.md` |
+| 支持范围、能力差异、平台高危区域 | `PLATFORM.md` |
 | 颜色、布局、控件、交互范式 | `UI_DESIGN_SYSTEM.md` |
 | 搜索计划、分面、AI 查询结构 | 对应 `contracts/*.md` |
 | 测试分层、准入准出 | `TEST_STRATEGY.md` |

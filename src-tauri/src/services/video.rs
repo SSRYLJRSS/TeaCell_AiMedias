@@ -1,6 +1,7 @@
 //! 视频服务：ffprobe 元数据 + ffmpeg 抽帧。
-//! 二进制解析策略（T03）：优先 PATH；未安装则全部降级（元数据尽力而为、封面走通用占位图）。
-//! 随应用分发（ffmpeg-sidecar/打包资源目录）在打包阶段接入，resolve_binary 已预留入口。
+//! 二进制解析策略（P2-03 修正）：统一经 `media_tools::resolve` —— **生产首选随包 sidecar**
+//! （`current_exe` 同目录），即便系统 PATH 为空也能探测与转码；**仅开发（debug）模式**允许
+//! PATH fallback。不再「优先 PATH」。工具不可用时元数据尽力而为、封面走通用占位图。
 //!
 //! 指导书 阶段 2 §7.2：ffprobe stdout 必须 `piped` 并读取（历史 bug 是 `.stdout(Stdio::null())` 后再解析空 buffer，
 //! 导致所有视频元数据探测静默失败）；stderr 保留到错误摘要；探测有真实墙钟超时并返回可识别错误。
@@ -9,56 +10,95 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-/// ffmpeg/ffprobe 子进程总超时：损坏/超大文件可能让裸 status() 永久挂起（批次卡死），
-/// 统一加墙防止无界等待；超时后 kill + wait 并返回 `ProbeError::Timeout`。
-const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// ffprobe 可用性探测的短期缓存有效期（指导书 §7.2：PATH 探测不能每次素材请求都无界阻塞）
-const BINARY_CACHE_TTL: Duration = Duration::from_secs(60);
-
-/// ffmpeg/ffprobe 可用性结果缓存（短 TTL）。静态全局，进程内共享。
-static BINARY_CACHE: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
-
-/// 解析二进制路径：PATH → （预留）应用资源目录
-fn resolve_binary(name: &str) -> Option<String> {
-    Command::new(name)
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| name.to_string())
+/// 视频兼容代理变体（三端复核 R2 / 指导书 §8.3）。
+///
+/// 由自由字符串收敛为严格枚举：只维护两个明确变体，未知值一律拒绝——
+/// 不再「字母数字均允许」放任前端传入产不出来的变体。
+///  - `H264Mp4`：Windows/macOS 首选，H.264/AAC MP4；
+///  - `Vp8Webm`：Linux 媒体环境缺 H.264 解码器时的回退，VP8/Vorbis WebM。
+///    （包内 ffmpeg 与目标 WebView 的实际播放仍须真机样本验收，见 R2 验收。）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyVariant {
+    H264Mp4,
+    Vp8Webm,
 }
 
-/// 带短 TTL 缓存的 ffprobe 可用性探测：避免每次素材请求都 spawn `ffprobe -version`。
-pub fn ffprobe_available() -> bool {
-    binary_available("ffprobe")
-}
+/// 编码策略版本（P1-05）：每次修改 `transcode_args`（codec / 码率 / 像素格式 / 容器 /
+/// 兼容参数）都必须递增此常量，使旧代理缓存的 `encoder_version` 不再匹配而被重新生成。
+/// 与具体变体无关：任一变体的参数变化都提升整体版本，宁可多重生成也不放行过期代理。
+pub const ENCODER_VERSION: i64 = 1;
 
-/// 带短 TTL 缓存的 ffmpeg 可用性探测。
-pub fn ffmpeg_available() -> bool {
-    binary_available("ffmpeg")
-}
-
-fn binary_available(name: &str) -> bool {
-    if let Ok(cache) = BINARY_CACHE.lock() {
-        if let Some((cached_name, at, val)) = &*cache {
-            if cached_name == name && at.elapsed() < BINARY_CACHE_TTL {
-                return *val;
-            }
+impl ProxyVariant {
+    /// 严格解析：只接受两个已知变体，其余返回 invalid_arg（不静默默认）。
+    pub fn parse(s: &str) -> crate::error::AppResult<Self> {
+        match s {
+            "h264_mp4" => Ok(Self::H264Mp4),
+            "vp8_webm" => Ok(Self::Vp8Webm),
+            other => Err(crate::error::AppError::invalid_arg(format!(
+                "非法代理变体：{other}（仅支持 h264_mp4 | vp8_webm）"
+            ))),
         }
     }
-    let val = resolve_binary(name).is_some();
-    if let Ok(mut cache) = BINARY_CACHE.lock() {
-        *cache = Some((name.to_string(), Instant::now(), val));
+
+    /// 稳定字符串标识（用于 DB 存储与代理键）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "h264_mp4",
+            Self::Vp8Webm => "vp8_webm",
+        }
     }
-    val
+
+    /// 输出文件扩展名：按变体，不再一律 `.mp4`。
+    pub fn file_extension(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "mp4",
+            Self::Vp8Webm => "webm",
+        }
+    }
+
+    /// 播放 MIME 类型（供前端 <video> 选择）。
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "video/mp4",
+            Self::Vp8Webm => "video/webm",
+        }
+    }
+}
+
+/// ffprobe / 抽帧的短总超时：探测与单帧抽取应在数十秒内完成，损坏/超大文件不得无界挂起。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 完整转码的「启动超时」：ffmpeg 迟迟不产出任何输出文件字节即判定卡死（区别于正常长视频）。
+/// 正常转码会持续增长输出文件；长视频不再受 30s 总时限误杀（§8.1）。
+const TRANSCODE_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 完整转码的「无进度超时」：输出文件大小在此时长内零增长即判定卡死。
+const TRANSCODE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// ffprobe 二进制解析（经统一 media_tools 入口：sidecar 优先，仅开发模式 PATH fallback）。
+/// 保留 `PathBuf` 直到 `Command::new`，避免 Unix 非 UTF-8 的 PATH/安装目录被
+/// `to_string_lossy` 改写后再执行错误的二进制。
+fn resolve_binary(name: &str) -> Option<std::path::PathBuf> {
+    let tool = match name {
+        "ffmpeg" => crate::services::media_tools::MediaTool::Ffmpeg,
+        "ffprobe" => crate::services::media_tools::MediaTool::Ffprobe,
+        _ => return None,
+    };
+    crate::services::media_tools::resolve(tool).map(|t| t.path)
+}
+
+/// ffprobe 是否可用（经 media_tools 缓存，不必每次素材请求都 spawn）。
+pub fn ffprobe_available() -> bool {
+    crate::services::media_tools::ffprobe_available()
+}
+
+/// ffmpeg 是否可用（经 media_tools 缓存）。
+pub fn ffmpeg_available() -> bool {
+    crate::services::media_tools::ffmpeg_available()
 }
 
 /// ffprobe 探测错误：不同失败原因必须可区分（指导书 §7.2）。
@@ -68,7 +108,7 @@ pub enum ProbeError {
     BinaryMissing,
     #[error("启动 ffprobe 失败: {0}")]
     Spawn(#[source] std::io::Error),
-    #[error("ffprobe 探测超时（>{FFMPEG_TIMEOUT:?}），已终止")]
+    #[error("ffprobe 探测超时（>{PROBE_TIMEOUT:?}），已终止")]
     Timeout,
     #[error("ffprobe 退出码非 0（code={code}）：{stderr}")]
     NonZeroExit { code: i32, stderr: String },
@@ -410,8 +450,8 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
         buf
     });
 
-    // 真实墙钟超时：轮询 try_wait，超时 kill + wait
-    let deadline = Instant::now() + FFMPEG_TIMEOUT;
+    // 真实墙钟超时：轮询 try_wait，超时 kill + wait（探测短超时）
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
@@ -424,7 +464,7 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
                     let _ = stderr_reader.join();
                     tracing::warn!(
                         "ffprobe 探测超时（>{:?}），已终止：{}",
-                        FFMPEG_TIMEOUT,
+                        PROBE_TIMEOUT,
                         path.display()
                     );
                     return Err(ProbeError::Timeout);
@@ -491,8 +531,8 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    // 带超时的等待：进程超时未退出 → kill，避免抽帧卡死批次
-    let deadline = Instant::now() + FFMPEG_TIMEOUT;
+    // 带超时的等待：进程超时未退出 → kill，避免抽帧卡死批次（抽单帧属短任务，用探测短超时）
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     let ok = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st.success(),
@@ -502,7 +542,7 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
                     let _ = child.wait();
                     tracing::warn!(
                         "ffmpeg 抽帧超时（>{:?}），已终止：{}",
-                        FFMPEG_TIMEOUT,
+                        PROBE_TIMEOUT,
                         path.display()
                     );
                     break false;
@@ -515,20 +555,11 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
     ok && out.exists()
 }
 
-/// 把视频转码为 H.264/AAC MP4（指导书 §8.3 兼容代理）。带真实墙钟超时 + 可选取消；stderr 保留到错误摘要。
-/// 注意：输出格式由 out 扩展名决定（.mp4）。返回不同的可辨识错误（ffmpeg 缺失/启动/超时/取消/非 0 退出）。
-pub fn transcode_to_h264(
-    src: &Path,
-    out: &Path,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> crate::error::AppResult<()> {
-    let Some(ffmpeg) = resolve_binary("ffmpeg") else {
-        return Err(crate::error::AppError::msg("ffmpeg 不可用"));
-    };
-    let mut child = Command::new(ffmpeg)
-        .args(["-y", "-i"])
-        .arg(src)
-        .args([
+/// 按变体的 ffmpeg 编码参数（不含 -y/-i/输入/输出，仅编码器与容器选项）。
+/// H.264：libx264 + AAC + faststart MP4；VP8：libvpx + libvorbis WebM。
+fn transcode_args(variant: ProxyVariant) -> &'static [&'static str] {
+    match variant {
+        ProxyVariant::H264Mp4 => &[
             "-c:v",
             "libx264",
             "-preset",
@@ -543,7 +574,55 @@ pub fn transcode_to_h264(
             "128k",
             "-movflags",
             "+faststart",
-        ])
+        ],
+        // VP8/Vorbis WebM：Linux 缺 H.264 时的回退。-deadline good + -cpu-used 平衡速度；
+        // -b:v 1M 保证可控码率（VP8 CRF 需配合 -b:v 才生效）。
+        ProxyVariant::Vp8Webm => &[
+            "-c:v",
+            "libvpx",
+            "-crf",
+            "10",
+            "-b:v",
+            "1M",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "4",
+        ],
+    }
+}
+
+/// 把视频转码为 H.264/AAC MP4（指导书 §8.3 兼容代理）。带真实墙钟超时 + 可选取消；stderr 保留到错误摘要。
+/// 保留向后兼容入口：等价于 `transcode_variant(src, out, ProxyVariant::H264Mp4, cancel)`。
+pub fn transcode_to_h264(
+    src: &Path,
+    out: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::error::AppResult<()> {
+    transcode_variant(src, out, ProxyVariant::H264Mp4, cancel)
+}
+
+/// 按变体转码（三端复核 R2）。输出容器/编码器由 `variant` 决定，不再由 out 扩展名隐式推断。
+/// 返回不同的可辨识错误（ffmpeg 缺失/启动/超时/取消/非 0 退出）。
+pub fn transcode_variant(
+    src: &Path,
+    out: &Path,
+    variant: ProxyVariant,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::error::AppResult<()> {
+    let Some(ffmpeg) = resolve_binary("ffmpeg") else {
+        return Err(crate::error::AppError::msg("ffmpeg 不可用"));
+    };
+    let mut child = Command::new(ffmpeg)
+        .args(["-y", "-i"])
+        .arg(src)
+        .args(transcode_args(variant))
         .arg(out)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -560,18 +639,44 @@ pub fn transcode_to_h264(
         buf
     });
 
-    let deadline = Instant::now() + FFMPEG_TIMEOUT;
+    // §8.1：完整转码不用固定 30s 总时限（正常长视频会被误杀），改用「启动超时 + 无进度超时」：
+    //  - 启动超时：迟迟不产出任何输出字节 → 判定卡死；
+    //  - 无进度超时：输出文件大小在窗口内零增长 → 判定卡死；
+    //  - 输出持续增长的正常长视频永不误杀。取消标志随时打断。
+    let started = Instant::now();
+    let mut last_size: u64 = 0;
+    let mut last_progress = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
-                if Instant::now() >= deadline || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stderr_reader.join();
-                    return Err(crate::error::AppError::msg("转码超时或已取消"));
+                    return Err(crate::error::AppError::msg("转码已取消"));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let cur_size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+                if cur_size > last_size {
+                    last_size = cur_size;
+                    last_progress = Instant::now();
+                }
+                // 启动超时：整段时间内输出文件始终为空（从未产出字节）。
+                let never_started = last_size == 0 && started.elapsed() >= TRANSCODE_START_TIMEOUT;
+                // 无进度超时：曾有输出，但在窗口内不再增长。
+                let stalled = last_size > 0 && last_progress.elapsed() >= TRANSCODE_STALL_TIMEOUT;
+                if never_started || stalled {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stderr_reader.join();
+                    let reason = if never_started {
+                        "转码启动超时（长时间无输出）"
+                    } else {
+                        "转码无进度超时（输出长时间未增长）"
+                    };
+                    return Err(crate::error::AppError::msg(reason));
+                }
+                std::thread::sleep(Duration::from_millis(200));
             }
             Err(_) => break None,
         }
@@ -631,6 +736,49 @@ mod tests {
 
     fn json(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
+    }
+
+    // ── 代理变体枚举（三端复核 R2）──
+
+    #[test]
+    fn proxy_variant_parse_accepts_known_rejects_unknown() {
+        assert_eq!(
+            ProxyVariant::parse("h264_mp4").unwrap(),
+            ProxyVariant::H264Mp4
+        );
+        assert_eq!(
+            ProxyVariant::parse("vp8_webm").unwrap(),
+            ProxyVariant::Vp8Webm
+        );
+        // 旧实现「字母数字均允许」会放行这些；现在必须拒绝。
+        assert!(ProxyVariant::parse("mp4").is_err());
+        assert!(ProxyVariant::parse("h265").is_err());
+        assert!(ProxyVariant::parse("").is_err());
+        assert!(ProxyVariant::parse("h264_mp4x").is_err());
+    }
+
+    #[test]
+    fn proxy_variant_extension_and_mime_by_variant() {
+        assert_eq!(ProxyVariant::H264Mp4.file_extension(), "mp4");
+        assert_eq!(ProxyVariant::H264Mp4.mime_type(), "video/mp4");
+        assert_eq!(ProxyVariant::H264Mp4.as_str(), "h264_mp4");
+        assert_eq!(ProxyVariant::Vp8Webm.file_extension(), "webm");
+        assert_eq!(ProxyVariant::Vp8Webm.mime_type(), "video/webm");
+        assert_eq!(ProxyVariant::Vp8Webm.as_str(), "vp8_webm");
+    }
+
+    #[test]
+    fn transcode_args_dispatch_by_variant() {
+        // H.264 用 libx264 + faststart MP4；VP8 用 libvpx + libvorbis WebM。
+        let h = transcode_args(ProxyVariant::H264Mp4);
+        assert!(h.contains(&"libx264"));
+        assert!(h.contains(&"+faststart"));
+        let v = transcode_args(ProxyVariant::Vp8Webm);
+        assert!(v.contains(&"libvpx"));
+        assert!(v.contains(&"libvorbis"));
+        // 两变体不得混用编码器
+        assert!(!v.contains(&"libx264"));
+        assert!(!h.contains(&"libvpx"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # 开发规范
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-22
 >
 > 本文档定义当前仓库的开发、测试、迁移、提交和 AI 协作规范。根级 [AGENTS.md](../AGENTS.md) 是 AI 的最短强制入口。
 
@@ -11,12 +11,12 @@
 - Windows 10/11。
 - Rust stable MSVC。
 - Visual Studio C++ Build Tools，包含 MSVC linker 和 Windows SDK。
-- Node.js 20 或更高版本。
+- Node.js 22（`package.json` 的 `engines` 约束为 `>=22 <25`）。
 - PowerShell 7 用于本地 smoke；普通 PowerShell 5.1 也可运行基础命令。
 
 辅助依赖：
 
-- `ffmpeg` / `ffprobe`：视频元数据和抽帧，缺失时按降级逻辑运行。
+- `ffmpeg` / `ffprobe`：开发时可由 PATH 提供；发布包必须使用经过 manifest 校验的 sidecar。
 - LLVM/libclang：HEIC 构建链需要。
 - Ollama：仅本地模型功能需要，不是应用编译前置。
 
@@ -26,7 +26,7 @@
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 
 npm run lint
 npm run typecheck
@@ -55,6 +55,22 @@ pwsh ./scripts/smoke.ps1
 cd src-tauri
 cargo test --test perf_probe -- --ignored --nocapture
 ```
+
+### 2.1 桌面构建入口
+
+三目标（Windows x64、macOS Apple Silicon、Linux x64）统一走 `scripts/desktop.mjs`：
+
+```powershell
+npm run desktop:dev            # node scripts/desktop.mjs dev [--target <triple>]
+npm run desktop:build          # node scripts/desktop.mjs build [--target <triple>]
+npm run desktop:check          # node scripts/desktop.mjs check [--target <triple>]
+```
+
+- `.cargo/config.toml` 不再无条件注入 `HEIF_BINARIES_DIR`；由 `desktop.mjs` 按实际 target triple 决定：仅 Windows x64 有本地 `heif-bin/` 覆盖时导出。
+- HEIF 依赖来源（现状，非“系统库”）：未设置 `HEIF_BINARIES_DIR` 时，`heif-rs 26.7.0` 的 `build.rs` 从其**固定 release（26.7.0）**下载对应目标的预编译归档，不解析系统 libheif。若要离线/可控构建，先准备本地目录并导出 `HEIF_BINARIES_DIR`（Windows x64 兼容旧布局 `heif-bin/`）。构建日志会打印实际来源。
+- ffmpeg / ffprobe sidecar 放在 `src-tauri/binaries/`，命名为 `<name>-<triple>[.exe]`。用 `npm run prepare-media-tools -- --target <triple>` 按 `src-tauri/binaries/manifest.json`（版本化 + SHA256 + 编码器 + 许可证）下载校验放置；macOS 可通过 `ffprobeArchive*` 使用独立的 ffprobe 归档。脚本会在解压前检查归档成员路径，拒绝 Zip Slip 和符号链接，并复核已存在 sidecar 的编码器/许可证；`build` 与 `desktop:check:strict` 会强校验（存在 + 可执行位 + hash 匹配 + 编码器齐全 + 许可证），缺失或哨兵 SHA256 即失败。许可证目录由 `tauri.sidecar.conf.json` 作为 bundle resource 打包，并由候选包 workflow 单独归档。
+- 工具链固定：`src-tauri/rust-toolchain.toml`（Rust 1.98.1 + rustfmt/clippy）与 `package.json` 的 `engines.node`（>=22 <25）记录已验证版本；跨目标由 CI 按 runner 安装，本机不强制下载他平台目标。升级 Rust 必须同步修改两个 workflow 并重跑三端门禁。
+- 三目标 CI：`.github/workflows/code-gate.yml`（每个 PR 的代码门，含 Tauri native 非 bundle 构建 + 二进制架构断言）与 `release-candidate.yml`（候选包门：sidecar 准备 + pipefail 捕获构建状态 + 硬校验安装包 + per-target `artifact-manifest.json` + 汇总校验目标/版本/commit/校验和）。
 
 ## 3. 分层规范
 

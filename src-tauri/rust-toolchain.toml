@@ -1,0 +1,10 @@
+# P2-02：固定已验证的 Rust 工具链，使本地与 CI（code-gate / release-candidate）一致。
+# 复查报告指出仓库缺 rust-toolchain.toml / engines 记录，导致「本机通过 ≠ CI 通过」。
+# channel 固定到当前已验证版本；升级时必须在独立变更中重新跑三端门禁并同步 CI。
+#
+# 不在此列 targets：跨目标（macOS/Linux）由 CI 的 dtolnay/rust-toolchain@stable
+# `toolchain: 1.98.1` + `targets:` 参数按 runner 安装。若在这里列全三目标，本机每次 cargo 都会尝试下载与本平台无关的目标，
+# 拖慢开发且离线会失败。本机构建只需当前平台默认目标。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

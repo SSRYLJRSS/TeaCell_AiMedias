@@ -3,7 +3,7 @@
 //! 三类数据必须分开（三端复核 B2）：
 //! - **可打开的原生路径**：忠实保留系统实际路径；POSIX 反斜杠是普通字符，不做改写。
 //! - **比较/搜索键**：仅作索引或同源判定，允许明确的大小写策略，不拿它打开文件。
-//! - **迁移包相对路径**：自定义可移植格式，不用当前主机语义判断另一 OS 的路径。
+//! - **跨平台相对路径**：自定义可移植格式，不用当前主机语义判断另一 OS 的路径。
 //!
 //! `normalize_path` 仅在 Windows 分支保留历史 DB 兼容（正斜杠 + 小写盘符）；
 //! Unix 分支不替换 `\`、不改大小写、不删有语义的字节。
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn ensure_absolute_bool_wrapper() {
         // 布尔封装行为与新实现一致
-        assert_eq!(ensure_absolute(""), false);
-        assert_eq!(ensure_absolute("a/b.jpg"), false);
+        assert!(!ensure_absolute(""));
+        assert!(!ensure_absolute("a/b.jpg"));
     }
 }

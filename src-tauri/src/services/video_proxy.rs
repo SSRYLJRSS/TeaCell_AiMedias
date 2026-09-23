@@ -1,12 +1,15 @@
-//! 视频兼容代理服务（指导书 §8.3）：原文件 → H.264/AAC MP4 按需生成并缓存。
-//!  - 代理路径按 素材 ID + 变体 稳定生成：`{proxy_dir}/{asset_id}_{variant}.mp4`；
+//! 视频兼容代理服务（指导书 §8.3）：原文件 → 兼容代理按需生成并缓存。
+//! 变体决定容器/编码：H.264/AAC MP4（Windows/macOS）或 VP8/Vorbis WebM（Linux），非仅 MP4。
+//!  - 代理路径按 素材 ID + 变体 稳定生成，扩展名随变体（`.mp4` / `.webm`）：
+//!    `{proxy_dir}/{asset_id}_{variant}.{ext}`；
 //!  - 生成使用临时文件 + 原子 rename；状态机 queued|running|ready|failed|canceled 持久化；
 //!  - 同一素材同一变体 single-flight：同一时刻只一个生成任务，其他调用方复用结果；
 //!  - 全局转码并发闸（§8.1）：默认并发 = 1（软件 libx264），跨素材生效，不只是 single-flight；
 //!    许可在 ffmpeg 子进程启动前获取，转码结束/失败/取消时释放（RAII guard）；
 //!    等待队列期间不持数据库锁，且等待可被取消（cancel flag 轮询）；
 //!  - 代理不是替换原文件：清理缓存不影响原文件。
-//!    转码由调用方注入（便于单测注入 fake 转码；真实路径用 video::transcode_to_h264）。
+//!    转码由调用方注入（便于单测注入 fake 转码；真实路径按平台变体调用
+//!    `video::transcode_variant`）。
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +22,35 @@ use rusqlite::Connection;
 
 use crate::db::{assets, video_proxy};
 use crate::error::{AppError, AppResult};
+use crate::services::video::ENCODER_VERSION;
+
+/// P1-05：源素材内容指纹。已入库内容 hash 优先（最可靠）；否则用
+/// 规范化路径 + 文件大小 + 高精度 mtime 组合——不为每次播放重读整段大视频。
+fn source_fingerprint(asset: &assets::Asset) -> String {
+    if let Some(h) = asset.hash.as_ref().filter(|h| !h.is_empty()) {
+        return format!("hash:{h}");
+    }
+    let (size, mtime_ms) = std::fs::metadata(&asset.file_path)
+        .ok()
+        .map(|m| {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(asset.modified_at);
+            (m.len() as i64, mt)
+        })
+        .unwrap_or((asset.file_size, asset.modified_at));
+    format!("meta:{}|{}|{}", asset.file_path, size, mtime_ms)
+}
+
+/// P1-05：ffmpeg 工具指纹（版本 + 二进制 size/mtime 指纹）。不可用时为空串——
+/// 空串在生成与复用两端一致比较，不影响幂等。
+fn tool_fingerprint() -> String {
+    crate::services::media_tools::tool_fingerprint(crate::services::media_tools::MediaTool::Ffmpeg)
+        .unwrap_or_default()
+}
 
 /// 全局转码并发上限（§8.1）：默认 1。硬件编码探测成功后（未来配置 video_proxy_concurrency）
 /// 才允许提高到 2。静态全局，跨素材共享——不同素材同时转码也被限制。
@@ -95,16 +127,23 @@ fn with_single_flight(
     f()
 }
 
+/// 代理输出路径：扩展名按变体（三端复核 R2），不再一律 `.mp4`。
+/// 未知变体回退 mp4 扩展（get_or_create_proxy 入口已先严格校验，此处仅兜底）。
 fn proxy_path(proxy_dir: &Path, asset_id: i64, variant: &str) -> PathBuf {
-    proxy_dir.join(format!("{asset_id}_{variant}.mp4"))
+    let ext = crate::services::video::ProxyVariant::parse(variant)
+        .map(|v| v.file_extension())
+        .unwrap_or("mp4");
+    proxy_dir.join(format!("{asset_id}_{variant}.{ext}"))
 }
 
 /// 生成临时路径（与目标同目录、同扩展名），用于「写入临时文件 → 原子 rename」。
 fn temp_path(out: &Path, uid: &str) -> PathBuf {
+    let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
     out.parent().unwrap_or(Path::new(".")).join(format!(
-        "{}.{}.mp4",
+        "{}.{}.{}",
         out.file_stem().and_then(|s| s.to_str()).unwrap_or("p"),
-        uid
+        uid,
+        ext
     ))
 }
 
@@ -136,12 +175,8 @@ pub fn get_or_create_proxy(
     cancel: &AtomicBool,
     transcode: impl Fn(&Path, &Path, &AtomicBool) -> AppResult<()>,
 ) -> AppResult<video_proxy::VideoProxy> {
-    if !variant
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppError::msg("非法代理变体"));
-    }
+    // 三端复核 R2：严格枚举校验（只接受 h264_mp4 | vp8_webm），拒绝未知变体。
+    crate::services::video::ProxyVariant::parse(variant)?;
     let started = Instant::now();
     tracing::debug!(
         operation = "video_proxy",
@@ -152,13 +187,27 @@ pub fn get_or_create_proxy(
     );
     let key = format!("{asset_id}:{variant}");
     with_single_flight(&key, || {
-        // ① 已 ready 且文件存在 → 复用
+        // ① 读素材（短锁）+ 计算期望指纹（源内容 / 编码策略 / 工具版本）。
+        //    指纹在 ready 命中判定之前算好：命中必须三项全一致才复用（P1-05）。
+        let (mime, src, expected_src_fp) = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            let a = assets::get(&conn, asset_id)?;
+            let fp = source_fingerprint(&a);
+            (a.mime_type, PathBuf::from(a.file_path), fp)
+        };
+        let expected_tool_fp = tool_fingerprint();
+
+        // ② 已 ready 且文件存在且**三项指纹全一致** → 复用；否则删旧文件并重生成。
         {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             if let Some(p) = video_proxy::get(&conn, asset_id, variant)? {
                 if p.status == "ready" {
                     if let Some(path) = &p.path {
-                        if Path::new(path).exists() {
+                        let fresh = Path::new(path).exists()
+                            && p.source_fingerprint.as_deref() == Some(expected_src_fp.as_str())
+                            && p.encoder_version == Some(ENCODER_VERSION)
+                            && p.tool_fingerprint.as_deref() == Some(expected_tool_fp.as_str());
+                        if fresh {
                             tracing::info!(
                                 operation = "video_proxy",
                                 asset_id,
@@ -169,16 +218,21 @@ pub fn get_or_create_proxy(
                             );
                             return Ok(p);
                         }
+                        // 指纹不符或文件消失：安全删除旧派生文件（不动原素材），走重生成。
+                        if Path::new(path).exists() {
+                            let _ = fs::remove_file(path);
+                        }
+                        tracing::info!(
+                            operation = "video_proxy",
+                            asset_id,
+                            variant = %variant,
+                            stage = "cache_stale",
+                            "源/编码/工具指纹变化或文件缺失，作废旧代理并重新生成"
+                        );
                     }
                 }
             }
         }
-        // ② 读素材（短锁），确定输出路径
-        let (mime, src) = {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            let a = assets::get(&conn, asset_id)?;
-            (a.mime_type, PathBuf::from(a.file_path))
-        };
         if !mime.starts_with("video/") {
             tracing::warn!(
                 operation = "video_proxy",
@@ -206,26 +260,18 @@ pub fn get_or_create_proxy(
         }
         fs::create_dir_all(proxy_dir)?;
         let out = proxy_path(proxy_dir, asset_id, variant);
+        // P1-05：能走到这里说明上面的 ready 命中判定未通过（记录缺失 / 指纹不符 / 已删旧文件）。
+        // 若目标路径仍存在同名文件，那是**无法验证来源的孤儿文件**（如数据库重置后残留），
+        // 不能凭文件存在就标 ready 复用——安全删除后重新生成，绝不复用未指纹校验的派生物。
         if out.exists() {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            video_proxy::upsert(
-                &conn,
-                asset_id,
-                variant,
-                "ready",
-                Some(&out.to_string_lossy()),
-                None,
-            )?;
+            let _ = fs::remove_file(&out);
             tracing::info!(
                 operation = "video_proxy",
                 asset_id,
                 variant = %variant,
-                stage = "disk_reuse",
-                duration_ms = started.elapsed().as_millis() as u64,
-                "代理文件已存在，恢复数据库状态"
+                stage = "orphan_removed",
+                "发现无指纹记录的孤儿代理文件，已删除并重新生成"
             );
-            return video_proxy::get(&conn, asset_id, variant)?
-                .ok_or_else(|| AppError::msg("代理记录写入失败"));
         }
         // ③ 标记 running（短锁）
         {
@@ -281,13 +327,15 @@ pub fn get_or_create_proxy(
             Ok(()) => match atomic_rename(&tmp, &out) {
                 Ok(()) => {
                     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                    video_proxy::upsert(
+                    // P1-05：ready 落盘同时写三项指纹，供下次复用判定新鲜度。
+                    video_proxy::upsert_ready(
                         &conn,
                         asset_id,
                         variant,
-                        "ready",
-                        Some(&out.to_string_lossy()),
-                        None,
+                        &out.to_string_lossy(),
+                        &expected_src_fp,
+                        ENCODER_VERSION,
+                        &expected_tool_fp,
                     )?;
                     tracing::info!(
                         operation = "video_proxy",
@@ -418,7 +466,9 @@ pub fn clear_all_proxies(db: &Arc<Mutex<Connection>>, proxy_dir: &Path) -> AppRe
     let mut removed: u64 = 0;
     if let Ok(rd) = fs::read_dir(proxy_dir) {
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().ends_with(".mp4") {
+            // 代理文件按变体有 .mp4 / .webm 两种扩展（三端复核 R2）；均清理。
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".mp4") || name.ends_with(".webm") {
                 if fs::remove_file(e.path()).is_ok() {
                     removed += 1;
                 } else {
@@ -541,6 +591,170 @@ mod tests {
         let p = get_or_create_proxy(&db, &dir, id, "h264_mp4", &cancel, |_, _, _| Ok(())).unwrap();
         assert_eq!(p.status, "failed");
         assert_eq!(p.error.as_deref(), Some("素材不是视频"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- P1-05：视频代理缓存指纹（复用只在源/编码/工具指纹全一致时发生）----
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// 用计数转码闭包跑一次生成；返回本次是否真正触发了转码。
+    fn run_with_counter(
+        db: &Arc<Mutex<Connection>>,
+        dir: &Path,
+        id: i64,
+        counter: &Arc<AtomicUsize>,
+    ) -> String {
+        let counter = Arc::clone(counter);
+        let cancel = AtomicBool::new(false);
+        get_or_create_proxy(db, dir, id, "h264_mp4", &cancel, move |_, tmp, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            fs::write(tmp, b"fake proxy bytes").unwrap();
+            Ok(())
+        })
+        .unwrap()
+        .status
+    }
+
+    fn set_hash(c: &Connection, id: i64, h: &str) {
+        c.execute(
+            "UPDATE assets SET hash=?1 WHERE id=?2",
+            rusqlite::params![h, id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reuses_only_when_all_fingerprints_match() {
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            insert_video(&c)
+        };
+        let dir = std::env::temp_dir().join(format!("bg_fp_reuse_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(run_with_counter(&db, &dir, id, &counter), "ready");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "首次必转码");
+        // 指纹全一致 → 复用，不再转码
+        assert_eq!(run_with_counter(&db, &dir, id, &counter), "ready");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "指纹一致应复用，不重复转码"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn regenerates_when_content_hash_changes() {
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            let id = insert_video(&c);
+            set_hash(&c, id, "hash-A");
+            id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_fp_hash_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        // 内容 hash 变化（用户在原路径替换视频 / 恢复数据库）→ 重新生成
+        {
+            let c = db.lock().unwrap();
+            set_hash(&c, id, "hash-B");
+        }
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "内容 hash 变化必须重生成"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn regenerates_when_source_size_changes() {
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            insert_video(&c) // hash 为空 → 用 meta:path|size|mtime
+        };
+        let dir = std::env::temp_dir().join(format!("bg_fp_size_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        // 源 size 变化 → 指纹变 → 重生成
+        {
+            let c = db.lock().unwrap();
+            c.execute("UPDATE assets SET file_size=99999 WHERE id=?1", [id])
+                .unwrap();
+        }
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "源 size 变化必须重生成");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn regenerates_when_encoder_version_changes() {
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            insert_video(&c)
+        };
+        let dir = std::env::temp_dir().join(format!("bg_fp_enc_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        // 模拟旧代理由不同编码策略版本生成 → 重生成
+        {
+            let c = db.lock().unwrap();
+            c.execute(
+                "UPDATE video_proxies SET encoder_version=? WHERE asset_id=?",
+                rusqlite::params![ENCODER_VERSION + 100, id],
+            )
+            .unwrap();
+        }
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "编码版本变化必须重生成");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_ready_record_without_fingerprints_is_not_reused() {
+        // 老库升级：V25 加列，旧 ready 记录三列为 NULL；即使文件在也不得当有效。
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            insert_video(&c)
+        };
+        let dir = std::env::temp_dir().join(format!("bg_fp_oldrec_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{id}_h264_mp4.mp4"));
+        fs::write(&out, b"stale proxy").unwrap();
+        {
+            // 直接写一条无指纹的 ready 记录（模拟 V14 时代旧记录）
+            let c = db.lock().unwrap();
+            video_proxy::upsert(
+                &c,
+                id,
+                "h264_mp4",
+                "ready",
+                Some(&out.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        run_with_counter(&db, &dir, id, &counter);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "无指纹旧记录不得复用，必须重新生成"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

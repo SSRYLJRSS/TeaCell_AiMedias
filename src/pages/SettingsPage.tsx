@@ -32,6 +32,7 @@ import { useMetadataStore } from "@/stores/metadataStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useTagStore } from "@/stores/tagStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 import { CELL_STEPS } from "@/types/settings";
 import type { CellAspect, CellFit, Settings } from "@/types/settings";
 
@@ -101,6 +102,14 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // 平台能力：仅 Windows（managedOllama=true）提供应用管理的 Ollama 安装/进程/模型管理。
+  // 非托管平台不得调用任何 Ollama 管理命令（安装状态探测、安装包缓存、模型目录等）。
+  const managedOllama = usePlatformStore(selectManagedOllama);
+  // P1-02：平台能力读取失败必须可见、可重试。设置页订阅 status/error/load，
+  // status==="error" 时显示非阻塞提示 + 「重试」按钮（load 幂等，error 允许再次发起）。
+  const platformStatus = usePlatformStore((s) => s.status);
+  const platformError = usePlatformStore((s) => s.error);
+  const reloadPlatform = usePlatformStore((s) => s.load);
   // A3：安装包缓存（「存储与维护」分组展示占用/清理）
   const [installerInfo, setInstallerInfo] = useState<{ path: string; size: number } | null>(null);
   const [removingInstaller, setRemovingInstaller] = useState(false);
@@ -342,18 +351,23 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => setDataDirError(true));
   }, []);
 
-  // 进入「存储与维护」分组时刷新安装包缓存 + 视频代理缓存统计
+  // 进入「存储与维护」分组时刷新安装包缓存 + 视频代理缓存统计。
+  // 安装包缓存探测是 Ollama 管理命令：仅托管平台（Windows）调用，非托管平台零管理调用。
   useEffect(() => {
     if (route !== "data") return;
-    ollamaInstallStatus()
-      .then((s) =>
-        s.installerPath ? setInstallerInfo({ path: s.installerPath, size: s.installerSize }) : setInstallerInfo(null),
-      )
-      .catch(() => setInstallerInfo(null));
+    if (managedOllama) {
+      ollamaInstallStatus()
+        .then((s) =>
+          s.installerPath ? setInstallerInfo({ path: s.installerPath, size: s.installerSize }) : setInstallerInfo(null),
+        )
+        .catch(() => setInstallerInfo(null));
+    } else {
+      setInstallerInfo(null);
+    }
     videoProxyCacheStats()
       .then(([count, bytes]) => setProxyStats({ count, bytes }))
       .catch(() => setProxyStats(null));
-  }, [route]);
+  }, [route, managedOllama]);
 
   const onClearVideoProxies = async () => {
     setClearingProxies(true);
@@ -540,6 +554,29 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       {/* 右侧分组内容（§13 FB-07：取消 max-w-xl 小框，宽屏充分利用） */}
       <div className="relative min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-[1040px] flex-col gap-6 px-6 py-6">
+          {/* P1-02：平台能力读取失败 —— 非阻塞提示 + 重试。不白屏、不进永久骨架，
+              页面主体继续可用；重试点击调用 load()（幂等），loading 期间禁用。 */}
+          {platformStatus === "error" && (
+            <div
+              role="alert"
+              className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-danger)] bg-[color-mix(in_srgb,var(--color-danger)_8%,transparent)] px-3 py-2 text-sm"
+            >
+              <span className="text-[var(--color-text)]">
+                平台能力读取失败，部分平台专属功能暂不可用。
+              </span>
+              {platformError && (
+                <span className="text-xs text-[var(--color-text-secondary)]">（{platformError}）</span>
+              )}
+              <Button className="ml-auto" onClick={() => void reloadPlatform()}>
+                重试
+              </Button>
+            </div>
+          )}
+          {platformStatus === "loading" && (
+            <div className="rounded-md border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-secondary)]">
+              正在读取平台能力…
+            </div>
+          )}
           {route === "library" && (
             <>
             <PageHeader title="素材库与入库" description="设置总库位置，以及 RAW/JPG 等同源文件的显示和打标行为。" />
@@ -904,20 +941,23 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void onClearCache()}>立即清除</Button>
                 </div>
               </Field>
-              <Field
-                label="Ollama 安装包缓存"
-                hint={
-                  installerInfo
-                    ? `约 ${(installerInfo.size / 1024 / 1024).toFixed(0)} MB，供离线重装；删除后需重新下载`
-                    : "未缓存安装包（一键安装时自动下载）"
-                }
-              >
-                {installerInfo && (
-                  <Button variant="danger" disabled={removingInstaller} onClick={() => void onRemoveInstaller()}>
-                    {removingInstaller ? "删除中…" : "删除安装包"}
-                  </Button>
-                )}
-              </Field>
+              {/* Ollama 安装包缓存仅在托管平台（Windows）显示：非托管平台不管理本机 Ollama。 */}
+              {managedOllama && (
+                <Field
+                  label="Ollama 安装包缓存"
+                  hint={
+                    installerInfo
+                      ? `约 ${(installerInfo.size / 1024 / 1024).toFixed(0)} MB，供离线重装；删除后需重新下载`
+                      : "未缓存安装包（一键安装时自动下载）"
+                  }
+                >
+                  {installerInfo && (
+                    <Button variant="danger" disabled={removingInstaller} onClick={() => void onRemoveInstaller()}>
+                      {removingInstaller ? "删除中…" : "删除安装包"}
+                    </Button>
+                  )}
+                </Field>
+              )}
               <Field label="回收站" hint="超过保留期限后，会在启动时自动清理；设为 0 时不自动清理。">
                 <input
                   type="number"
@@ -1612,7 +1652,12 @@ function ResetDataPanel({
       if (r.searchStateReset) parts.push("搜索条件已清除");
       if (r.cacheFilesDeleted > 0) parts.push(`缓存文件 ${r.cacheFilesDeleted} 个`);
       if (r.logFilesDeleted > 0) parts.push(`诊断日志 ${r.logFilesDeleted} 个`);
-      const msg = parts.length > 0 ? `重置完成：已清除${parts.join("，")}` : "重置完成：所选数据本来就是空的";
+      const base = parts.length > 0 ? `重置完成：已清除${parts.join("，")}` : "重置完成：所选数据本来就是空的";
+      // P2-01：系统凭据部分清理失败必须可见——数据库已重置成功，但残留系统凭据需用户排查。
+      const msg =
+        r.credentialsDeleteFailed > 0
+          ? `${base}。注意：有 ${r.credentialsDeleteFailed} 个系统凭据未能清理，请检查系统密钥服务（钥匙串 / 凭据管理器 / Secret Service）后手动删除对应条目。`
+          : base;
       setResult(msg);
       notify(msg);
       setSel(RESET_NONE);

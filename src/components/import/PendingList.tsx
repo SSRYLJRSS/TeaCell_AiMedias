@@ -178,10 +178,13 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
     },
     () => onOpenItem(item.path),
   );
-  // 入库开始：强制释放预览（视频层卸载 + pause）
+  // 入库开始：强制释放预览（视频层卸载 + pause）。
+  // 只依赖 running 触发：hover 每次渲染都是新对象引用，纳入依赖会让本效果每帧重跑；
+  // 仅需 running 由 false→true 时取消一次，故有意省略 hover。
   useEffect(() => {
     if (running) hover.cancel();
-  }, [running, hover.cancel]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
 
   const isVideo = item.kind === "video";
 

@@ -1,0 +1,257 @@
+# ============================================================
+# 三端复核 §12.2：候选包门。
+# 同一版本号 + 提交 SHA 生成三个安装包目标（Windows x64 / macOS ARM64 / Linux x64）。
+# 每个 job 上传：安装包 + SHA256 + 构建日志 + 目标 triple + 依赖清单 + FFmpeg/HEIF 来源。
+# 汇总 job 只有三个工件齐全时才标记候选版本「可供用户测试」。
+#
+# 注意：「可供用户测试」≠「macOS/Linux 真机已通过」。发布说明附反馈模板（见 docs/QA_PLAYBOOK.md）。
+# 前置：src-tauri/binaries/ 需含各目标的 ffmpeg-<triple>/ffprobe-<triple> sidecar，
+#       否则 desktop.mjs build 会明确失败（安装包必须自带视频工具）。
+# ============================================================
+name: release-candidate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Print and assert runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV
+          echo "uname=$(uname -a)"
+          echo "node.platform=$(node -p process.platform) node.arch=$(node -p process.arch)"
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc)
+              rustc -vV | grep -F "host: x86_64-pc-windows-msvc"
+              test "$(node -p process.platform)" = "win32"
+              test "$(node -p process.arch)" = "x64"
+              test "$(uname -m)" = "x86_64" ;;
+            aarch64-apple-darwin)
+              rustc -vV | grep -F "host: aarch64-apple-darwin"
+              test "$(node -p process.platform)" = "darwin"
+              test "$(node -p process.arch)" = "arm64"
+              test "$(uname -m)" = "arm64" ;;
+            x86_64-unknown-linux-gnu)
+              rustc -vV | grep -F "host: x86_64-unknown-linux-gnu"
+              test "$(node -p process.platform)" = "linux"
+              test "$(node -p process.arch)" = "x64"
+              test "$(uname -m)" = "x86_64" ;;
+            *) echo "未知 target"; exit 1 ;;
+          esac
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libayatana-appindicator3-dev patchelf libasound2-dev unzip
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # P0-02：准备并验证本目标 ffmpeg/ffprobe sidecar（下载 + SHA256 + 编码器 + 许可证）。
+      # manifest 里 SHA256 为占位哨兵时脚本会明确失败——这是有意的发布闸，不会抓未校验的 latest。
+      - name: Prepare media tool sidecars
+        run: node scripts/prepare-media-tools.mjs --target ${{ matrix.target }}
+
+      # 记录构建元数据：目标 triple、版本、SHA、工具链、FFmpeg/HEIF 来源。
+      - name: Record build metadata
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          {
+            echo "target=${{ matrix.target }}"
+            echo "version=$(node -p "require('./package.json').version")"
+            echo "commit=${GITHUB_SHA}"
+            echo "rustc=$(rustc -vV | tr '\n' ';')"
+            echo "node=$(node -v)"
+          } > artifacts/build-metadata.txt
+          # P0-01：check 用 strict-release，且不再 `|| true` 吞失败——sidecar 未就绪必须让步骤失败。
+          node scripts/desktop.mjs check --target ${{ matrix.target }} --strict-release | tee artifacts/desktop-check.log
+          cargo tree --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} > artifacts/cargo-deps.txt
+
+      # P0-01：发布 bundle 用 pipefail 捕获真实退出码，无论成败都保留日志，最后按构建状态退出。
+      # 不再让 `tee` 的成功状态掩盖 Node 构建失败。
+      - name: Build desktop bundle
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          node scripts/desktop.mjs build --target ${{ matrix.target }} 2>&1 | tee artifacts/build.log
+          build_status=${PIPESTATUS[0]}
+          set -e
+          echo "build_status=${build_status}" >> artifacts/build-metadata.txt
+          exit "${build_status}"
+
+      # P0-01：硬校验安装包 + 生成/校验 per-target manifest + 只对安装包计算 SHA256SUMS。
+      - name: Collect installers, checksums and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          TARGET="${{ matrix.target }}"
+          VERSION="$(node -p "require('./package.json').version")"
+          # 每目标允许的安装包扩展名（macOS 只以 DMG 为发布工件；.app 目录不作为单文件工件）。
+          case "$TARGET" in
+            x86_64-pc-windows-msvc) EXTS="exe msi" ;;
+            aarch64-apple-darwin) EXTS="dmg" ;;
+            x86_64-unknown-linux-gnu) EXTS="AppImage deb" ;;
+            *) echo "未知目标 $TARGET"; exit 1 ;;
+          esac
+          mkdir -p artifacts
+          shopt -s nullglob
+          installers=()
+          if [ -d "$BUNDLE_DIR" ]; then
+            for ext in $EXTS; do
+              while IFS= read -r -d '' f; do
+                cp "$f" artifacts/
+                installers+=("$(basename "$f")")
+              done < <(find "$BUNDLE_DIR" -type f -name "*.${ext}" -print0)
+            done
+          fi
+          if [ "${#installers[@]}" -eq 0 ]; then
+            echo "未找到本目标允许的安装包（$EXTS）——bundle 失败或产物缺失，判定失败。"
+            exit 1
+          fi
+          # 只对安装包计算 SHA256SUMS（不把构建日志混进「安装包校验和」语义）。
+          cd artifacts
+          : > SHA256SUMS.txt
+          for f in "${installers[@]}"; do
+            if command -v sha256sum >/dev/null; then sha256sum "$f" >> SHA256SUMS.txt; else shasum -a 256 "$f" >> SHA256SUMS.txt; fi
+          done
+          cat SHA256SUMS.txt
+
+          # 许可证属于候选交付材料：同时随安装包资源打包，并单独上传供审计复核。
+          if [ ! -d "../src-tauri/binaries/licenses" ]; then
+            echo "缺少 sidecar 许可证目录——候选材料不完整。"
+            exit 1
+          fi
+          cp -R ../src-tauri/binaries/licenses third-party-licenses
+          find third-party-licenses -maxdepth 3 -type f -print
+
+          # per-target manifest：目标、版本、commit、runner、安装包清单 + sha256、ffmpeg 版本。
+          node - "$TARGET" "$VERSION" "${GITHUB_SHA}" "$RUNNER_OS" "$RUNNER_ARCH" "${installers[@]}" <<'NODE' > artifact-manifest.json
+          const [target, version, commit, os, arch, ...installers] = process.argv.slice(2);
+          const fs = require("node:fs");
+          const crypto = require("node:crypto");
+          const files = installers.map((name) => ({
+            name,
+            size: fs.statSync(name).size,
+            sha256: crypto.createHash("sha256").update(fs.readFileSync(name)).digest("hex"),
+          }));
+          let ffmpegVersion = null;
+          try {
+            ffmpegVersion = JSON.parse(fs.readFileSync("../src-tauri/binaries/manifest.json", "utf8")).ffmpegVersion;
+          } catch {}
+          const licenseFiles = [];
+          function collect(dir, prefix = "") {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+              const full = `${dir}/${entry.name}`;
+              if (entry.isDirectory()) collect(full, rel);
+              else if (entry.isFile()) licenseFiles.push({ name: rel, sha256: crypto.createHash("sha256").update(fs.readFileSync(full)).digest("hex") });
+            }
+          }
+          collect("third-party-licenses");
+          console.log(JSON.stringify({ target, version, commit, runnerOs: os, runnerArch: arch, installers: files, ffmpegVersion, licenseFiles }, null, 2));
+          NODE
+          cat artifact-manifest.json
+
+      # P0-01：安装包缺失时直接失败上传，不上传只有日志的目录。
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bagertea-${{ matrix.target }}
+          path: artifacts/**
+          if-no-files-found: error
+
+  # 汇总门（P0-01）：验证内容而非目录名。任一 bundle job 失败 → 候选版本不就绪。
+  summarize:
+    needs: bundle
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+      - name: Verify three-target installers, manifest, commit and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ① 所有 bundle job 必须成功（needs.bundle.result 通过 job 依赖间接保证；这里再显式核内容）。
+          if [ "${{ needs.bundle.result }}" != "success" ]; then
+            echo "有 bundle job 未成功（result=${{ needs.bundle.result }}）——候选版本【未】就绪。"
+            exit 1
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          COMMIT="${GITHUB_SHA}"
+          echo "期望 version=$VERSION commit=$COMMIT"
+          fail=0
+          for t in x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            dir="all-artifacts/bagertea-$t"
+            if [ ! -d "$dir" ]; then echo "缺失目标工件目录：$t"; fail=1; continue; fi
+            mf="$dir/artifact-manifest.json"
+            if [ ! -f "$mf" ]; then echo "$t 缺少 artifact-manifest.json"; fail=1; continue; fi
+            if [ ! -f "$dir/SHA256SUMS.txt" ]; then echo "$t 缺少 SHA256SUMS.txt"; fail=1; continue; fi
+            # manifest 的 target/version/commit 必须与本次 workflow 一致，且至少一个安装包。
+            node - "$mf" "$t" "$VERSION" "$COMMIT" <<'NODE' || fail=1
+          const [mf, t, version, commit] = process.argv.slice(2);
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const crypto = require("node:crypto");
+          const m = JSON.parse(fs.readFileSync(mf, "utf8"));
+          const errs = [];
+          if (m.target !== t) errs.push(`target ${m.target}!=${t}`);
+          if (m.version !== version) errs.push(`version ${m.version}!=${version}`);
+          if (m.commit !== commit) errs.push(`commit ${m.commit}!=${commit}`);
+          if (!Array.isArray(m.installers) || m.installers.length === 0) errs.push("无安装包");
+          if (!Array.isArray(m.licenseFiles) || m.licenseFiles.length === 0) errs.push("无 sidecar 许可证材料");
+          for (const license of m.licenseFiles || []) {
+            const file = path.join(path.dirname(mf), "third-party-licenses", license.name);
+            if (!fs.existsSync(file)) { errs.push(`许可证缺失 ${license.name}`); continue; }
+            const got = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            if (got !== license.sha256) errs.push(`许可证 SHA256 不匹配 ${license.name}`);
+          }
+          if (errs.length) { console.error(`${t} manifest 校验失败: ${errs.join("; ")}`); process.exit(1); }
+          console.log(`${t} manifest OK：${m.installers.map(i => i.name).join(", ")}`);
+          NODE
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "三目标内容校验未全通过——候选版本【未】就绪（不标记可供用户测试）。"
+            exit 1
+          fi
+          echo "三目标安装包 + manifest + 校验和齐全且与同一 SHA 一致——候选版本可供用户测试（注意：≠ macOS/Linux 真机已通过）。"

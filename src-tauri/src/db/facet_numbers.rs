@@ -126,19 +126,18 @@ pub fn clear_facet_number(conn: &Connection, asset_ids: &[i64], facet_key: &str)
     Ok(())
 }
 
-/// kinship RAW/非 RAW 配对兄弟（与 assign_inner 同源；此处直接按扩展名对拍）。
+/// kinship RAW/非 RAW 配对兄弟（§11：与 asset_tags::kinship_sibling_ids 同一收口判定）。
+///
+/// 统一走 `kinship::paired_sibling`：同目录 + 同主干名（大小写不敏感），且整组恰好
+/// 1 RAW + 1 非 RAW 才返回对方。多 RAW / 多非 RAW / `X.RAW+X.JPG+X.PNG` 等歧义组合
+/// 一律不扩散，避免数值分面不对称同步。返回 0 或 1 个 id。
 fn kinship_siblings(conn: &Connection, asset_id: i64) -> AppResult<Vec<i64>> {
-    let mut out = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT b.id FROM assets a JOIN assets b
-           ON b.file_name = a.file_name AND b.id != a.id
-          WHERE a.id = ?1",
-    )?;
-    let rows = stmt.query_map([asset_id], |r| r.get(0))?;
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
+    let mut stmt = conn.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let all: Vec<(i64, String)> = rows.flatten().collect();
+    Ok(crate::services::kinship::paired_sibling(&all, asset_id)
+        .into_iter()
+        .collect())
 }
 
 /// 读单素材某分面的数值行。

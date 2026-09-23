@@ -86,43 +86,41 @@ pub fn protocol_to_api_mode(protocol: &str) -> &'static str {
     }
 }
 
-/// 按用途解析出可直接喂给现有 AI HTTP service 的 ApiProfile（老管线兼容形态）。
-/// 读取 keyring 拿 API Key：读取失败返回错误（不静默吞）；未配置返回空 key。
-/// 该函数读 DB + 系统凭据，调用方负责在短锁作用域内调用（keyring 读取耗时极短）。
-pub fn usage_profile(
-    conn: &Connection,
-    usage: &str,
-) -> AppResult<Option<crate::db::settings::ApiProfile>> {
+/// 用途绑定解析结果（§10）：不含 plaintext 的 ApiProfile 骨架 + 凭据引用。
+/// db 层不访问系统凭据；调用方在**释放 DB 锁后**用 `api_key_ref` 读 keyring 补全 profile。
+pub struct UsageProfileRef {
+    /// api_key 字段固定为空串；由锁外的 keyring 读取填充。
+    pub profile: crate::db::settings::ApiProfile,
+    /// 凭据引用（= connection_id）；None 表示无需密钥（常见本地服务）。
+    pub api_key_ref: Option<String>,
+}
+
+/// 按用途解析出 ApiProfile 骨架（不含明文密钥）+ 凭据引用（§10）。
+/// db 层只读数据库、不碰 keyring；明文密钥由 service/command 在锁外组装。
+pub fn usage_profile_ref(conn: &Connection, usage: &str) -> AppResult<Option<UsageProfileRef>> {
     let Some(c) = binding_for(conn, usage)? else {
         return Ok(None);
     };
-    let api_key = match &c.api_key_ref {
-        Some(_) => crate::services::credentials::get_api_key(&c.id)?.unwrap_or_default(),
-        None => String::new(),
-    };
-    Ok(Some(crate::db::settings::ApiProfile {
-        id: c.id.clone(),
-        name: c.name.clone(),
-        api_mode: protocol_to_api_mode(&c.protocol).to_string(),
-        kind: c.deployment.clone(),
-        base_url: c.base_url.clone(),
-        api_key,
-        model: c.model.clone(),
+    Ok(Some(UsageProfileRef {
+        profile: crate::db::settings::ApiProfile {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            api_mode: protocol_to_api_mode(&c.protocol).to_string(),
+            kind: c.deployment.clone(),
+            base_url: c.base_url.clone(),
+            api_key: String::new(),
+            model: c.model.clone(),
+        },
+        api_key_ref: c.api_key_ref,
     }))
 }
 
-/// 把用途绑定的连接覆盖到调用方持有的 AiSettings 上（不动库内 settings 本体），
-/// 使现有 `cfg.active()` 直接命中绑定档案——共用现有 AI HTTP service（指导书 §4.4）。
-/// 返回是否命中绑定（false = 无绑定，调用方继续用默认 active 档案）。
-pub fn apply_usage_binding(
-    conn: &Connection,
-    usage: &str,
+/// 把（已在锁外补全明文密钥的）绑定 profile 覆盖到调用方持有的 AiSettings 上。
+/// 纯内存操作：不读 DB、不读 keyring，使现有 `cfg.active()` 直接命中绑定档案（§4.4）。
+pub fn apply_profile_to_cfg(
     cfg: &mut crate::db::settings::AiSettings,
-) -> AppResult<bool> {
-    let Some(profile) = usage_profile(conn, usage)? else {
-        return Ok(false);
-    };
-    // 把绑定连接注入 profiles（替换同 id，或追加），并设为 active
+    profile: crate::db::settings::ApiProfile,
+) {
     let id = profile.id.clone();
     if let Some(existing) = cfg.profiles.iter_mut().find(|p| p.id == id) {
         *existing = profile;
@@ -130,7 +128,6 @@ pub fn apply_usage_binding(
         cfg.profiles.push(profile);
     }
     cfg.active_profile = id;
-    Ok(true)
 }
 
 /// 写入/覆盖连接档案（upsert）。api_key_ref 由调用方决定（成功写凭据后置为 id）。
@@ -283,5 +280,78 @@ mod tests {
         let conn = init_memory().unwrap();
         assert!(upsert(&conn, "x", "X", "bad", "openai_chat", "u", "m", None).is_err());
         assert!(upsert(&conn, "x", "X", "cloud", "bad_proto", "u", "m", None).is_err());
+    }
+
+    /// P1-01：新安装环境无 legacy profile，只有「超级搜索」用途绑定时，
+    /// 解析绑定并注入后 `active()` 必须命中，不会被误判为「未配置」。
+    #[test]
+    fn usage_binding_populates_active_for_fresh_install() {
+        let conn = init_memory().unwrap();
+        upsert(
+            &conn,
+            "conn-new",
+            "新中转",
+            "cloud",
+            "openai_chat",
+            "https://new/v1",
+            "gpt-4o-mini",
+            Some("conn-new"),
+        )
+        .unwrap();
+        bind_usage(&conn, "super_search", "conn-new").unwrap();
+
+        // 模拟全新 settings：无任何 legacy profile。
+        let mut ai = crate::db::settings::AiSettings::default();
+        assert!(ai.active().is_none(), "全新环境无 legacy 档案");
+
+        // 按 super_search_cmd 的顺序解析并注入。
+        let bref = usage_profile_ref(&conn, "super_search").unwrap().unwrap();
+        assert_eq!(bref.api_key_ref.as_deref(), Some("conn-new"));
+        apply_profile_to_cfg(&mut ai, bref.profile);
+
+        // 注入后 active() 命中绑定档案。
+        let active = ai.active().expect("绑定注入后 active 必须命中");
+        assert_eq!(active.id, "conn-new");
+        assert_eq!(active.base_url, "https://new/v1");
+        assert_eq!(active.model, "gpt-4o-mini");
+    }
+
+    /// P1-01：绑定优先于 legacy active——存在 legacy 档案但绑定指向另一连接时，
+    /// 注入后 active 指向绑定连接。
+    #[test]
+    fn usage_binding_overrides_legacy_active() {
+        let conn = init_memory().unwrap();
+        upsert(
+            &conn,
+            "conn-bound",
+            "绑定连接",
+            "cloud",
+            "openai_chat",
+            "https://bound/v1",
+            "model-b",
+            Some("conn-bound"),
+        )
+        .unwrap();
+        bind_usage(&conn, "super_search", "conn-bound").unwrap();
+
+        // legacy 档案指向另一个连接
+        let mut ai = crate::db::settings::AiSettings {
+            active_profile: "legacy".into(),
+            profiles: vec![crate::db::settings::ApiProfile {
+                id: "legacy".into(),
+                name: "旧档案".into(),
+                api_mode: "openai".into(),
+                kind: "cloud".into(),
+                base_url: "https://legacy/v1".into(),
+                api_key: "sk-legacy".into(),
+                model: "model-legacy".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(ai.active().unwrap().id, "legacy");
+
+        let bref = usage_profile_ref(&conn, "super_search").unwrap().unwrap();
+        apply_profile_to_cfg(&mut ai, bref.profile);
+        assert_eq!(ai.active().unwrap().id, "conn-bound", "绑定优先于 legacy");
     }
 }

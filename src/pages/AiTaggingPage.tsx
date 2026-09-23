@@ -288,9 +288,11 @@ export default function AiTaggingPage() {
 
   // FB5-05（§7.6）：当前张审核中的一句话描述（切张重置：确认值 → 素材当前值 → 建议值）
   const [draftDescription, setDraftDescription] = useState("");
+  // 只在这些描述字段变化时重置草稿；currentSuggestion 整对象每帧新引用，故列具体字段而非整对象。
   useEffect(() => {
     if (!currentSuggestion) return;
     setDraftDescription(pickReviewDescription(currentSuggestion));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSuggestion?.id, currentSuggestion?.status, currentSuggestion?.confirmedDescription, currentSuggestion?.suggestedDescription, currentSuggestion?.currentDescription]);
 
   // 胶片条多选（批量套用用，按 assetId）

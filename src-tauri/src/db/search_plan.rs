@@ -406,11 +406,10 @@ pub fn compile_search_plan_with(
     };
 
     // 3) 排序：Field → 额外算 sortv（内层）；Relevance → score DESC, id DESC
-    let order_sql: String;
     let mut sortv_keep = String::new();
     let mut sortv_inner = String::new();
-    match &plan.ranking {
-        Ranking::Relevance => order_sql = "score DESC, id DESC".to_string(),
+    let order_sql = match &plan.ranking {
+        Ranking::Relevance => "score DESC, id DESC".to_string(),
         Ranking::Field { key, dir } => {
             let col = sort_column_sql(key)
                 .ok_or_else(|| AppError::msg(format!("非法排序字段：{key}")))?;
@@ -423,9 +422,9 @@ pub fn compile_search_plan_with(
             };
             // B9（方案 A）：字段排序为主键，score DESC 为次级（同值命中优先项的排前面），
             // 尾缀仍为 id DESC → 分页稳定。
-            order_sql = format!("sortv {dir}, score DESC, id DESC");
+            format!("sortv {dir}, score DESC, id DESC")
         }
-    }
+    };
 
     // 4) 组装（三层：内层算 0/1 标记 → 中层算 score/hits → 外层过滤/排序）。
     //    每个 should 片段只在内层出现一次（别名不能在同一个 SELECT 里复用）。

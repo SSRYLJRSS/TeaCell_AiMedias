@@ -102,6 +102,40 @@ pub async fn reset_app_data(
     .await
     .map_err(|e| AppError::msg(format!("重置线程异常: {e}")))??;
 
+    // §10：事务已提交、DB 锁已释放，此处在锁外删除 keyring 凭据。删除失败只记录 warning，
+    // 不回滚已提交的 DB 重置（连接表已清空，残留凭据不含引用、只是惰性垃圾）。
+    let cred_ids = std::mem::take(&mut report.credential_ids_to_delete);
+    if !cred_ids.is_empty() {
+        report.credentials_delete_attempted = cred_ids.len() as u64;
+        // P2-01：逐项删除并回填可见统计。失败只 warn（不回滚已提交的 DB 重置），
+        // 但把成功/失败数量与脱敏错误类别交回前端，避免「重置成功」却残留系统凭据。
+        let (deleted, failed, kinds) = tauri::async_runtime::spawn_blocking(move || {
+            let mut deleted = 0u64;
+            let mut failed = 0u64;
+            let mut kinds: Vec<String> = Vec::new();
+            for id in &cred_ids {
+                match crate::services::credentials::delete_api_key(id) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        failed += 1;
+                        // 只记录脱敏类别到报告；完整 cause（可能含连接名）写日志。
+                        let kind = sanitize_credential_error_kind(&e.to_string());
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                        tracing::warn!("重置数据：某连接的系统凭据清理失败: {e}");
+                    }
+                }
+            }
+            (deleted, failed, kinds)
+        })
+        .await
+        .map_err(|e| AppError::msg(format!("凭据清理线程异常: {e}")))?;
+        report.credentials_deleted = deleted;
+        report.credentials_delete_failed = failed;
+        report.credentials_delete_error_kinds = kinds;
+    }
+
     if let Some(file_result) = asset_file_result {
         report.asset_files_deleted = file_result.deleted;
         report.asset_files_failed = file_result.failed_files.len() as u64;
@@ -111,6 +145,18 @@ pub async fn reset_app_data(
     }
 
     Ok(report)
+}
+
+/// P2-01：把凭据删除错误映射为**稳定、脱敏**的类别串（不含连接 ID、密钥、平台细节）。
+/// 完整 cause 只写日志；返回给前端的仅是可用于排查提示的粗类别。
+fn sanitize_credential_error_kind(msg: &str) -> String {
+    if msg.contains("初始化失败") {
+        "backend_unavailable".to_string()
+    } else if msg.contains("删除") {
+        "delete_failed".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn selection_requires_task_guard(selection: &db_reset::ResetSelection) -> bool {
@@ -347,6 +393,30 @@ mod tests {
         )
         .unwrap();
         AppState::new(conn, std::env::temp_dir())
+    }
+
+    /// P2-01：凭据删除错误映射为脱敏稳定类别，不泄漏连接 ID / 密钥 / 平台细节。
+    #[test]
+    fn credential_error_kind_is_sanitized_and_stable() {
+        assert_eq!(
+            sanitize_credential_error_kind("凭据存储初始化失败: backend down"),
+            "backend_unavailable"
+        );
+        assert_eq!(
+            sanitize_credential_error_kind("删除 API 密钥失败: conn-secret-123"),
+            "delete_failed"
+        );
+        assert_eq!(sanitize_credential_error_kind("something else"), "unknown");
+        // 不得回传原始信息（无连接 id / 密钥）
+        for msg in [
+            "删除 API 密钥失败: conn-secret-123",
+            "凭据存储初始化失败: /Users/foo/.secret",
+        ] {
+            let kind = sanitize_credential_error_kind(msg);
+            assert!(!kind.contains("secret"));
+            assert!(!kind.contains("conn"));
+            assert!(!kind.contains("/Users"));
+        }
     }
 
     #[test]

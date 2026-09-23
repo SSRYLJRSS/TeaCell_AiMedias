@@ -7,9 +7,16 @@
  *  - 点击 logo 设置入口派发 app:navigate=settings；
  *  - 非 Tauri 环境（jsdom）不抛异常。
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import TitleBar from "@/components/layout/TitleBar";
+import { usePlatformStore } from "@/stores/platformStore";
+import type { PlatformCapabilities } from "@/types/platform";
+
+afterEach(() => {
+  // 复位平台能力，避免跨用例串状态（默认 idle → 自绘控制）
+  usePlatformStore.setState({ status: "idle", capabilities: null, error: null });
+});
 
 describe("TitleBar（指导书 §3.3）", () => {
   it("软件名不显示，logo 本身作为设置入口并提供悬停提示", () => {
@@ -67,4 +74,26 @@ describe("TitleBar（指导书 §3.3）", () => {
   it("非 Tauri 环境渲染不抛异常（jsdom 无窗口 API）", () => {
     expect(() => render(<TitleBar />)).not.toThrow();
   });
+
+  // 三端统一自绘标题栏（指导书 §6.3）：Windows/macOS/Linux 三种 fixture 下均渲染窗口控制。
+  const fixtures: { os: PlatformCapabilities["os"]; arch: PlatformCapabilities["arch"]; managedOllama: boolean; preferredVideoProxy: PlatformCapabilities["preferredVideoProxy"] }[] = [
+    { os: "windows", arch: "x86_64", managedOllama: true, preferredVideoProxy: "h264_mp4" },
+    { os: "macos", arch: "aarch64", managedOllama: false, preferredVideoProxy: "h264_mp4" },
+    { os: "linux", arch: "x86_64", managedOllama: false, preferredVideoProxy: "vp8_webm" },
+  ];
+
+  for (const f of fixtures) {
+    it(`${f.os}：始终渲染自绘窗口控制（三端一致）`, () => {
+      usePlatformStore.setState({
+        status: "ready",
+        error: null,
+        capabilities: { schemaVersion: 1, ...f },
+      });
+      render(<TitleBar />);
+      expect(screen.getByRole("button", { name: "最小化" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /最大化|还原/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+    });
+  }
 });

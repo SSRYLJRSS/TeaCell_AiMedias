@@ -5,19 +5,10 @@ use rusqlite::Connection;
 use super::{tag_ops, tags::Tag, tags::FACET_EFFECTIVE};
 use crate::error::AppResult;
 
-/// W5h-b：查出 asset 的同源 asset_id（同目录同主干名 + 一个 RAW 一个非 RAW）。
-/// 返回调用方给的 id 本身除外。数据层两条记录独立，这里只在打标层展开。
+/// W5h-b / §11：查出 asset 的**唯一同源兄弟**（同目录同主干名，且整组恰好 1 RAW + 1 非 RAW）。
+/// 通过统一的 `kinship::paired_sibling` 分类：多 RAW / 多非 RAW / `X.RAW+X.JPG+X.PNG`
+/// 等歧义组合一律不返回兄弟，避免不对称同步。返回 0 或 1 个 id。
 fn kinship_sibling_ids(conn: &Connection, asset_id: i64) -> Vec<i64> {
-    let path: Option<String> = conn
-        .query_row(
-            "SELECT file_path FROM assets WHERE id = ?1",
-            [asset_id],
-            |r| r.get(0),
-        )
-        .ok();
-    let Some(path) = path else { return Vec::new() };
-    let (key, is_raw) = crate::services::kinship::kinship_key(&path);
-    // 同 key 的所有素材里，取 is_raw 相反的那些（一个 RAW 一个非 RAW）
     let mut stmt = match conn.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL") {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -26,17 +17,10 @@ fn kinship_sibling_ids(conn: &Connection, asset_id: i64) -> Vec<i64> {
         Ok(rows) => rows,
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
-    for row in rows.flatten() {
-        if row.0 == asset_id {
-            continue;
-        }
-        let (k, raw) = crate::services::kinship::kinship_key(&row.1);
-        if k == key && raw != is_raw {
-            out.push(row.0);
-        }
-    }
-    out
+    let all: Vec<(i64, String)> = rows.flatten().collect();
+    crate::services::kinship::paired_sibling(&all, asset_id)
+        .into_iter()
+        .collect()
 }
 
 /// W5h-b：设置开关是否开启同源同步（读设置失败时按默认开启处理——设置损坏不应静默关闭功能）

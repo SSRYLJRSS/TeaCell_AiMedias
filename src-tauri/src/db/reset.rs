@@ -10,7 +10,6 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
-use crate::services::credentials;
 
 /// 要重置的数据分类（前端勾选传入；false = 保留）
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,6 +51,20 @@ pub struct ResetReport {
     pub search_state_reset: bool,
     pub cache_files_deleted: u64,
     pub log_files_deleted: u64,
+    // P2-01：系统凭据（keyring）删除的可见统计。事务内只收集待删引用，提交后由 command 层
+    // 在 DB 锁外逐项删除并回填这三项，使前端能显示「N 个系统凭据未能清理」而非静默成功。
+    /// 尝试删除的凭据数（= 收集到的 connection_id 数）。
+    pub credentials_delete_attempted: u64,
+    /// 成功删除的凭据数。
+    pub credentials_deleted: u64,
+    /// 删除失败的凭据数（keyring 不可用 / 后端错误 / 权限等）。
+    pub credentials_delete_failed: u64,
+    /// 脱敏错误类别（不含 secret、不含完整 connection_id），供 UI 排查提示。
+    pub credentials_delete_error_kinds: Vec<String>,
+    /// §10：事务内只收集待删除凭据引用（= connection_id），提交后由 command 层在 DB 锁外删除
+    /// keyring 并生成失败报告；不进前端序列化（内部转交用）。
+    #[serde(skip)]
+    pub credential_ids_to_delete: Vec<String>,
 }
 
 impl ResetSelection {
@@ -124,17 +137,15 @@ pub fn reset(
         report.ai_tasks_deleted = tx.changes() as i64;
     }
 
-    // AI 服务配置：先读出连接 id，逐个删除系统凭据里的 API Key（keyring 非事务，先删后清表：
-    // 若中途失败最多留下孤儿凭据，不会出现「表里还有连接但密钥已丢」）
+    // AI 服务配置：§10——事务内只收集凭据引用并删 DB 表，绝不在事务里访问 keyring；
+    // 凭据删除由 command 层在事务提交后、DB 锁外执行，失败项进报告不回滚 DB。
     if sel.ai_connections {
         let ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM ai_connections")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
-        for id in &ids {
-            let _ = credentials::delete_api_key(id);
-        }
+        report.credential_ids_to_delete = ids;
         tx.execute("DELETE FROM ai_usage_bindings", [])?;
         tx.execute("DELETE FROM ai_connections", [])?;
         report.connections_deleted = tx.changes() as i64;
@@ -423,5 +434,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM export_tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// §10：重置 AI 连接在事务内只删 DB 表并收集凭据引用，绝不在事务里访问 keyring。
+    /// 凭据引用交回报告，由 command 层锁外删除。
+    #[test]
+    fn reset_ai_connections_collects_credential_ids_without_touching_keyring() {
+        let mut conn = init_memory().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        for id in ["conn-a", "conn-b"] {
+            conn.execute(
+                "INSERT INTO ai_connections
+                   (id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at)
+                 VALUES (?1, ?1, 'cloud', 'openai_chat', 'https://x/v1', 'm', ?1, 1, ?2, ?2)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+        }
+
+        let report = reset(
+            &mut conn,
+            &std::env::temp_dir(),
+            &ResetSelection {
+                ai_connections: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.connections_deleted, 2);
+        let mut ids = report.credential_ids_to_delete.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["conn-a".to_string(), "conn-b".to_string()]);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "连接表应被清空");
     }
 }

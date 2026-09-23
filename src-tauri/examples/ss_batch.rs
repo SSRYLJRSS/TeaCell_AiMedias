@@ -6,6 +6,7 @@
 use bagertea_ai_media_v2_lib::db::ai_connections;
 use bagertea_ai_media_v2_lib::db::query_expr::{validate_expr, LeafCond, QueryExpr};
 use bagertea_ai_media_v2_lib::db::{settings, tag_facets};
+use bagertea_ai_media_v2_lib::services::credentials;
 use bagertea_ai_media_v2_lib::services::super_search_ai as ss;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -122,8 +123,21 @@ fn main() {
     let conn = Connection::open(&db_path).expect("open db");
 
     let mut settings = settings::get_settings(&conn).expect("settings");
-    ai_connections::apply_usage_binding(&conn, "super_search", &mut settings.ai)
-        .expect("usage binding");
+    // §10：db 层只解析不含明文密钥的 profile，keyring 读取在锁外补全（示例为单连接顺序流程）。
+    if let Some(bref) =
+        ai_connections::usage_profile_ref(&conn, "super_search").expect("usage binding")
+    {
+        let key_ref = bref.api_key_ref.clone();
+        ai_connections::apply_profile_to_cfg(&mut settings.ai, bref.profile);
+        if let Some(id) = key_ref {
+            let key = credentials::get_api_key(&id)
+                .expect("keyring")
+                .unwrap_or_default();
+            if let Some(active) = settings.ai.profiles.iter_mut().find(|p| p.id == id) {
+                active.api_key = key;
+            }
+        }
+    }
     let cfg = settings.ai;
     match cfg.active() {
         Some(p) => eprintln!("model = {} @ {}", p.model, p.base_url),

@@ -187,8 +187,22 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-sm text-[var(--color-text)]">{c.name}</span>
-                    <span className={clsx("shrink-0 rounded px-1 text-[10px]", c.deployment === "local" ? "bg-[var(--color-surface-hover)]" : "bg-[var(--color-surface-hover)]")}>
-                      {c.deployment === "local" ? "本地" : "在线"}
+                    {/* P3-01：非托管平台（mac/Linux）应用不负责安装/启动本机进程，
+                        deployment=local 的旧连接标为「外部/自托管」，避免误以为应用托管其进程。
+                        仅托管平台（Windows）才显示「本地」。deployment 原值保留不迁移。 */}
+                    <span
+                      className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px]"
+                      title={
+                        c.deployment === "local" && !managedOllama
+                          ? "地址可指向本机自行安装的 Ollama、局域网机器或 OpenAI 兼容服务；应用只负责连接，不负责安装或启动进程。"
+                          : undefined
+                      }
+                    >
+                      {c.deployment === "local"
+                        ? managedOllama
+                          ? "本地"
+                          : "外部/自托管"
+                        : "在线"}
                     </span>
                     <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">
                       {c.protocol === "anthropic_messages" ? "Anthropic" : "OpenAI 兼容"}

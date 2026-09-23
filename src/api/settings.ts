@@ -80,6 +80,12 @@ export interface ResetDataReport {
   searchStateReset: boolean;
   cacheFilesDeleted: number;
   logFilesDeleted: number;
+  // P2-01：系统凭据（keyring）删除可见统计。部分失败时前端提示「N 个系统凭据未能清理」。
+  credentialsDeleteAttempted: number;
+  credentialsDeleted: number;
+  credentialsDeleteFailed: number;
+  /** 脱敏错误类别（不含 secret / 连接 ID），供排查提示。 */
+  credentialsDeleteErrorKinds: string[];
 }
 
 /** 分类重置应用数据（设置页「数据与缓存 → 重置数据」） */

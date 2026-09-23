@@ -12,9 +12,7 @@ function setOs(os: "windows" | "macos" | "linux") {
       os,
       arch: os === "macos" ? "aarch64" : "x86_64",
       managedOllama: os === "windows",
-      nativeWindowControls: os === "macos",
-      primaryModifier: os === "macos" ? "meta" : "ctrl",
-      libraryTransferVersion: null,
+      preferredVideoProxy: os === "linux" ? "vp8_webm" : "h264_mp4",
     },
   });
 }
@@ -52,5 +50,15 @@ describe("displayBasename（X-18）", () => {
     setOs("linux");
     expect(displayBasename("/home/me/")).toBe("/home/me/");
     expect(displayBasename("")).toBe("");
+  });
+
+  it("P3-02：显式 os 参数优先于 store（纯函数、不依赖全局状态）", () => {
+    // store 处于 idle（os 未知）时，显式传 windows 仍按反斜杠拆
+    expect(displayBasename("C:\\Users\\me\\photo.jpg", "windows")).toBe("photo.jpg");
+    // 显式传 linux 时反斜杠是合法文件名字符
+    expect(displayBasename("/home/a\\b.jpg", "linux")).toBe("a\\b.jpg");
+    // store 为 windows，但显式传 linux 覆盖：反斜杠不当分隔符
+    setOs("windows");
+    expect(displayBasename("/home/a\\b.jpg", "linux")).toBe("a\\b.jpg");
   });
 });

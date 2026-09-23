@@ -3,6 +3,9 @@
   "private": true,
   "version": "1.0.1",
   "type": "module",
+  "engines": {
+    "node": ">=22 <25"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -10,6 +13,11 @@
     "lint": "eslint .",
     "test:unit": "vitest run",
     "tauri": "tauri",
+    "desktop:dev": "node scripts/desktop.mjs dev",
+    "desktop:build": "node scripts/desktop.mjs build",
+    "desktop:check": "node scripts/desktop.mjs check",
+    "desktop:check:strict": "node scripts/desktop.mjs check --strict-release",
+    "prepare-media-tools": "node scripts/prepare-media-tools.mjs",
     "test:ignored": "cd src-tauri && cargo test --test perf_probe -- --ignored"
   },
   "dependencies": {

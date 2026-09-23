@@ -207,6 +207,8 @@ export default function QueryBuilder() {
       return;
     }
     setRoot(expr ? asRootGroup(exprToNode(expr)) : emptyGroup());
+    // 按 exprSignature（内容指纹）触发即可；expr 是每次渲染新对象，纳入会造成无意义重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exprSignature]);
   const commitFilter = (next: VGroup) => {
     const nextExpr = nodeToExpr(next, circularKeys);
@@ -215,6 +217,8 @@ export default function QueryBuilder() {
     lastLocalSignature.current = normalized ? serializeExpr(normalized) : "";
     setExpr(normalized);
   };
+  // commitFilter 是每次渲染重建的闭包，但只依赖 root/circularKeys/setExpr；显式列出这三项，
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const editFilter = useCallback((fn: (r: VGroup) => VGroup) => commitFilter(fn(root)), [root, circularKeys, setExpr]);
   // ═══ 排除区：平铺条件视图（根组连接词两态：命中任一 / 全部命中）═══
   const mustNotRoot = plan?.mustNot ?? null;
@@ -227,6 +231,8 @@ export default function QueryBuilder() {
       return;
     }
     setExRoot(mustNotRoot ? asRootGroup(exprToNode(mustNotRoot)) : emptyMustNotGroup());
+    // 按 mustNotSig（内容指纹）触发即可；mustNotRoot 是每次渲染新对象，纳入会造成无意义重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mustNotSig]);
   const commitMustNot = (next: VGroup) => {
     // allowNegated=false：排除区树内禁 NOT（与后端 validate 同规则），遗留取反叶子不回写
@@ -236,10 +242,15 @@ export default function QueryBuilder() {
     lastExSignature.current = normalized ? serializeExpr(normalized) : "";
     setPlanMustNot(normalized);
   };
+  // commitMustNot 是每次渲染重建的闭包，但只依赖 exRoot/circularKeys/setPlanMustNot；显式列出。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const editMustNot = useCallback((fn: (r: VGroup) => VGroup) => commitMustNot(fn(exRoot)), [exRoot, circularKeys, setPlanMustNot]);
   // U-6：诊断叶子的 expr 路径（与后端 collect_leaves 对齐：NOT 子树按下标 0 展开）。
   // 视图叶子按 DFS 序与 expr 叶子一一配对；未完成叶子不进 expr，配对时跳过保持对齐。
+  // expr/mustNotRoot 用其内容指纹（exprSignature/mustNotSig）代替对象身份进依赖，避免每帧重算。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const filterLeafPathById = useMemo(() => leafPathMap(root, collectLeafPaths(expr), circularKeys), [root, exprSignature, circularKeys]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const mustNotLeafPathById = useMemo(() => leafPathMap(exRoot, collectLeafPaths(mustNotRoot ?? undefined), circularKeys), [exRoot, mustNotSig, circularKeys]);
   // U-6/§4.5：四指标诊断（diagnose_search_plan_cmd → PlanDiagnostics）——
   // 叶子带 zone（filter/mustNot），加分项带 index，warnings 与列表同批。

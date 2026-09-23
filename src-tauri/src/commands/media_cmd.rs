@@ -20,15 +20,17 @@ fn acquire_refill_gate(gate: &Arc<AtomicBool>) -> AppResult<media_refill::Refill
     })
 }
 
-/// 开一轮回填：先抢闸，成功后才重置取消标志（FX-12）。
+/// 回填任务运行许可：回填互斥闸（RAII，move 进工作线程后持有到任务结束）。
+pub struct RefillRunToken {
+    _gate: media_refill::RefillGateGuard,
+}
+
+/// 开一轮回填：抢回填互斥闸，成功后才重置取消标志（FX-12）。
 /// 顺序不能反：抢不到闸的调用方若已经复位了标志，正在跑的那一批就丢掉了用户点过的"取消"。
-fn begin_refill(
-    gate: &Arc<AtomicBool>,
-    cancel: &AtomicBool,
-) -> AppResult<media_refill::RefillGateGuard> {
-    let guard = acquire_refill_gate(gate)?;
+fn begin_refill(state: &AppState, _task: &str, cancel: &AtomicBool) -> AppResult<RefillRunToken> {
+    let guard = acquire_refill_gate(&state.refill_running)?;
     cancel.store(false, Ordering::Relaxed);
-    Ok(guard)
+    Ok(RefillRunToken { _gate: guard })
 }
 
 /// 回填结果 JSON（camelCase 序列化）。
@@ -69,12 +71,12 @@ pub async fn rescan_asset_metadata(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // FX-12：抢闸失败时明确报错；guard move 进闭包，覆盖所有退出路径。
-    // 顺序要紧：先抢闸再重置取消标志（见 begin_refill）。
-    let _gate = begin_refill(&state.refill_running, &cancel)?;
+    // FX-12：抢闸失败时明确报错；token move 进闭包，覆盖所有退出路径。
+    // 顺序要紧：先抢闸再重置取消标志（见 begin_refill）。X-10：并含维护活动租约。
+    let _token = begin_refill(&state, "媒体元数据回填", &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
-        let _gate = _gate;
+        let _token = _token;
         // 锁外探测，只短锁读/写每行
         let resolved = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -117,11 +119,11 @@ pub async fn rescan_asset_palette(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // FX-12：与元数据回填互斥（抢闸失败时明确报错），先抢闸再重置取消标志。
-    let _gate = begin_refill(&state.refill_running, &cancel)?;
+    // FX-12：与元数据回填互斥（抢闸失败时明确报错），先抢闸再重置取消标志。X-10：并含维护活动租约。
+    let _token = begin_refill(&state, "色板回算", &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<PaletteRescanResult> {
-        let _gate = _gate;
+        let _token = _token;
         let resolved: Vec<i64> = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             match scope.as_str() {
@@ -179,11 +181,11 @@ pub async fn rescan_asset_geo_taken(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
-    let _gate = begin_refill(&state.refill_running, &cancel)?;
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。X-10：并含维护活动租约。
+    let _token = begin_refill(&state, "定位回填", &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
-        let _gate = _gate;
+        let _token = _token;
         let resolved: Vec<i64> = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             match scope.as_str() {
@@ -224,11 +226,11 @@ pub async fn rescan_image_dimensions(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
-    let _gate = begin_refill(&state.refill_running, &cancel)?;
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。X-10：并含维护活动租约。
+    let _token = begin_refill(&state, "图片宽高回填", &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
-        let _gate = _gate;
+        let _token = _token;
         let resolved: Vec<i64> = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             match scope.as_str() {
@@ -278,11 +280,11 @@ pub async fn rescan_asset_phash(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
-    let _gate = begin_refill(&state.refill_running, &cancel)?;
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。X-10：并含维护活动租约。
+    let _token = begin_refill(&state, "感知哈希回填", &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
-        let _gate = _gate;
+        let _token = _token;
         let resolved: Vec<i64> = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             assets::list_ids_needing_phash(&conn, &scope, ids.as_deref().unwrap_or_default())?
@@ -342,13 +344,17 @@ mod tests {
     /// 它先 store(false) 再抢闸失败，正在跑的批次就丢掉了取消请求。
     #[test]
     fn losing_gate_does_not_clear_cancel_flag() {
-        let gate = Arc::new(AtomicBool::new(false));
         let cancel = AtomicBool::new(false);
 
-        let _running = begin_refill(&gate, &cancel).expect("首轮应抢到闸");
+        let state =
+            crate::state::AppState::new(crate::db::init_memory().unwrap(), std::env::temp_dir());
+        let _running = begin_refill(&state, "回填", &cancel).expect("首轮应抢到闸");
         cancel.store(true, Ordering::Relaxed); // 用户点了取消
 
-        assert!(begin_refill(&gate, &cancel).is_err(), "第二轮必须抢不到闸");
+        assert!(
+            begin_refill(&state, "回填", &cancel).is_err(),
+            "第二轮必须抢不到闸（活动租约已被首轮持有，回填闸也被占）"
+        );
         assert!(
             cancel.load(Ordering::Relaxed),
             "抢闸失败不得复位取消标志，否则正在跑的批次停不下来"
@@ -359,9 +365,10 @@ mod tests {
     /// 不重置会让新一轮在第一个素材前就 break。
     #[test]
     fn winning_gate_resets_cancel_flag() {
-        let gate = Arc::new(AtomicBool::new(false));
         let cancel = AtomicBool::new(true); // 上一轮被取消后的残留状态
-        let _g = begin_refill(&gate, &cancel).expect("应抢到闸");
+        let state =
+            crate::state::AppState::new(crate::db::init_memory().unwrap(), std::env::temp_dir());
+        let _g = begin_refill(&state, "回填", &cancel).expect("应抢到闸");
         assert!(!cancel.load(Ordering::Relaxed), "新一轮应重置取消标志");
     }
 }

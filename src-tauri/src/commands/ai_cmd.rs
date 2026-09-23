@@ -16,16 +16,38 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
 }
 
 /// 打标只认 tagging 用途绑定；旧 settings 激活档案仅作为迁移输入，不再作为运行回退。
+///
+/// §10：db 锁内只解析不含明文密钥的 profile 并注入 cfg（供模型名/本地判定等只读检查）；
+/// 返回凭据引用 `api_key_ref`，由调用方在**释放锁后**用 keyring 补全密钥并重新注入 cfg。
+/// 无绑定时明确报错。
 fn require_tagging_binding(
     conn: &rusqlite::Connection,
     cfg: &mut settings::AiSettings,
+) -> AppResult<Option<String>> {
+    let Some(bref) = ai_connections::usage_profile_ref(conn, "tagging")? else {
+        return Err(AppError::msg(
+            "尚未绑定打标服务，请先在打标页选择在线或本地模型",
+        ));
+    };
+    let api_key_ref = bref.api_key_ref.clone();
+    ai_connections::apply_profile_to_cfg(cfg, bref.profile);
+    Ok(api_key_ref)
+}
+
+/// 锁外用 keyring 补全 tagging 绑定档案的明文密钥并重新注入 cfg（§10）。
+/// `api_key_ref` 为 None（本地服务常见）时不读 keyring，cfg 保持空密钥。
+fn fill_tagging_key_out_of_lock(
+    cfg: &mut settings::AiSettings,
+    api_key_ref: Option<String>,
 ) -> AppResult<()> {
-    if ai_connections::apply_usage_binding(conn, "tagging", cfg)? {
+    let Some(id) = api_key_ref else {
         return Ok(());
+    };
+    let key = crate::services::credentials::get_api_key(&id)?.unwrap_or_default();
+    if let Some(active) = cfg.profiles.iter_mut().find(|p| p.id == id) {
+        active.api_key = key;
     }
-    Err(AppError::msg(
-        "尚未绑定打标服务，请先在打标页选择在线或本地模型",
-    ))
+    Ok(())
 }
 
 fn mode_for_active_profile(cfg: &settings::AiSettings) -> &'static str {
@@ -63,6 +85,7 @@ pub fn ai_create_batch(
     let mode = if mode == "manual" {
         mode
     } else {
+        // 建批只需按绑定档案的本地/云端判定 mode，不需要明文密钥（丢弃 api_key_ref）。
         require_tagging_binding(&conn, &mut s.ai)?;
         mode_for_active_profile(&s.ai).to_string()
     };
@@ -88,7 +111,7 @@ pub async fn ai_start_batch(
 
     tauri::async_runtime::spawn_blocking(move || {
         // 预检与配置读取：短锁作用域，读完即放
-        let all = {
+        let (all, tagging_key_ref) = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             let batch = ai::get_batch(&conn, batch_id)?;
             // v2.12：仅执行中拒绝；done/cancelled 允许续跑剩余 pending 建议
@@ -106,9 +129,9 @@ pub async fn ai_start_batch(
                 ));
             }
             let mut s = settings::get_settings(&conn)?;
-            // §4.4：打标按用途绑定读取连接档案（含 keyring 密钥解析）。
-            //       绑定修改不写 settings JSON，复用现有 AI HTTP service（run_cloud_batch 只读 cfg）。
-            require_tagging_binding(&conn, &mut s.ai)?;
+            // §4.4/§10：打标按用途绑定读取连接档案；db 锁内只注入不含明文密钥的 profile，
+            //       密钥引用留到锁外用 keyring 补全（绑定修改不写 settings JSON）。
+            let tagging_key_ref = require_tagging_binding(&conn, &mut s.ai)?;
             let profile_is_local = mode_for_active_profile(&s.ai) == "local";
             // 建批后允许切换服务；执行时按当前 tagging 绑定修正批次类型。
             ai::set_batch_mode(&conn, batch_id, mode_for_active_profile(&s.ai))?;
@@ -161,9 +184,11 @@ pub async fn ai_start_batch(
                     }
                 }
             }
-            s
+            (s, tagging_key_ref)
         };
-        let cfg = all.ai;
+        let mut cfg = all.ai;
+        // §10：DB 锁已释放，此处用 keyring 补全 tagging 绑定档案的明文密钥（锁外阻塞调用）。
+        fill_tagging_key_out_of_lock(&mut cfg, tagging_key_ref)?;
         // W2-1：提示词上下文直接从 tag_facets 读（V20 合表后不再需要 configs 参数；短锁立即释放）
         // F4：按媒体类型各取一份 —— 图片批次只带 all+image 分面，视频批次 only all+video，
         //     「只适用于视频」的分面不再污染图片提示词（mixed 批次两条都传给执行层按条目取）。

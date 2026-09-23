@@ -65,6 +65,18 @@ export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, n
         </p>
       </div>
 
+      {/* R3（三端复核 §9.3）：非托管平台（macOS/Linux）不提供 Ollama 安装/启动/模型管理，
+          给出固定说明并引导用户自部署或连接其他机器服务，在下方连接表单填写地址。 */}
+      {!managedOllama && (
+        <div className="mx-4 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2">
+          <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
+            本平台不提供 Ollama 的安装、启动和模型管理。你可以在本机自行安装 Ollama 或其他
+            OpenAI 兼容服务，也可以连接局域网内其它机器的服务，然后在下方「在线/外部服务」表单里
+            填写本机（如 http://127.0.0.1:11434）、局域网或在线地址。
+          </p>
+        </div>
+      )}
+
       {effectiveDeployment === "local" && (
         <LocalModelGroup
           draft={draft}

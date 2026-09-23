@@ -1,0 +1,151 @@
+# ============================================================
+# 三端复核 §12.1：每个 PR 的三目标代码门。
+# 证明 Windows x64 / macOS ARM64 / Linux x64 三个首发目标代码可编译、
+# 静态门禁与测试通过，并执行 Tauri native 非 bundle 构建 + 二进制架构断言（P1-07）。
+# 前端测试无平台差异只跑一次；Rust clippy/test/native-build 按目标执行。
+#
+# 说明：本工作流是「代码门」，执行 native 构建但不产出安装包（bundle + sidecar 见 release-candidate.yml）。
+# 每个 runner 先打印 rustc/-node 平台信息并断言与目标一致，避免 runner 标签变化后静默跑错架构。
+# ============================================================
+name: code-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # 前端门只跑一次（无平台差异）：typecheck + lint + build + vitest。
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Assert node platform
+        run: node -p "process.platform" && node -p "process.arch"
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run build
+
+  # Rust 代码门按三目标矩阵执行（clippy/test/build 有平台差异，必须逐目标跑）。
+  rust:
+    name: rust (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            expect_os: win32
+            expect_arch: x64
+            expect_uname: x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            expect_os: darwin
+            expect_arch: arm64
+            expect_uname: arm64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            expect_os: linux
+            expect_arch: x64
+            expect_uname: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # §12.1：先打印并断言 runner 平台与目标一致（防 runner 标签漂移后静默跑错架构）。
+      - name: Print and assert toolchain/platform
+        shell: bash
+        run: |
+          rustc -vV
+          echo "uname=$(uname -a)"
+          echo "node.platform=$(node -p process.platform) node.arch=$(node -p process.arch)"
+          rustc -vV | grep -F "host: ${{ matrix.target }}"
+          test "$(node -p process.platform)" = "${{ matrix.expect_os }}"
+          test "$(node -p process.arch)" = "${{ matrix.expect_arch }}"
+          test "$(uname -m)" = "${{ matrix.expect_uname }}"
+
+      # Linux 需要 Tauri/webkit 系统依赖（build/bundle 用；cargo test 也可能链接）。
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libayatana-appindicator3-dev patchelf libasound2-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend build (needed by tauri build config beforeBuildCommand)
+        run: npm run build
+
+      - name: cargo fmt --check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: cargo clippy (deny warnings)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --all-features --target ${{ matrix.target }}
+
+      # P1-07：PR 代码门执行目标平台的 Tauri native 非 bundle 构建，证明 Tauri 配置、
+      # WebView 链接与目标二进制架构正确（不产出安装包，不需要 sidecar）。
+      - name: Tauri native build (no bundle)
+        working-directory: src-tauri
+        run: cargo build --release --target ${{ matrix.target }} --bin bagertea_ai_media_v2
+
+      # P1-07：断言产出二进制架构与目标一致（Windows PE x64 / macOS Mach-O / Linux ELF x86_64）。
+      - name: Assert built binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="src-tauri/target/${{ matrix.target }}/release"
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc)
+              f="$BIN_DIR/bagertea_ai_media_v2.exe"
+              test -f "$f"
+              # PE 文件头 'MZ'
+              head -c 2 "$f" | grep -q "MZ" && echo "Windows PE OK: $f" ;;
+            aarch64-apple-darwin)
+              f="$BIN_DIR/bagertea_ai_media_v2"
+              test -f "$f"
+              file "$f"
+              if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+                file "$f" | grep -q "arm64" && echo "Mach-O arm64 OK"
+              else
+                file "$f" | grep -q "x86_64" && echo "Mach-O x86_64 OK"
+              fi ;;
+            x86_64-unknown-linux-gnu)
+              f="$BIN_DIR/bagertea_ai_media_v2"
+              test -f "$f"
+              file "$f" | grep -q "ELF 64-bit" && file "$f" | grep -q "x86-64" && echo "ELF x86_64 OK" ;;
+          esac
+
+      # 普通开发检查：允许缺 sidecar（只 warn），不做 strict-release（那是候选包门的职责）。
+      - name: Desktop env check (HEIF/sidecar resolution, no bundle)
+        run: node scripts/desktop.mjs check --target ${{ matrix.target }}

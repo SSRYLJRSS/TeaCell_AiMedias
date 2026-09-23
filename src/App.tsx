@@ -10,6 +10,7 @@ import SettingsPage from "@/pages/SettingsPage";
 import PageErrorBoundary from "@/components/common/PageErrorBoundary";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { markStartup } from "@/utils/startupMarks";
@@ -77,10 +78,18 @@ export default function App() {
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const loadSettings = useSettingsStore((s) => s.load);
+  // 三端复核 §5.2：平台能力也在启动首次挂载加载一次。store 幂等（ready/loading 不重复请求）；
+  // 平台能力失败不阻塞启动——store 记录 error，设置页显示提示并允许重试，主页面仍可进入。
+  const platformStatus = usePlatformStore((s) => s.status);
+  const loadPlatform = usePlatformStore((s) => s.load);
   useEffect(() => {
     markStartup("react_first_render"); // §4.1：React 首帧打点（首次挂载即首帧）
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
+  useEffect(() => {
+    // idle/error 时允许（重）加载；ready/loading 由 store 自身幂等拦截。
+    if (platformStatus === "idle") void loadPlatform();
+  }, [platformStatus, loadPlatform]);
 
   // 骨架超时兜底：设置 IPC 异常挂起时不可无限停留在过渡态（§3.2）
   useEffect(() => {

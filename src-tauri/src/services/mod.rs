@@ -8,13 +8,14 @@ pub mod imaging;
 pub mod importer;
 pub mod kinship;
 pub mod media_refill;
+pub mod media_tools;
 pub mod ollama_installer;
-pub mod platform;
 pub mod ollama_runtime;
 pub mod ollama_setup;
 // FB2-08：算法提色（Lab k-means），见 §14.5
 pub mod palette;
 pub mod perceptual;
+pub mod platform;
 pub mod preview;
 pub mod raw_decode;
 pub mod super_search_ai;

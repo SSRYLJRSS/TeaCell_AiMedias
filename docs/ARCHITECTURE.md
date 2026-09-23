@@ -52,6 +52,7 @@ Rust commands -> services -> db
 - `superSearchStore`：SearchPlanV3、AI 合并、持久化和诊断。
 - `metadataStore`：元数据筛选项和派生值。
 - `numericDomainStore`：数值分面范围和类型信息。
+- `platformStore`：平台能力 DTO（`schemaVersion` / `os` / `arch` / `managedOllama` / `preferredVideoProxy`），由 `App.tsx` 首次挂载调用一次 `loadPlatform()` 载入。
 
 跨页核心状态不得放在页面局部 state 中，也不得复制到第二个 store。
 
@@ -315,6 +316,16 @@ pending -> processing -> done
 - move 导出：文件移动成功后同步素材路径。
 - 所有批处理都要区分成功、失败、重复和取消。
 - 失败必须保留可恢复信息，不允许 UI 假成功。
+
+### 5.8 平台适配
+
+- **平台能力初始化**：前端在 `App.tsx` 首次挂载时调用一次 `loadPlatform()`，写入 `platformStore`。`load` 带竞态代际（`loadGeneration`），并发重试或组件卸载后的较旧响应不会覆盖较新状态。载入失败可见且可恢复：设置页在 `status==="error"` 时显示非阻塞提示与「重试」按钮（`load()` 幂等，`error` 允许再次发起），主页面继续可用不白屏；平台敏感操作（如视频代理 ensure）在 `status==="ready"` 前不发起。DTO 只含 `schemaVersion` / `os` / `arch` / `managedOllama` / `preferredVideoProxy`，不承载业务数据。
+- **视频代理变体时序**：`ensure/status/cancel` 的 variant 省略时由后端 `platform::preferred_video_proxy()` 决定（Linux `vp8_webm`，Windows/macOS `h264_mp4`），API 层不硬编码。前端组件在平台 ready 前不自动 ensure；variant 变化时复位「已尝试」并用 generation token 丢弃旧变体的迟到响应，避免 H.264 响应覆盖 WebM 状态。
+- **视频代理缓存指纹**：`video_proxies` 记录源内容指纹（内容 hash 优先，回退 size+mtime）、编码策略版本常量、ffmpeg 工具指纹（V25 幂等迁移新增列）。ready 命中必须三项全一致才复用；任一变化或无指纹的旧记录一律作废旧派生文件并重新生成。
+- **平台相关 keyring**：凭据读写按 Windows / macOS / Linux target feature 分派系统凭据后端；所有 keyring 调用都在数据库 mutex 之外，不与 SQLite 锁交叉。
+- **媒体 sidecar**：`services/media_tools.rs` 是 ffmpeg / ffprobe 的唯一解析入口。发布包优先使用 Tauri sidecar，仅开发模式回退 PATH 查找；ffmpeg 与 ffprobe 分开缓存探测结果。版本探测（`-version`）用 spawn + 3s 硬超时 + kill/wait 回收 + 输出上限，损坏/被挂起的工具不会永久卡住调用线程；缓存键含工具文件指纹（size+mtime），换源/升级自动失效。
+- **非 Windows Ollama 边界**：仅 Windows 提供托管 Ollama 的安装、进程和模型管理；macOS / Linux 只引导用户自行部署，并在 AI 连接表单填写外部 OpenAI 兼容地址。
+- **同源分类统一收口**：`services/kinship.rs` 的 `classify_kinship_group` / `paired_sibling` 是同源判定唯一入口。只有恰好 1 个 RAW + 1 个非 RAW 才自动配对，其余情况归为 `Ambiguous`，不向外扩散配对关系。
 
 ## 6. 状态流
 

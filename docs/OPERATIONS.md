@@ -1,6 +1,6 @@
 # 运维与交接手册
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-22
 >
 > 本文档覆盖本地运行、数据位置、发布、备份恢复、本地模型和应急处理。性能细节见 [PERFORMANCE.md](PERFORMANCE.md)，故障症状见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
@@ -19,20 +19,23 @@
 
 环境：
 
-- Node.js 20+
+- Node.js 22（`>=22 <25`）
 - Rust stable MSVC
 - Visual Studio C++ Build Tools
 - 可选 `ffmpeg` / `ffprobe`
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 ```
 
-构建：
+FFmpeg 说明：发布包自带随平台打包的 ffmpeg / ffprobe sidecar，视频元数据和抽帧优先用它；无 sidecar 时仅开发模式回退到 PATH 上的系统 `ffmpeg` / `ffprobe`。sidecar 放置与命名见 [DEVELOPMENT.md](DEVELOPMENT.md#21-桌面构建入口)。
+
+Windows 本地构建（其他目标替换为对应 target triple）：
 
 ```powershell
-npm run tauri build
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
 
 正式交付前：
@@ -67,6 +70,14 @@ pwsh ./scripts/smoke.ps1
 | Ollama 安装器临时目录 | `ollama/` |
 | 备份文件 | 由用户选择目标位置 |
 | 素材总库 | 设置页配置，分库位于总库子目录 |
+
+各平台 `data_dir` 差异（表中 `%APPDATA%` 为 Windows 口径，运行日志统一在 `data_dir/logs`）：
+
+| 平台 | 应用数据目录 |
+|---|---|
+| Windows | `%APPDATA%\bagertea_ai_media_v2\` |
+| macOS | `~/Library/Application Support/bagertea_ai_media_v2/` |
+| Linux | `~/.local/share/bagertea_ai_media_v2/`（遵循 `XDG_DATA_HOME`） |
 
 设置页可打开数据目录、日志目录和缓存管理。不要直接删除数据库或缓存目录来“修复”问题，先备份并查看日志。
 
@@ -122,7 +133,17 @@ pwsh ./scripts/smoke.ps1
 src-tauri/target/release/bundle/
 ```
 
-不要提交 `target*/`、`dist/` 或安装包。
+各平台安装包格式：
+
+| 平台 | 安装包 |
+|---|---|
+| Windows | NSIS（`.exe`）/ MSI |
+| macOS | `.app` / `.dmg` |
+| Linux | AppImage / `.deb` |
+
+三目标构建入口见 [DEVELOPMENT.md](DEVELOPMENT.md#21-桌面构建入口)。不要提交 `target*/`、`dist/` 或安装包。
+
+FFmpeg sidecar 发布流程：`src-tauri/binaries/manifest.json` 按三目标记录固定版本、归档 URL、归档与二进制 SHA256、必需编码器（Windows/macOS H.264/AAC，Linux VP8/WebM）、许可证。Windows/Linux 归档固定到 BtbN 的不可变 release tag，macOS ARM64 固定到 Martin Riedl 的 7.1 release URL；macOS 可通过 `ffprobeArchive*` 使用独立的 ffprobe 归档。`npm run prepare-media-tools -- --target <triple>` 下载并校验（任一 SHA256 为占位哨兵时拒绝执行）、解压前检查归档成员路径、防 Zip Slip/符号链接、设置可执行位、运行版本与编码器探测，并复制/下载许可证到 `binaries/licenses/<triple>/`。`tauri.sidecar.conf.json` 将许可证目录作为 bundle resource；候选包 workflow 还会把它放入 `third-party-licenses/` 并写入 per-target manifest。Windows/Linux 的最终 sidecar SHA 已从固定归档实测并写入 manifest；Windows 已在本机通过版本、编码器、许可证、strict check 以及 NSIS/MSI bundle，MSI 的 WiX locale 固定为 936 代码页以支持中文产品名；Linux 的运行时可执行性/编码器仍需 Linux runner 复核。候选包工作流（`release-candidate.yml`）在每个 runner 先准备 sidecar，再 `desktop.mjs build`（含 `--strict-release` 校验），产出 per-target `artifact-manifest.json`（目标/版本/commit/安装包名+大小+SHA256/ffmpeg 版本+许可证 SHA256）与 `SHA256SUMS.txt`（只对安装包）；汇总 job 校验三目标 manifest 的目标/版本/commit 与本次 SHA 一致且各含安装包，任一 bundle 失败则候选版本不就绪。日志 sidecar 版本/来源/hash/许可证见构建日志与各 artifact-manifest。
 
 ### 5.3 回滚
 
@@ -172,6 +193,8 @@ src-tauri/target/release/bundle/
 
 ### 7.1 当前能力
 
+托管 Ollama（安装、进程、模型管理）仅在 Windows 提供。macOS / Linux 不管理本机 Ollama：用户自行部署，或连接局域网/在线的 OpenAI 兼容地址，在设置页 AI 连接表单填写后使用（见第 8 节）。
+
 设置页“本地模型”支持：
 
 - 检测 Ollama 是否安装和运行。
@@ -202,6 +225,7 @@ src-tauri/target/release/bundle/
 ## 8. AI 连接与凭据
 
 - 支持 OpenAI 兼容接口和 Anthropic 模式。
+- macOS / Linux 不管理本机 Ollama，用户自部署或填局域网/在线的 OpenAI 兼容地址；地址、模型名和凭据都在 AI 连接表单填写。
 - API Key 存系统凭据库，不写设置 JSON。
 - 连接档案可以绑定到不同用途。
 - 修改连接后应验证打标和超级搜索都读取同一绑定。

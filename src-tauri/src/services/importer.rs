@@ -214,6 +214,16 @@ fn copy_create_new(from: &Path, to: &Path) -> std::io::Result<()> {
 /// 托管模式：复制源文件到 总库/分库/（可选批量改名），返回入库用路径
 /// B06a：同名冲突循环耗尽（999）时报错而非静默覆盖已有文件
 fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBuf> {
+    // 所有落库路径都必须能无损转成 UTF-8；不能先用 lossy 名字复制出孤儿文件。
+    // 这也让直接调用 stage_file（而不只是主导入流程）遵守同一条契约。
+    let source_name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::unsupported("文件名不是有效 UTF-8，首版暂不支持无损入库"))?;
+    let source_stem = file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| AppError::unsupported("文件名不是有效 UTF-8，首版暂不支持无损入库"))?;
     let root = opts.library_root.as_deref().unwrap_or_default().trim();
     if root.is_empty() {
         return Ok(file.to_path_buf());
@@ -234,11 +244,6 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
         .and_then(|e| e.to_str())
         .unwrap_or_default();
     let base_name = if let Some(tpl) = &opts.rename_pattern {
-        let orig_stem = file
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
         let mtime = file
             .metadata()
             .and_then(|m| m.modified())
@@ -248,13 +253,10 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
             .unwrap_or(0);
         format!(
             "{}.{ext}",
-            render_name(tpl, collection, &orig_stem, mtime, seq)
+            render_name(tpl, collection, source_stem, mtime, seq)
         )
     } else {
-        file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+        source_name.to_owned()
     };
     // 同名冲突加 (n) 后缀：create_new 原子创建，②a 并行 stage 的多个同名文件
     // 各自依次尝试候选名，先创建成功者占用——不再依赖 exists() 检查后复制（有竞态，
@@ -721,12 +723,36 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             let mime_type = mime::mime_from_ext(&ext).unwrap_or_default();
             // 锁外：元数据提取（image_dimensions / EXIF / ffprobe）
             let meta = extract_meta(&staged, &mime_type);
-            let norm = path::normalize_path(&staged.to_string_lossy());
-            let file_name = staged
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let staged_text = match path::encode_native_path(&staged) {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!(
+                        operation = "import",
+                        task_id = %task_id,
+                        stage = "encode_staged_name",
+                        file = %staged.display(),
+                        error = %e,
+                        "暂存路径不是有效 UTF-8，拒绝写入数据库"
+                    );
+                    return ProcResult::Failed(format!("{}: {e}", staged.display()));
+                }
+            };
+            let norm = path::normalize_path(&staged_text);
+            let file_name = match staged.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name.to_owned(),
+                None => {
+                    let e = AppError::unsupported("文件名不是有效 UTF-8，首版暂不支持无损入库");
+                    tracing::warn!(
+                        operation = "import",
+                        task_id = %task_id,
+                        stage = "encode_staged_name",
+                        file = %staged.display(),
+                        error = %e,
+                        "暂存文件名不是有效 UTF-8，拒绝写入数据库"
+                    );
+                    return ProcResult::Failed(format!("{}: {e}", staged.display()));
+                }
+            };
             let file_size = staged.metadata().map(|m| m.len() as i64).unwrap_or(0);
             let modified_at = staged
                 .metadata()
@@ -963,7 +989,8 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
 
 /// 重复判定（hash 已由并行阶段算好）：true = 新文件
 fn precheck(conn: &Connection, file: &Path, file_hash: &str) -> AppResult<bool> {
-    let norm = path::normalize_path(&file.to_string_lossy());
+    let file_text = path::encode_native_path(file)?;
+    let norm = path::normalize_path(&file_text);
     if assets::find_by_path(conn, &norm)?.is_some() {
         return Ok(false);
     }
@@ -1112,5 +1139,25 @@ mod tests {
             result.is_err(),
             "数据库结构错误必须向上返回，不能伪装为重复"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_file_rejects_non_utf8_name_before_copy() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let source_root = tempfile::tempdir().unwrap();
+        let bad_name = OsString::from_vec(b"bad\xff.jpg".to_vec());
+        let source = source_root.path().join(bad_name);
+        let library = source_root.path().join("library");
+        let opts = super::ImportOptions {
+            library_root: Some(library.to_string_lossy().into_owned()),
+            ..super::ImportOptions::default()
+        };
+
+        let err = super::stage_file(&source, &opts, 1).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"));
+        assert!(!library.exists(), "拒绝应发生在创建托管目录之前");
     }
 }
