@@ -118,6 +118,8 @@
 
 RAW 没有内嵌预览时，占位层黑图可能是设计结果；高清层应走真解码兜底。
 
+导入页现在会在正式入库前实际尝试生成快速缩略图。能提取 RAW 内嵌预览的文件会标记为“可能受限”并允许导入；连快速缩略图都无法生成的文件会被拦截，需从队列剔除后才能继续。这里的“无法解析”表示当前解码链路不支持或文件损坏，不表示版权保护。
+
 ### 3.6 RAW EXIF 缺失
 
 CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 RAW 元数据解析作为补充，只填缺失字段，不覆盖已有 EXIF。
@@ -126,11 +128,17 @@ CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 
 
 检查：
 
-- `heif-bin/` 是否存在。
-- `.cargo/config.toml` 是否指向预编译库。
+- 先运行 `node scripts/desktop.mjs check --target <target-triple>`，确认实际目标和依赖来源。
+- Windows x64 可使用本地 `heif-bin/` 兼容布局；macOS/Linux 不得读取该目录中的 MSVC `.lib`。
+- 若使用目标专属预编译库，目录必须是 `src-tauri/native/heif/<target-triple>/{include,lib}`。
+- `.cargo/config.toml` 不应无条件注入 Windows 的 HEIF 路径；统一由 `scripts/desktop.mjs` 按目标导出。
 - LLVM/libclang 是否可用。
 - MSVC STL 版本与 shim 是否匹配。
 - 网络下载失败时是否使用了完整、未损坏的预编译包。
+
+发布构建还必须通过 sidecar 严格检查：`node scripts/desktop.mjs check --target <target-triple> --strict-release`。
+如果报告占位 SHA、`latest` URL、缺少可执行位或许可证材料，不能绕过检查；先在
+`src-tauri/binaries/manifest.json` 填写经复核的不可变来源、真实 SHA256 和许可材料。
 
 ## 4. 搜索
 
@@ -214,6 +222,17 @@ done/cancelled/interrupted 可以续跑 pending，processing 拒绝重复启动�
 
 空解析视为单条失败，不写空标签成功。检查模型是否支持视觉输入、模型名是否正确、中转站是否截断响应。
 
+若提示“无法解码素材图片（扩展名 .…）”，先检查原文件是否仍存在、是否损坏，以及对应的 HEIC/RAW 解码依赖；
+必要时把该素材重新导入或转换为 JPG/PNG 后再续跑，不要把损坏文件标记为成功。
+
+若 Windows 托管 Ollama 日志或错误同时出现空 `message.content`、非空 `message.thinking`、
+`done_reason=length`，说明思考输出吃满了 `num_predict`，最终 JSON 尚未生成。原生
+`/api/chat` 请求会发送 `think: false`；其他 localhost、局域网或自定义端口服务不属于本地 Ollama，
+不会收到 Ollama 扩展字段。不要通过不断增大超时或重复“校验修复”掩盖此问题；修复后可续跑批次中的未完成项。
+
+如果错误提示包含“上下文过长”，系统会把 AI 图片从 1024px 降到 768px 重试一次。仍失败时应更换上下文更大的视觉模型，
+不要直接把 UI 高清缓存或未经处理的原图重新发送。
+
 ### 6.3 云端连接失败
 
 检查：
@@ -222,6 +241,11 @@ done/cancelled/interrupted 可以续跑 pending，processing 拒绝重复启动�
 - API mode 与供应商协议是否匹配。
 - Key、额度和模型权限。
 - 网络代理、超时和证书。
+- 如果界面显示请求正在等待限流，检查“在线服务 → 编辑 → 请求限制”中的并发、每分钟和每小时数值是否与供应商额度一致。
+  空值或 0 代表不限；较小的值会主动排队，取消当前批次即可停止等待。仍收到 429 时应降低数值并检查供应商是否还对
+  token、并发连接或模型分别计费，这些额外维度不在本地计数器内。
+- 收到 429 后批次会主动中断且不再重试，界面会显示服务商返回的脱敏错误。对 Agnes 免费模型可先使用并发 1、RPM 16–18，
+  再根据账号实际提示调整；修正设置后直接续跑剩余 pending 素材。
 
 ### 6.4 Ollama 未检测到
 
@@ -231,6 +255,11 @@ done/cancelled/interrupted 可以续跑 pending，processing 拒绝重复启动�
 - 默认端口 11434 是否可访问。
 - base URL 的 `/v1` 与原生 `/api` 根地址是否正确区分。
 - 模型是否已 pull。
+
+如果设置页显示“正在启动并复检”，先等待页面自动检查完成，不要连续点击启动；首次启动最多等待
+90 秒。若仍未就绪，检查 Ollama 安装路径、11434 端口占用和应用日志中的 `ollama_start_service`。
+应用自己拉起的服务空闲 2 分钟后会自动停止，下一次本地打标、超级搜索或模型拉取会再次自动启动；外部
+已经运行的服务不会被应用停止。
 
 ### 6.5 本地模型推荐错误
 
@@ -315,7 +344,7 @@ Windows 上优先在 PowerShell 运行 cargo。若 GNU `link` 抢占 MSVC linker
 
 ### 9.4 后端没有重新编译
 
-确认 cargo watcher 进程存在。不确定时结束旧的 `npm run tauri dev`，然后重新启动。
+确认 cargo watcher 进程存在。不确定时结束旧的 `npm run desktop:dev`，然后重新启动。
 
 ### 9.5 测试/构建产物污染 Git 状态
 

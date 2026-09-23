@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "ffmpegVersion": "7.1",
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "os": "windows",
+      "exeExt": ".exe",
+      "archiveUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-01-31-12-58/ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1.zip",
+      "archiveSha256": "701292d0914c95f2edbf20da28fe922b60d15ace690de96bd518dc68612e9f6e",
+      "archiveKind": "zip",
+      "ffmpegPathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/bin/ffmpeg.exe",
+      "ffprobePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/bin/ffprobe.exe",
+      "ffmpegSha256": "cf5bcf890408dc3431d51738cf454893b4e8c6464c319dcaad0edcdb3a7fc77c",
+      "ffprobeSha256": "4ac029a180081c4d4b0070a906b3851d2d6cf6d3eca4c26c3b3cfce6d8ecae78",
+      "licensePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/LICENSE.txt",
+      "licenseSha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "requiredEncoders": ["libx264", "aac"]
+    },
+    "aarch64-apple-darwin": {
+      "os": "macos",
+      "exeExt": "",
+      "archiveUrl": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1737140319_7.1/ffmpeg.zip",
+      "archiveSha256": "3d57f8032cb6ac8550e3abf41e74f15fd52865523d16c14fe3c55b31a07ecd6f",
+      "archiveKind": "zip",
+      "ffmpegPathInArchive": "ffmpeg",
+      "ffprobeArchiveUrl": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1737140319_7.1/ffprobe.zip",
+      "ffprobeArchiveSha256": "7bad07c2d8c8d2b7dfa95071b9c52ee7907d3a69a3165eb2a659c26248b5b764",
+      "ffprobeArchiveKind": "zip",
+      "ffprobePathInArchive": "ffprobe",
+      "ffmpegSha256": "35d5b4bae415843ec8827480ae28be760d04ddfe4bb33b8834178104c288fd20",
+      "ffprobeSha256": "54b3eaddd43d64a2eccfe1140ac2cb8fa8cfa5312b4d78a90916ffb6e0a15760",
+      "licenseUrl": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/GPL-3.0-only.txt",
+      "licenseSha256": "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0",
+      "licenseFileName": "GPL-3.0.txt",
+      "requiredEncoders": ["libx264", "aac"]
+    },
+    "x86_64-unknown-linux-gnu": {
+      "os": "linux",
+      "exeExt": "",
+      "archiveUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-01-31-12-58/ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1.tar.xz",
+      "archiveSha256": "a3cf6c3934850c0fa2e8dd90901b68dd3ce82e36f98c99b064f685ecc059135b",
+      "archiveKind": "tar.xz",
+      "ffmpegPathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/bin/ffmpeg",
+      "ffprobePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/bin/ffprobe",
+      "ffmpegSha256": "f25f17a4e6f118845a178a2b42dddc09de87e225a2d358f9dac6302ed05c2c24",
+      "ffprobeSha256": "db345cf2e2ee7392963e93a5c14b9b7c4cc1b6ca5d73bc8dfc43e05e1c938ce5",
+      "licensePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/LICENSE.txt",
+      "licenseSha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "requiredEncoders": ["libvpx", "libvorbis"]
+    }
+  }
+}

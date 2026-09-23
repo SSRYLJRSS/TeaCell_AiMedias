@@ -117,8 +117,8 @@ export function ollamaRemoveCustomSource(id: string): Promise<void> {
     return invoke<void>("ollama_remove_custom_source", { id });
 }
 
-export function ollamaStartService(): Promise<void> {
-    return invoke<void>("ollama_start_service");
+export function ollamaStartService(): Promise<OllamaRuntimeSnapshot> {
+    return invoke<OllamaRuntimeSnapshot>("ollama_start_service");
 }
 
 // ---- L2 运行态（§8.2/§8.5）：ownership + 停止服务 ----
@@ -141,7 +141,7 @@ export interface OllamaStopResult {
 
 /** 启动服务（L2：已有服务标记 External；自启保存 AppOwned），返回运行态快照 */
 export function ollamaStartServiceWithStatus(): Promise<OllamaRuntimeSnapshot> {
-    return invoke<OllamaRuntimeSnapshot>("ollama_start_service");
+    return ollamaStartService();
 }
 
 /** 查询本地服务运行态（ownership / 最近活动时间） */

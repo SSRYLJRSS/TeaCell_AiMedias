@@ -1,6 +1,2 @@
-# Phase 2 F02：heif-rs 的预编译 libheif 静态库（本机无法直连 GitHub，
-# 二进制已手动下载解压到仓库根 heif-bin/；含 include/ + lib/，详见 docs/ARCHITECTURE.md）。
-# 注意：relative 路径相对本文件所在目录（src-tauri/.cargo）解析。
-# 若在无 heif-bin 目录的机器上构建，删除此段让 build.rs 自动联网下载即可。
-[env]
-HEIF_BINARIES_DIR = { value = "../heif-bin", relative = true }
+# HEIF_BINARIES_DIR 由 scripts/desktop.mjs 按 target triple 注入。
+# 这里不能无条件指向 Windows .lib：macOS/Linux 构建必须走各自的原生依赖解析。

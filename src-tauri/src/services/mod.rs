@@ -1,4 +1,5 @@
 pub mod ai_cloud;
+pub mod ai_rate_limit;
 pub mod credentials;
 pub mod dedup;
 pub mod exif_meta;
@@ -8,9 +9,11 @@ pub mod imaging;
 pub mod importer;
 pub mod kinship;
 pub mod media_refill;
+pub mod media_tools;
 pub mod ollama_installer;
 pub mod ollama_runtime;
 pub mod ollama_setup;
+pub mod platform;
 // FB2-08：算法提色（Lab k-means），见 §14.5
 pub mod palette;
 pub mod perceptual;

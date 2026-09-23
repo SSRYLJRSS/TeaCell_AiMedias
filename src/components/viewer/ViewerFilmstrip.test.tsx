@@ -7,6 +7,9 @@ import type { Asset } from "@/types/asset";
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (p: string) => `asset://${p}`,
 }));
+vi.mock("@/utils/thumbnailCache", () => ({
+  requestThumbnail: vi.fn().mockResolvedValue("asset://placeholder.webp"),
+}));
 
 function mkAsset(id: number): Asset {
   return {

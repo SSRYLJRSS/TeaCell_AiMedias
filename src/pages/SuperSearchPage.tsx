@@ -3,8 +3,8 @@
  *  scrollHeight，从根上断掉「卸载 ↔ scrollHeight 钳制」的正反馈环（原先的闪烁根因）。
  *  FB6 需求五：不再有顶栏返回按钮和重复「超级搜索」标题——返回统一由底部「素材库」按钮
  *  单击/双击完成（BottomBar.useDoubleAction）。「超级搜索」标识由 AiSearchBar 在搜索框上方显示。
- *  结构：header 区（shrink-0 不滚动，含搜索区 + grid-template-rows 折叠的详细条件）
- *  → 滚动容器（只装虚拟化网格）。
+ *  结构：可收缩且可滚动的 header 区（含搜索区 + grid-template-rows 折叠的详细条件）
+ *  → 保留最小可见高度的结果滚动容器（只装虚拟化网格）。页面根节点封住溢出，避免文档层滚动标题栏。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -79,7 +79,7 @@ export default function SuperSearchPage() {
 
   // R0-5：超搜自己的空结果判定 —— 有 expr（AI/构建器产物）或扁平 query 非默认，
   // 都算「带条件」，不能显示「素材库还是空的」。清除按钮走 clearConditions。
-  const hasActiveFilter = expr != null || query.search.trim() !== "" || query.assetType !== "all" || query.untaggedOnly || query.facetFilters.length > 0 || query.excludeTagIds.length > 0 || query.metadataFilters.length > 0;
+  const hasActiveFilter = (plan != null && (plan.filter != null || plan.mustNot != null || plan.should.length > 0)) || expr != null || query.search.trim() !== "" || query.assetType !== "all" || query.untaggedOnly || query.facetFilters.length > 0 || query.excludeTagIds.length > 0 || query.metadataFilters.length > 0;
 
   // §3.9：三区摘要（折叠态常驻）—— 区徽标带条数，点任一展开并滚到对应区；优先区存在时附 B9 排序说明。
   const mustCount = expr ? flattenExprForDisplay(expr, resolvedTags).length : 0;
@@ -116,15 +116,17 @@ export default function SuperSearchPage() {
     const revisionAtRequest = planRevision;
     let alive = true;
     setZeroing([]);
-    diagnoseSearchPlan(diagPlan, revisionAtRequest)
-      .then((d) => {
-        if (!alive) return;
-        // 不变式 9：诊断返回时代次过期 → 整批丢弃（旧诊断会指着新条件的位置）
-        if (d.leaves.some((l) => l.planRevision !== revisionAtRequest)) return;
-        setZeroing(d.leaves.filter((l) => l.delta > 0 && l.resultCount === 0).map((l) => ({ zone: l.zone, path: l.path, label: l.label })));
-      })
-      .catch(() => { if (alive) setZeroing([]); }); // 诊断只读可失败：失败只少展示归零提示
-    return () => { alive = false; };
+    const timer = window.setTimeout(() => {
+      diagnoseSearchPlan(diagPlan, revisionAtRequest)
+        .then((d) => {
+          if (!alive) return;
+          // 不变式 9：诊断返回时代次过期 → 整批丢弃（旧诊断会指着新条件的位置）
+          if (d.leaves.some((l) => l.planRevision !== revisionAtRequest)) return;
+          setZeroing(d.leaves.filter((l) => l.delta > 0 && l.resultCount === 0).map((l) => ({ zone: l.zone, path: l.path, label: l.label })));
+        })
+        .catch(() => { if (alive) setZeroing([]); }); // 诊断只读可失败：失败只少展示归零提示
+    }, 320);
+    return () => { alive = false; window.clearTimeout(timer); };
   }, [loading, total, hasActiveFilter, plan, planRevision, query]);
 
   // FB2-06（§7.3 方案 C）：非对称阈值 + 顶部区恒展开 + 手动设定抑制窗
@@ -214,15 +216,15 @@ export default function SuperSearchPage() {
   }
 
   return (
-    <div className="relative flex h-full flex-col">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden">
       {/* FB6 需求五：顶栏已移除（无返回按钮、无重复标题）。结果计数保留在下方摘要行。 */}
 
-      {/* header 区（shrink-0，不滚动）：摘要条 + 可折叠详细条件。
-          折叠只改 header 高度，不再改变滚动容器的 scrollHeight（FB2-06 方案 A） */}
+      {/* header 区：空间不足时自身滚动；折叠只改 header 高度，不卸载条件面板，
+          保留 FB2-06 对 scrollHeight 闪烁回路的修复。 */}
       <div
         data-filter-zone
         onFocusCapture={forceExpand}
-        className="shrink-0"
+        className="min-h-0 shrink overflow-x-hidden overflow-y-auto overscroll-contain"
       >
         {/* 摘要条：搜索框 + chips + 计数（FB5-03 §3.5：文字披露按钮移出，改为中央 Chevron 披露行） */}
         <div className="bg-[var(--color-bg)] px-4 pt-3">
@@ -275,8 +277,8 @@ export default function SuperSearchPage() {
                               key={t}
                               type="button"
                               data-testid={`term-suggestion-${t}`}
-                              title={`点击把「${t}」加入条件（当前条件不变）`}
-                              onClick={() => applyTermSuggestion(t, "fuzzy")}
+                              title={`点击把原词查条件替换为「${t}」`}
+                              onClick={() => applyTermSuggestion(prefix, t, "fuzzy")}
                               className="inline-flex h-5 items-center rounded-full border border-[var(--color-status)] px-1.5 text-[10px] text-[var(--color-status)] hover:bg-[var(--color-surface-hover)]"
                             >
                               试试「{t}」
@@ -330,14 +332,15 @@ export default function SuperSearchPage() {
         </div>
       </div>
 
-      {/* 滚动容器：只装虚拟化网格（FB2-06 唯一滚动上下文） */}
-      <div ref={bindScroll} data-testid="super-search-scroll" className="min-h-0 flex-1 overflow-y-auto">
+      {/* 结果滚动容器：保留最低可见高度；结果滚动仍是条件自动收起的监听源。 */}
+      <div ref={bindScroll} data-testid="super-search-scroll" className="min-h-40 flex-1 overflow-y-auto overscroll-contain">
         <AssetGridView
           items={items}
           total={total}
           loading={loading}
           loadMore={loadMore}
           fetchAllIds={fetchAllIds}
+          selectionRevision={planRevision}
           onPreview={openViewer}
           onSearchDominant={onSearchDominant}
           scrollElementRef={scrollRef}

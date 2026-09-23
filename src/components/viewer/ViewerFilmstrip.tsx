@@ -5,10 +5,12 @@
  *  上一张/下一张按钮固定左右（保持 size-9）；缩略图区 min-w-0 防按钮挤压。
  *  点击缩略图、左右按钮、键盘左右键都定位同一素材（onJump/onPrev/onNext 由上层绑定）。
  */
+import { useEffect, useState } from "react";
 import clsx from "clsx";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { toFileUrl } from "@/api/thumbnail";
 import { isVideoAsset } from "@/utils/assetKind";
+import { requestThumbnail } from "@/utils/thumbnailCache";
 import type { Asset } from "@/types/asset";
 
 interface ViewerFilmstripProps {
@@ -21,6 +23,37 @@ interface ViewerFilmstripProps {
 
 /** 缩略图固定 56px（FB4-01：单行带硬性尺寸） */
 const THUMB = 56;
+const PLACEHOLDER_SIZE = 256;
+
+function FilmstripThumbnail({ asset }: { asset: Asset }) {
+  const [src, setSrc] = useState<string | null>(() => (
+    asset.placeholderPath ? toFileUrl(asset.placeholderPath) : null
+  ));
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(asset.placeholderPath ? toFileUrl(asset.placeholderPath) : null);
+    // 通过后端取一次“确保有效”的占位图：旧版本写入的通用灰块会在这里被修复，
+    // 新路径也能让 WebView 立即避开旧 URL 缓存。
+    requestThumbnail(asset.id, "placeholder", PLACEHOLDER_SIZE)
+      .then((url) => {
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [asset.id, asset.placeholderPath]);
+
+  if (!src) {
+    return (
+      <span className="flex h-full w-full items-center justify-center bg-[var(--color-surface)] text-[9px] text-[var(--color-text-secondary)]">
+        {isVideoAsset(asset) ? "视频" : "图片"}
+      </span>
+    );
+  }
+  return <img src={src} alt="" className="h-full w-full object-cover" />;
+}
 
 export default function ViewerFilmstrip({ items, currentId, onJump, onPrev, onNext }: ViewerFilmstripProps) {
   return (
@@ -55,13 +88,7 @@ export default function ViewerFilmstrip({ items, currentId, onJump, onPrev, onNe
             )}
             style={{ width: THUMB, height: THUMB }}
           >
-            {a.placeholderPath ? (
-              <img src={convertFileSrc(a.placeholderPath)} alt="" className="h-full w-full object-cover" />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center bg-[var(--color-surface)] text-[9px] text-[var(--color-text-secondary)]">
-                {isVideoAsset(a) ? "视频" : "图片"}
-              </span>
-            )}
+            <FilmstripThumbnail asset={a} />
           </button>
         ))}
       </div>

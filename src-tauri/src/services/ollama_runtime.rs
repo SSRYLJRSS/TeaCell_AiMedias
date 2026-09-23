@@ -7,9 +7,18 @@
 //! 注意：Child 由本模块独占持有（不 Send 复制），Mutex 包裹后由命令层/退出钩子访问。
 
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+
+use crate::error::{AppError, AppResult};
+use crate::services::ollama_installer;
+use crate::services::ollama_setup;
+
+/// 应用自启服务的空闲关闭阈值。
+pub const AUTO_STOP_IDLE: Duration = Duration::from_secs(120);
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// L2 ownership（§8.2）
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -42,6 +51,7 @@ pub struct OllamaRuntimeState {
     ownership: Option<ServiceOwnership>,
     child: Option<Child>,
     last_activity_at: i64,
+    active_requests: usize,
 }
 
 fn now_ts() -> i64 {
@@ -57,6 +67,7 @@ impl OllamaRuntimeState {
             ownership: None,
             child: None,
             last_activity_at: 0,
+            active_requests: 0,
         }
     }
 
@@ -65,6 +76,7 @@ impl OllamaRuntimeState {
         self.ownership = Some(ServiceOwnership::External);
         self.child = None;
         self.last_activity_at = now_ts();
+        self.active_requests = 0;
     }
 
     /// 应用自启成功：保存 pid/Child（防重复启动；替换旧句柄时先清理旧 Child）
@@ -77,11 +89,67 @@ impl OllamaRuntimeState {
         self.child = Some(child);
         self.ownership = Some(ServiceOwnership::AppOwned { pid, started_at });
         self.last_activity_at = started_at;
+        self.active_requests = 0;
     }
 
     /// 活动更新（模型请求发生/结束时由调用方调用，L3 runtime 使用）
     pub fn touch_activity(&mut self) {
         self.last_activity_at = now_ts();
+    }
+
+    /// 标记一个本地 AI 请求开始。
+    pub fn begin_request(&mut self) {
+        self.active_requests = self.active_requests.saturating_add(1);
+        self.touch_activity();
+    }
+
+    /// 标记一个本地 AI 请求结束；计数归零后开始计算空闲时间。
+    pub fn end_request(&mut self) {
+        self.active_requests = self.active_requests.saturating_sub(1);
+        self.touch_activity();
+    }
+
+    pub fn active_requests(&self) -> usize {
+        self.active_requests
+    }
+
+    /// 检查应用持有的 serve 子进程是否仍然活着；已退出时清理过期 ownership。
+    pub fn app_owned_alive(&mut self) -> bool {
+        if !self
+            .ownership
+            .as_ref()
+            .is_some_and(ServiceOwnership::is_app_owned)
+        {
+            return false;
+        }
+        let Some(child) = self.child.as_mut() else {
+            self.ownership = None;
+            self.active_requests = 0;
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                self.child = None;
+                self.ownership = None;
+                self.active_requests = 0;
+                false
+            }
+        }
+    }
+
+    /// 只对应用自己启动且没有活动请求的服务判定自动停服。
+    pub fn should_auto_stop_at(&self, now: i64, idle: Duration) -> bool {
+        self.ownership
+            .as_ref()
+            .is_some_and(ServiceOwnership::is_app_owned)
+            && self.active_requests == 0
+            && self.last_activity_at > 0
+            && now.saturating_sub(self.last_activity_at) >= idle.as_secs() as i64
+    }
+
+    pub fn should_auto_stop(&self, idle: Duration) -> bool {
+        self.should_auto_stop_at(now_ts(), idle)
     }
 
     pub fn ownership(&self) -> Option<&ServiceOwnership> {
@@ -148,9 +216,57 @@ impl OllamaRuntimeState {
         }
         self.ownership = None;
         self.child = None;
+        self.active_requests = 0;
         tracing::info!("Ollama AppOwned 服务已停止（pid={pid}）");
         true
     }
+}
+
+/// 只管理默认 Ollama 地址；LM Studio 等其它本机兼容服务不应被应用擅自启动或停止。
+pub fn is_managed_ollama_base(base_url: &str) -> bool {
+    let root = ollama_setup::api_root(base_url).to_ascii_lowercase();
+    matches!(
+        root.as_str(),
+        "http://localhost:11434" | "http://127.0.0.1:11434"
+    )
+}
+
+/// 发起默认 Ollama 启动（若已有服务则标记为 External）。不等待端点就绪，
+/// 慢启动由页面复检，AI 请求则调用 `ensure_ready` 等待。
+pub fn start_if_needed(runtime: &Arc<Mutex<OllamaRuntimeState>>, proxy: &str) -> AppResult<()> {
+    let mut rt = runtime
+        .lock()
+        .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+    if rt.app_owned_alive() {
+        return Ok(());
+    }
+    if ollama_setup::ping(ollama_installer::LOCAL_BASE_URL).running {
+        rt.mark_external();
+        return Ok(());
+    }
+    let exe = ollama_installer::detect_installed()
+        .exe_path
+        .ok_or_else(|| AppError::msg("未检测到已安装的 Ollama，请先一键安装"))?;
+    let child = if proxy.trim().is_empty() {
+        ollama_installer::start_service(&exe)?
+    } else {
+        ollama_installer::start_service_with_proxy(&exe, proxy)?
+    };
+    rt.register_app_owned(child);
+    Ok(())
+}
+
+/// AI 请求使用的就绪保证：发起启动后最多等待 90 秒，服务晚启动也不会被 20 秒硬切断。
+pub fn ensure_ready(runtime: &Arc<Mutex<OllamaRuntimeState>>, proxy: &str) -> AppResult<()> {
+    start_if_needed(runtime, proxy)?;
+    if ollama_installer::wait_ready(ollama_installer::LOCAL_BASE_URL, READY_TIMEOUT).is_some()
+        || ollama_setup::ping(ollama_installer::LOCAL_BASE_URL).running
+    {
+        return Ok(());
+    }
+    Err(AppError::timeout(
+        "Ollama 服务启动超时，请检查安装状态和 11434 端口后重试",
+    ))
 }
 
 impl Default for OllamaRuntimeState {
@@ -229,6 +345,32 @@ mod tests {
         // 停止：Child kill/wait → 进程应退出 → ownership 清空
         assert!(s.stop_app_owned());
         assert!(s.ownership().is_none());
+    }
+
+    #[test]
+    fn auto_stop_requires_idle_and_no_active_requests() {
+        let mut s = OllamaRuntimeState::new();
+        let child = spawn_dummy(30);
+        s.register_app_owned(child);
+        s.last_activity_at = 100;
+        assert!(!s.should_auto_stop_at(219, Duration::from_secs(120)));
+        assert!(s.should_auto_stop_at(220, Duration::from_secs(120)));
+
+        s.begin_request();
+        s.last_activity_at = 100;
+        assert!(!s.should_auto_stop_at(1_000, Duration::from_secs(120)));
+        s.end_request();
+        s.last_activity_at = 100;
+        assert!(s.should_auto_stop_at(220, Duration::from_secs(120)));
+        assert!(s.stop_app_owned());
+    }
+
+    #[test]
+    fn managed_base_only_covers_default_ollama_ports() {
+        assert!(is_managed_ollama_base("http://localhost:11434/v1"));
+        assert!(is_managed_ollama_base("http://127.0.0.1:11434"));
+        assert!(!is_managed_ollama_base("http://localhost:1234/v1"));
+        assert!(!is_managed_ollama_base("https://api.example.com/v1"));
     }
 
     #[test]

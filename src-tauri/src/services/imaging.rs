@@ -16,7 +16,71 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, ImageEncoder};
+
+/// AI 视觉请求的稳定输入契约。
+///
+/// 这两个值属于请求层契约，不应由 UI 缩略图尺寸或用户是否打开过高清预览影响。
+pub const AI_IMAGE_MAX_PX: u32 = 1024;
+pub const AI_IMAGE_FALLBACK_MAX_PX: u32 = 768;
+pub const AI_JPEG_QUALITY: u8 = 85;
+
+/// 已标准化的 AI 图片载荷。所有协议（Ollama/OpenAI/Anthropic）共用同一份 JPEG。
+#[derive(Debug, Clone)]
+pub struct AiImagePayload {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub max_px: u32,
+}
+
+/// 解码素材并编码为稳定的 RGB JPEG，避免直接把 UI 高清 WebP 送进模型。
+///
+/// `decode_thumb` 已统一负责普通图片、HEIC 和 RAW 的分派；这里再统一做透明背景、
+/// 尺寸和编码，确保请求 MIME 与实际字节一致。失败返回 `None`，由 AI 服务层给出
+/// 面向用户的“无法解码素材”错误。
+pub fn encode_ai_image(src: &Path, max_px: u32) -> Option<AiImagePayload> {
+    let max_px = max_px.max(1);
+    let image = decode_thumb(src, max_px)?;
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    // JPEG 没有 alpha 通道。使用缩略图服务的中性背景，避免透明 PNG 被黑底编码。
+    const BACKGROUND: [u8; 3] = [233, 233, 231];
+    let mut rgb = image::RgbImage::new(width, height);
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = u16::from(a);
+        let inv = u16::from(255_u8.saturating_sub(a));
+        let blend = |foreground: u8, background: u8| -> u8 {
+            ((u16::from(foreground) * alpha + u16::from(background) * inv + 127) / 255) as u8
+        };
+        rgb.put_pixel(
+            x,
+            y,
+            image::Rgb([
+                blend(r, BACKGROUND[0]),
+                blend(g, BACKGROUND[1]),
+                blend(b, BACKGROUND[2]),
+            ]),
+        );
+    }
+
+    let mut bytes = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, AI_JPEG_QUALITY);
+    encoder
+        .write_image(rgb.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+        .ok()?;
+    Some(AiImagePayload {
+        bytes,
+        width,
+        height,
+        max_px,
+    })
+}
 
 /// 读取常规图片或 RAW 文件的尺寸。RAW 由 rawler 兜底，调用方应在数据库锁外调用。
 pub fn probe_dimensions(src: &Path) -> Option<(u32, u32)> {
@@ -452,7 +516,21 @@ pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
         }
     }
 
-    // 2. 全解码 + 缩放（image 0.24 默认 zune-jpeg；dev 下已配 O3 override，
+    // 2. rawler 的格式专用预览提取。它覆盖 RAF/CRW/MRW/DNG 等容器各自的
+    // 预览定位规则，作为手写通用扫描失败后的轻量兜底；小尺寸占位层也允许走
+    // 这条路径，但仍不会进入完整 RAW 显影。
+    let raw_preview = if is_raw_like(src) {
+        super::raw_decode::decode_preview(src)
+    } else {
+        None
+    };
+    if let Some(img) = &raw_preview {
+        if img.dimensions().0.max(img.dimensions().1) >= max_px {
+            return Some(img.thumbnail(max_px, max_px));
+        }
+    }
+
+    // 3. 全解码 + 缩放（image 0.24 默认 zune-jpeg；dev 下已配 O3 override，
     //    24MP 全解码 ~370ms——实测比 jpeg-decoder 的 DCT 缩放路径还快，故精简掉后者）
     let raw_like = is_raw_like(src);
     let decoded = image::open(src)
@@ -466,7 +544,7 @@ pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
             }
         })
         .or_else(|| {
-            // 3. 真解码兜底（Phase 2 F02/F04）：仅高清按需层；占位层（≤320px）禁用，
+            // 4. 真解码兜底（Phase 2 F02/F04）：仅高清按需层；占位层（≤320px）禁用，
             //    避免 HEVC/RAW 全解码拖垮入库速度（docs/ARCHITECTURE.md 红线）
             if max_px > 320 {
                 special_decode(src)
@@ -477,11 +555,11 @@ pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
     if let Some(img) = decoded {
         if raw_like && is_effectively_black(&img) {
             tracing::warn!("RAW 解码结果近似纯黑，降级到内嵌预览或占位图: {src:?}");
-            return embedded;
+            return raw_preview.or(embedded);
         }
         return Some(img.thumbnail(max_px, max_px));
     }
-    embedded
+    raw_preview.or(embedded)
 }
 
 /// `image::open` 依赖扩展名；3FR/IIQ 等 TIFF 容器按文件头识别后解码其预览。
@@ -576,6 +654,30 @@ pub fn decode_thumb_phash(src: &Path, max_px: u32) -> Option<(image::DynamicImag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_image_is_normalized_to_jpeg_and_max_edge() {
+        let dir = std::env::temp_dir().join(format!("bagertea_ai_image_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("large.png");
+        let image = image::RgbaImage::from_fn(2400, 1200, |x, y| {
+            if x < 1200 {
+                image::Rgba([220, 40, 30, 255])
+            } else {
+                image::Rgba([40, 80, 220, (y % 255) as u8])
+            }
+        });
+        image.save(&src).unwrap();
+
+        let payload = encode_ai_image(&src, AI_IMAGE_MAX_PX).expect("PNG 应可被 AI 解码");
+        assert_eq!(payload.max_px, AI_IMAGE_MAX_PX);
+        assert_eq!(payload.width, 1024);
+        assert_eq!(payload.height, 512);
+        assert_eq!(&payload.bytes[..2], &[0xff, 0xd8], "输出必须是 JPEG");
+        let decoded = image::load_from_memory(&payload.bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (1024, 512));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn semaphore_allows_up_to_four() {

@@ -128,6 +128,17 @@ describe("superSearchStore", () => {
     expect(useSuperSearchStore.getState().expr).toEqual(plan?.filter);
   });
 
+  it("扁平字段编辑只替换旧扁平叶子，保留 AI 的嵌套条件", () => {
+    const aiGroup: QueryExpr = { op: "or", children: [tagLeaf(10), tagLeaf(11)] };
+    const filter: QueryExpr = { op: "and", children: [tagLeaf(1), aiGroup] };
+    useSuperSearchStore.getState().setExpr(filter);
+    useSuperSearchStore.getState().setQuery({
+      facetFilters: [{ facetKey: "subject", tagIds: [2], mode: "any", includeDescendants: true }],
+    });
+    const next = useSuperSearchStore.getState().plan?.filter;
+    expect(next).toEqual({ op: "and", children: [tagLeaf(2), aiGroup] });
+  });
+
   it("AI replace：使用后端返回的 plan 为唯一事实源，query 只同步排序", async () => {
     const { aiParseSearchQuery } = await import("@/api/superSearch");
     const expr: QueryExpr = { op: "leaf", cond: { type: "search", value: "海边" } };
@@ -201,6 +212,33 @@ describe("superSearchStore", () => {
     expect(st.expr).toEqual(base);
     expect(st.resolvedTags.length).toBe(1);
     expect(refreshSpy).not.toHaveBeenCalled();
+  });
+
+  it("手动编辑条件会取消旧 AI 请求并解除 loading", async () => {
+    const { aiParseSearchQuery } = await import("@/api/superSearch");
+    let resolveAi!: (value: Awaited<ReturnType<typeof aiParseSearchQuery>>) => void;
+    vi.mocked(aiParseSearchQuery).mockReturnValueOnce(new Promise((resolve) => { resolveAi = resolve; }));
+    const task = useSuperSearchStore.getState().applyAiSearch("最好有蓝天");
+    await vi.waitFor(() => expect(useSuperSearchStore.getState().aiLoading).toBe(true));
+    useSuperSearchStore.getState().setPlanMustNot(tagLeaf(7));
+    expect(useSuperSearchStore.getState().aiLoading).toBe(false);
+    resolveAi({} as Awaited<ReturnType<typeof aiParseSearchQuery>>);
+    await task;
+    expect(useSuperSearchStore.getState().plan?.mustNot).toEqual(tagLeaf(7));
+  });
+
+  it("编辑搜索输入时旧 AI 响应不会覆盖新输入", async () => {
+    const { aiParseSearchQuery } = await import("@/api/superSearch");
+    let resolveAi!: (value: Awaited<ReturnType<typeof aiParseSearchQuery>>) => void;
+    vi.mocked(aiParseSearchQuery).mockReturnValueOnce(new Promise((resolve) => { resolveAi = resolve; }));
+    const task = useSuperSearchStore.getState().applyAiSearch("旧条件");
+    await vi.waitFor(() => expect(useSuperSearchStore.getState().aiLoading).toBe(true));
+    useSuperSearchStore.getState().setAiInput("新条件");
+    expect(useSuperSearchStore.getState().aiLoading).toBe(false);
+    resolveAi({} as Awaited<ReturnType<typeof aiParseSearchQuery>>);
+    await task;
+    expect(useSuperSearchStore.getState().aiInput).toBe("新条件");
+    expect(useSuperSearchStore.getState().plan).toBeNull();
   });
 
   it("removeExprAtPath 只摘除 filter 区对应节点", () => {
@@ -299,6 +337,21 @@ describe("superSearchStore", () => {
     expect(useSuperSearchStore.getState().planRevision).toBeGreaterThan(revBefore);
   });
 
+  it("优先区达到 12 条时移动被拒绝，源条件不丢失", () => {
+    const source = tagLeaf(99, "scene");
+    const should = Array.from({ length: 12 }, (_, i) => ({ cond: tagCond(i + 1), weight: 1, label: `优先${i + 1}` }));
+    useSuperSearchStore.getState().setExpr(source);
+    useSuperSearchStore.setState({
+      plan: emptyPlan(source, { should }),
+      executionWarnings: [],
+    });
+    useSuperSearchStore.getState().moveConditionBetweenZones("filter", "should", []);
+    const st = useSuperSearchStore.getState();
+    expect(st.plan?.filter).toEqual(source);
+    expect(st.plan?.should).toHaveLength(12);
+    expect(st.executionWarnings.at(-1)?.message).toContain("未移动该条件");
+  });
+
   it("removeAtZonePath 按区删除（filter 与 mustNot 同下标互不干扰）", () => {
     useSuperSearchStore.getState().setExpr(tagLeaf(1));
     useSuperSearchStore.getState().setPlanMustNot(tagLeaf(2, "scene"));
@@ -342,27 +395,50 @@ describe("superSearchStore", () => {
     expect(st.expr).toEqual(st.plan?.filter);
   });
 
-  it("S5 5-4：applyTermSuggestion 点击才把按词查 leaf AND 进必须区（不变量 11）", () => {
+  it("S5 5-4：applyTermSuggestion 只替换点击建议对应的失败按词查 leaf（不变量 11）", () => {
     useSuperSearchStore.setState({ plan: null, expr: undefined });
     // 未点击前：条件保持原样（后端只出建议不改写）
     const before = useSuperSearchStore.getState().plan;
     expect(before).toBeNull();
     // 用户点击建议「森林」→ 词查 leaf 进 filter
-    useSuperSearchStore.getState().applyTermSuggestion("森林", "fuzzy");
+    useSuperSearchStore.getState().applyTermSuggestion("", "森林", "fuzzy");
     const st = useSuperSearchStore.getState();
     expect(st.plan?.filter).toEqual({
       op: "leaf",
       cond: { type: "tag", facetKey: "", tagIds: [], mode: "any", includeDescendants: true, termQuery: "森林", termMatch: "fuzzy" },
     });
-    // 再点一个：AND 合并，不覆盖已有条件
-    useSuperSearchStore.getState().applyTermSuggestion("海边", "fuzzy");
+    // 找不到原词时才追加，不覆盖已有条件（兼容旧 warning/手工路径）
+    useSuperSearchStore.getState().applyTermSuggestion("不存在的原词", "海边", "fuzzy");
     const st2 = useSuperSearchStore.getState();
     expect(st2.plan?.filter?.op).toBe("and");
     const conds = st2.plan?.filter?.op === "and" ? st2.plan.filter.children : [];
     expect(conds).toHaveLength(2);
     // 空词不入条件
-    useSuperSearchStore.getState().applyTermSuggestion("  ", "fuzzy");
+    useSuperSearchStore.getState().applyTermSuggestion("", "  ", "fuzzy");
     expect(useSuperSearchStore.getState().plan?.filter).toEqual(st2.plan?.filter);
+  });
+
+  it("相近词替换保留其他布尔条件与树结构", () => {
+    const failed: QueryExpr = {
+      op: "leaf",
+      cond: { type: "tag", facetKey: "scene", tagIds: [], mode: "any", includeDescendants: true, termQuery: "森材", termMatch: "alias" },
+    };
+    const other = tagLeaf(9, "subject");
+    useSuperSearchStore.getState().setExpr({ op: "or", children: [{ op: "and", children: [failed, other] }, tagLeaf(10, "scene")] });
+    useSuperSearchStore.getState().applyTermSuggestion("森材", "森林", "fuzzy");
+    expect(useSuperSearchStore.getState().plan?.filter).toEqual({
+      op: "or",
+      children: [
+        {
+          op: "and",
+          children: [
+            { op: "leaf", cond: { type: "tag", facetKey: "scene", tagIds: [], mode: "any", includeDescendants: true, termQuery: "森林", termMatch: "fuzzy" } },
+            other,
+          ],
+        },
+        tagLeaf(10, "scene"),
+      ],
+    });
   });
 
   it("S5：prefix/contains 词查 leaf 经 setExpr 写入 plan 并发给后端（prefix_mode_reaches_backend）", async () => {
@@ -394,5 +470,30 @@ describe("superSearchStore", () => {
     };
     expect(migratePlanV3(base)).not.toBeNull();
     expect(migratePlanV3({ ...base, planSchemaVersion: 99 })).toBeNull();
+  });
+
+  it("future plan hydrate：丢弃未知版本并保留一次可见 warning", async () => {
+    const base: SearchPlanV3 = {
+      planSchemaVersion: 99,
+      normalizationVersion: 1,
+      compilerVersion: 1,
+      filter: tagLeaf(77),
+      mustNot: null,
+      should: [],
+      minimumShouldMatch: 0,
+      retrievers: { retrievers: [], fusion: "rrf" },
+      ranking: { type: "field", key: "created_at", dir: "desc" },
+    };
+    useSuperSearchStore.setState({ executionWarnings: [], plan: null, expr: undefined });
+    localStorage.setItem(
+      "super-search-conditions",
+      JSON.stringify({ state: { plan: base, query: { sortBy: "created_at", sortDir: "desc" } }, version: 2 }),
+    );
+    await useSuperSearchStore.persist.rehydrate();
+    const st = useSuperSearchStore.getState();
+    expect(st.plan).toBeNull();
+    expect(st.expr).toBeUndefined();
+    expect(st.executionWarnings.filter((w) => w.message.includes("更新版本"))).toHaveLength(1);
+    localStorage.removeItem("super-search-conditions");
   });
 });

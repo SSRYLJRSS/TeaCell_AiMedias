@@ -2,7 +2,7 @@
 
 > 状态：Frozen
 >
-> 更新日期：2026-09-13
+> 更新日期：2026-09-18
 >
 > 本文档是超级搜索执行链路的唯一机器协议。列表、总数、全选、排序、warning 和诊断必须由同一计划编译，不允许平行实现。
 
@@ -49,6 +49,7 @@
 | `assetType` | `plan.filter` | `{ type: "assetType", value }` | `"all"` 跳过 |
 | `untaggedOnly` | `plan.filter` | `{ type: "untagged" }` | `false` 跳过 |
 | `facetFilters[]` | `plan.filter` | `{ type: "tag", facetKey, tagIds, mode, includeDescendants }` | mode/descendants 原样带；空 tagIds 跳过 |
+| 标签按词查 | `plan.filter` | `{ type: "tag", tagIds: [], termQuery, termMatch }` | `tagIds` 为空时只要 `termQuery` 非空即为完整条件；两者可并存 |
 | **`excludeTagIds[]`** | **`plan.mustNot`** | `{ type: "tag", facetKey: "", tagIds: [id], mode: "any", includeDescendants: true }` | **正向 Tag**，不是 excludeTag；多个 → `mustNot = Or([...])` |
 | `metadataFilters[]` | `plan.filter` | `{ type: "metadata", filter }` | 原样 |
 | `sortBy` / `sortDir` | `plan.ranking` | `Ranking::Field { key, dir }` | 字段排序规则 |
@@ -144,7 +145,7 @@ pub struct PlanDiagnostics {
 |---|---|
 | `filter` | **AND 合并，保留内部 OR**（`mergeQueryExpr`），按序列化去重相同叶子 |
 | `mustNot` | **OR 合并**（同样去重） |
-| `should` | 拼接，按 `serialize(cond)` 去重；超 `MAX_SHOULD_CLAUSES = 12` 按权重降序保留前 12，丢的记 warning |
+| `should` | 拼接，按 `serialize(cond)` 去重；超 `MAX_SHOULD_CLAUSES = 12` 按当前可见优先顺序保留前 12，丢的记 warning |
 | `minimumShouldMatch` | `old.should 空 ? new_min : old_min`，最后 `clamp(0, len)`；与保留值不同记 info warning |
 | `ranking` | **append 恒保留用户的**；AI 建议不同 → warning。**replace 才采纳 AI 的** |
 | `retrievers` | append 保留旧的；replace 采纳新的 |

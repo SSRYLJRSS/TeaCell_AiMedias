@@ -74,10 +74,59 @@ describe("ImportPage", () => {
     });
   });
 
+  it("发现无法生成缩略图的文件时先拦截，并可剔除后保留可导入项", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/mixed"]);
+    vi.mocked(inspectImport).mockResolvedValue({
+      items: [
+        { path: "d:/raw/ok.jpg", kind: "image", size: 1024, previewStatus: "ready" },
+        {
+          path: "d:/raw/unsupported.x3f",
+          kind: "image",
+          size: 2048,
+          previewStatus: "unsupported",
+          previewMessage: "无法解析缩略图",
+        },
+      ],
+      images: 2,
+      videos: 0,
+      totalSize: 3072,
+    });
+    render(<ImportPage />);
+    fireEvent.click(screen.getByText("选择文件…"));
+
+    expect(await screen.findByRole("dialog", { name: "有文件无法生成缩略图" })).toBeInTheDocument();
+    expect(screen.getByText("d:/raw/unsupported.x3f")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "剔除并保留可导入项" }));
+
+    expect(screen.queryByRole("dialog", { name: "有文件无法生成缩略图" })).toBeNull();
+    expect(screen.getByText("开始入库（1）")).toBeInTheDocument();
+  });
+
+  it("可解析但可能受限的特殊格式允许入队并显示提示", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/limited.cr2"]);
+    vi.mocked(inspectImport).mockResolvedValue({
+      items: [{
+        path: "d:/raw/limited.cr2",
+        kind: "image",
+        size: 1024,
+        previewStatus: "limited",
+        previewMessage: "可解析缩略图但后续功能可能受限",
+      }],
+      images: 1,
+      videos: 0,
+      totalSize: 1024,
+    });
+    render(<ImportPage />);
+    fireEvent.click(screen.getByText("选择文件…"));
+
+    expect(await screen.findByText(/高清预览、元数据或 AI 功能可能受限/)).toBeInTheDocument();
+    expect(screen.getByText("开始入库（1）")).toBeInTheDocument();
+  });
+
   it("入库命令级失败后解除 busy，允许重试且不再显示取消状态", async () => {
     vi.mocked(pickFiles).mockResolvedValue(["d:/raw/X3F"]);
     vi.mocked(inspectImport).mockResolvedValue({
-      items: [{ path: "d:/raw/X3F", kind: "image", size: 1024 }],
+      items: [{ path: "d:/raw/X3F", kind: "image", size: 1024, previewStatus: "ready" }],
       images: 1,
       videos: 0,
       totalSize: 1024,

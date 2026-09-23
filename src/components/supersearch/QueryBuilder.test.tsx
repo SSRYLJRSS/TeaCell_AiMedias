@@ -855,13 +855,17 @@ describe("U-5 加分项区", () => {
     expect(screen.getAllByRole("button", { name: "下移优先条件" })).toHaveLength(3);
   });
 
-  it("空 plan 时新增加分项 → store 从当前 expr 建 plan（filter 镜像，should 一条、默认权重 1）", () => {
+  it("空 plan 时先保留加分草稿，条件完整后才写入 plan", async () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "search", value: "海边" } },
       plan: null,
     });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个优先条件" }));
+    expect(useSuperSearchStore.getState().plan).toBeNull();
+    // 草稿默认是空标签；切换到有默认值的素材类型后才满足完整性。
+    pickField("素材类型", 1);
+    await waitFor(() => expect(useSuperSearchStore.getState().plan?.should).toHaveLength(1));
     const plan = useSuperSearchStore.getState().plan;
     expect(plan?.should).toHaveLength(1);
     expect(plan?.should?.[0].weight).toBe(2);
@@ -891,13 +895,8 @@ describe("U-6 四指标诊断", () => {
       warnings: [],
     });
     render(<QueryBuilder />);
-    // 诊断经 promise 微任务落 UI；纯微任务轮询（组件/测试不使用真实定时器，避免调度器挂起）
-    let found = false;
-    for (let i = 0; i < 200 && !found; i += 1) {
-      found = screen.queryByText(/这个条件把结果筛空了/) !== null;
-      if (!found) await Promise.resolve();
-    }
-    expect(found).toBe(true);
+    // 诊断带 320ms 防抖，使用 waitFor 覆盖定时器 + promise 两层异步。
+    await waitFor(() => expect(screen.getByText(/这个条件把结果筛空了/)).toBeInTheDocument(), { timeout: 1000 });
     // 第二行：−5（delta）+ 单独就没有匹配项（self_count=0）
     expect(screen.queryByText(/这个条件本身就没有匹配项/)).not.toBeInTheDocument();
     expect(screen.queryByText(/−106/)).not.toBeInTheDocument(); // 归零行走红色文案，不再重复 −delta
@@ -1016,12 +1015,7 @@ describe("排除区（mustNot）", () => {
     });
     render(<QueryBuilder />);
     const zone = document.getElementById("qb-zone-mustnot") as HTMLElement;
-    let found = false;
-    for (let i = 0; i < 200 && !found; i += 1) {
-      found = within(zone).queryByText(/这个条件把结果筛空了/) !== null;
-      if (!found) await Promise.resolve();
-    }
-    expect(found).toBe(true);
+    await waitFor(() => expect(within(zone).getByText(/这个条件把结果筛空了/)).toBeInTheDocument(), { timeout: 1000 });
   });
 });
 

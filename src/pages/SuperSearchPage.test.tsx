@@ -148,6 +148,21 @@ describe("SuperSearchPage", () => {
     expect(screen.queryByRole("button", { name: "快速添加条件" })).not.toBeInTheDocument();
   });
 
+  it("小窗口布局：页面封住文档溢出，条件区可独立滚动且结果区保留最低高度", () => {
+    const { container } = render(<SuperSearchPage />);
+    const page = container.firstElementChild as HTMLElement;
+    const filterZone = container.querySelector("[data-filter-zone]") as HTMLElement;
+    const resultScroll = screen.getByTestId("super-search-scroll");
+
+    expect(page.className).toContain("min-h-0");
+    expect(page.className).toContain("overflow-hidden");
+    expect(filterZone.className).toContain("overflow-y-auto");
+    expect(filterZone.className).toContain("overscroll-contain");
+    expect(filterZone.className).not.toContain("shrink-0");
+    expect(resultScroll.className).toContain("min-h-40");
+    expect(resultScroll.className).toContain("overscroll-contain");
+  });
+
   function scrollTo(top: number) {
     const el = screen.getByTestId("super-search-scroll") as HTMLElement;
     Object.defineProperty(el, "scrollTop", { configurable: true, value: top, writable: true });
@@ -283,13 +298,7 @@ describe("U-7③ 空结果归零条件", () => {
       warnings: [],
     });
     render(<SuperSearchPage />);
-    let found = false;
-    for (let i = 0; i < 200 && !found; i += 1) {
-      found = screen.queryByText(/以下条件把结果砍到 0/) !== null;
-      if (!found && i % 20 === 0) await new Promise((r) => setTimeout(r, 20));
-      else if (!found) await Promise.resolve();
-    }
-    expect(found).toBe(true);
+    await waitFor(() => expect(screen.getByText(/以下条件把结果砍到 0/)).toBeInTheDocument(), { timeout: 2000 });
     expect(screen.getByRole("button", { name: "移除归零条件 海边" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "移除归零条件 海边" }));
     // 归零条件在 expr（plan.filter 派生视图）中消失（removeAtZonePath("filter", path) 摘除叶子并 normalize）
@@ -324,19 +333,13 @@ describe("S5 5-4 零结果相近词建议", () => {
     // 未点击前：条件保持原样
     const before = useSuperSearchStore.getState().plan?.filter;
     expect(before).toEqual(expr);
-    // 点击建议 → 词查 leaf AND 进必须区
+    // 点击建议 → 只替换对应失败的词查 leaf，其他条件保持不变
     fireEvent.click(chip);
     const after = useSuperSearchStore.getState().plan?.filter;
-    expect(after?.op).toBe("and");
-    const children = after?.op === "and" ? after.children : [];
-    expect(children).toHaveLength(2);
-    const added = children[1];
-    expect(added.op).toBe("leaf");
-    if (added.op === "leaf") {
-      const cond = added.cond as { termQuery?: string; termMatch?: string };
-      expect(cond.termQuery).toBe("森林");
-      expect(cond.termMatch).toBe("fuzzy");
-    }
+    expect(after).toEqual({
+      op: "leaf",
+      cond: { type: "tag", facetKey: "scene", tagIds: [], mode: "any", includeDescendants: true, termQuery: "森林", termMatch: "fuzzy" },
+    });
     // 第二个建议也在（丛林），可继续点
     expect(screen.getByRole("button", { name: /试试「丛林」/ })).toBeInTheDocument();
   });

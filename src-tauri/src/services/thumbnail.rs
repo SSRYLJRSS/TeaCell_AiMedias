@@ -21,8 +21,12 @@ pub const PLACEHOLDER_SIZE: u32 = 256;
 pub const HD_SIZE: u32 = 512;
 /// 缩略图解码修复后提升缓存代次，避免继续命中历史纯黑 RAW WebP。
 const IMAGE_HD_CACHE_VERSION: &str = "v2";
+/// 占位图修复代次。旧版本可能已经把解码失败结果固化成通用灰色图，
+/// 修复时使用新文件名，避免 WebView/asset 协议继续命中同一路径的旧缓存。
+const IMAGE_PLACEHOLDER_REPAIR_VERSION: &str = "v2";
 
 /// 判断数据库中的图片高清缓存是否属于当前解码代次。
+#[cfg(test)]
 pub(crate) fn is_current_image_hd_cache_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -121,6 +125,12 @@ impl ThumbnailService {
         self.placeholder_dir.join(format!("{asset_id}.webp"))
     }
 
+    fn repaired_placeholder_path(&self, asset_id: i64) -> PathBuf {
+        self.placeholder_dir.join(format!(
+            "{asset_id}_{IMAGE_PLACEHOLDER_REPAIR_VERSION}.webp"
+        ))
+    }
+
     fn image_hd_path(&self, asset_id: i64, size: u32) -> PathBuf {
         self.hd_dir
             .join(format!("{asset_id}_{size}_{IMAGE_HD_CACHE_VERSION}.webp"))
@@ -137,8 +147,13 @@ impl ThumbnailService {
         src: &Path,
         mime_type: &str,
     ) -> (PathBuf, Option<u64>) {
-        let out = self.placeholder_path(asset_id);
-        if out.exists() {
+        let original_out = self.placeholder_path(asset_id);
+        let out = if original_out.exists() && placeholder_is_unusable(&original_out) {
+            self.repaired_placeholder_path(asset_id)
+        } else {
+            original_out
+        };
+        if out.exists() && !placeholder_is_unusable(&out) {
             return (out, None);
         }
         let is_video = mime_type.starts_with("video/");
@@ -183,6 +198,30 @@ impl ThumbnailService {
             return (out, None);
         }
         (out, phash_out)
+    }
+
+    /// 取占位图并修复历史的通用灰色缓存。
+    ///
+    /// 读取素材行只持有短数据库锁；实际解码和文件写入都在锁外完成。
+    /// 当旧占位图不可用时，`extract_placeholder` 会写入带修复代次的新路径，
+    /// 从而避免浏览器继续复用旧的灰色 URL。
+    pub fn get_or_create_placeholder(
+        &self,
+        db: &std::sync::Arc<std::sync::Mutex<Connection>>,
+        asset_id: i64,
+    ) -> AppResult<PathBuf> {
+        let asset = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            assets::get(&conn, asset_id)?
+        };
+        let (path, phash) =
+            self.extract_placeholder(asset_id, Path::new(&asset.file_path), &asset.mime_type);
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        assets::set_placeholder_path(&conn, asset_id, &path.to_string_lossy())?;
+        if let Some(ph) = phash {
+            assets::set_phash(&conn, asset_id, ph)?;
+        }
+        Ok(path)
     }
 
     // ── 高清层 ──
@@ -351,6 +390,7 @@ impl ThumbnailService {
     /// 删除素材联动清理两层文件（架构 §1.6③）
     pub fn delete_for_asset(&self, asset_id: i64) {
         let _ = fs::remove_file(self.placeholder_path(asset_id));
+        let _ = fs::remove_file(self.repaired_placeholder_path(asset_id));
         if let Ok(rd) = fs::read_dir(&self.hd_dir) {
             let prefix = format!("{asset_id}_");
             for e in rd.flatten() {
@@ -407,6 +447,17 @@ impl ThumbnailService {
                 image::ExtendedColorType::Rgba8,
             );
         }
+    }
+}
+
+/// 旧占位图不存在、损坏，或是 `write_generic` 生成的 UI 灰块时，需要重新生成。
+fn placeholder_is_unusable(path: &Path) -> bool {
+    if !path.is_file() {
+        return true;
+    }
+    match image::open(path) {
+        Ok(img) => looks_like_generic_placeholder(&img),
+        Err(_) => true,
     }
 }
 
@@ -479,6 +530,31 @@ mod tests {
         assert!(!looks_like_generic_placeholder(&photo), "渐变图不是占位图");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_generic_placeholder_is_repaired_to_a_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = ThumbnailService::new(dir.path()).unwrap();
+        let source = dir.path().join("source.jpg");
+        image::RgbImage::from_fn(320, 240, |x, y| {
+            image::Rgb([x as u8, y as u8, (x.wrapping_add(y) % 255) as u8])
+        })
+        .save(&source)
+        .unwrap();
+
+        let old = svc.placeholder_path(42);
+        ThumbnailService::write_generic(&old, false);
+        let (repaired, phash) = svc.extract_placeholder(42, &source, "image/jpeg");
+
+        assert_eq!(
+            repaired.file_name().and_then(|name| name.to_str()),
+            Some("42_v2.webp")
+        );
+        assert!(repaired.exists());
+        assert!(!placeholder_is_unusable(&repaired));
+        assert!(phash.is_some());
+        assert!(old.exists(), "旧缓存保留作回退，不应删除原文件");
     }
 
     #[test]

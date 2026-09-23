@@ -225,6 +225,35 @@ describe("优先区位置归一化纯函数", () => {
     expect(normalizeSearchPlan(normalized)).toEqual(normalized);
   });
 
+  it("hydrate legacy flat metadata leaves into the nested wire contract", () => {
+    const flat = {
+      type: "metadata",
+      key: "file_size",
+      op: "gte",
+      value: 5 * 1024 * 1024,
+    } as unknown as LeafCond;
+    const plan = planWith({ op: "leaf", cond: flat }, null, [{ cond: flat, weight: 1, label: "文件大小" }]);
+    const normalized = normalizeSearchPlan(plan);
+    expect(normalized.filter).toEqual({
+      op: "leaf",
+      cond: { type: "metadata", filter: { key: "file_size", op: "gte", value: 5 * 1024 * 1024 } },
+    });
+    expect(normalized.should[0]?.cond).toEqual({
+      type: "metadata",
+      filter: { key: "file_size", op: "gte", value: 5 * 1024 * 1024 },
+    });
+  });
+
+  it("保留尚未加载 numeric domain 时的色相跨零区间", () => {
+    const hue: ShouldClause = {
+      cond: { type: "metadata", filter: { key: "dominant_hue", op: "between", min: 345, max: 15 } },
+      weight: 1,
+      label: "红色",
+    };
+    expect(normalizeShouldByPosition([hue])).toHaveLength(1);
+    expect(normalizeShouldByPosition([hue])[0]?.cond).toEqual(hue.cond);
+  });
+
   it("reorderShould 返回新数组，支持首尾和相同位置", () => {
     const source = ["a", "b", "c"];
     expect(reorderShould(source, 2, 0)).toEqual(["c", "a", "b"]);

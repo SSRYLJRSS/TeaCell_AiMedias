@@ -122,6 +122,17 @@ describe("flattenExprForDisplay（§9.6.1）", () => {
     );
     expect(chips.map((c) => c.label)).toEqual(["内容：银杏树", "文件名：IMG_1097"]);
   });
+  it("兼容旧 Rust 返回的扁平 metadata leaf", () => {
+    const legacy = {
+      op: "leaf",
+      cond: { type: "metadata", key: "file_size", op: "gte", value: 5 * 1024 * 1024 },
+    } as unknown as QueryExpr;
+    expect(flattenExprForDisplay(legacy, []).map((c) => c.label)).toEqual(["文件大小 ≥ 5242880"]);
+    expect(normalizeExpr(legacy)).toEqual({
+      op: "leaf",
+      cond: { type: "metadata", filter: { key: "file_size", op: "gte", value: 5 * 1024 * 1024 } },
+    });
+  });
 });
 
 describe("mergeQueryExpr（§9.6 append）", () => {

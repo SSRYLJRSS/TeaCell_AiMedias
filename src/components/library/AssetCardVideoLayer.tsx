@@ -8,6 +8,7 @@ import { toFileUrl } from "@/api/thumbnail";
 import { ensureVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
 import { acquireVideoSlot } from "@/utils/videoSlot";
+import { selectPreferredVideoProxy, usePlatformStore } from "@/stores/platformStore";
 import type { Asset } from "@/types/asset";
 
 interface AssetCardVideoLayerProps {
@@ -17,6 +18,8 @@ interface AssetCardVideoLayerProps {
 
 export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: AssetCardVideoLayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const proxyVariant = usePlatformStore(selectPreferredVideoProxy);
+  const platformReady = usePlatformStore((state) => state.status === "ready");
   // 初始用原文件 URL；播放失败（常见 HEVC/不兼容编码）→ 换 H.264 代理（每张只尝试一次）
   const [src, setSrc] = useState<string>(() => toFileUrl(asset.filePath));
   const [failed, setFailed] = useState(false);
@@ -26,7 +29,7 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
     proxyAttempted.current = false;
     setFailed(false);
     setSrc(toFileUrl(asset.filePath));
-  }, [asset.id, asset.filePath]);
+  }, [asset.id, asset.filePath, proxyVariant]);
 
   // 挂载即抢占全局唯一位；卸载让出
   useEffect(() => {
@@ -35,16 +38,16 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
 
   const onFail = useCallback(() => {
     setFailed(true);
-    if (proxyAttempted.current) return;
+    if (!platformReady || proxyAttempted.current) return;
     proxyAttempted.current = true;
-    void ensureVideoProxy(asset.id, "h264_mp4").then((p) => {
+    void ensureVideoProxy(asset.id, proxyVariant).then((p) => {
       if (p.status === "ready" && p.path) {
         setSrc(toProxyFileUrl(p.path));
         setFailed(false);
       }
       // 未就绪：静默保持封面（不弹加载态，见 §12.5）
     }).catch(() => undefined);
-  }, [asset.id]);
+  }, [asset.id, platformReady, proxyVariant]);
 
   useHoverPreviewPlayback(videoRef, { previewSeconds, onFailed: onFail });
 

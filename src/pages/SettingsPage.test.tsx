@@ -11,7 +11,8 @@ import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTagStore } from "@/stores/tagStore";
-import { exportDiagnostics, getSettings, resetAppData, saveSettings } from "@/api/settings";
+import { usePlatformStore } from "@/stores/platformStore";
+import { exportDiagnostics, getSettings, openHelpPage, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
@@ -43,6 +44,7 @@ vi.mock("@/api/settings", () => ({
   saveSettings: vi.fn().mockResolvedValue(undefined),
   getDataDir: vi.fn().mockResolvedValue("D:/data"),
   openDataDir: vi.fn().mockResolvedValue(undefined),
+  openHelpPage: vi.fn().mockResolvedValue(undefined),
   openLogsDir: vi.fn().mockResolvedValue(undefined),
   exportDiagnostics: vi.fn().mockResolvedValue({ path: "D:/diag.zip", logFiles: 2, bytes: 2048 }),
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
@@ -61,7 +63,15 @@ vi.mock("@/api/settings", () => ({
   }),
 }));
 vi.mock("@/api/ollama", () => ({
-  ollamaInstallStatus: vi.fn().mockResolvedValue({ installerPath: null, installerSize: 0 }),
+  ollamaInstallStatus: vi.fn().mockResolvedValue({
+    installed: false,
+    running: false,
+    version: null,
+    exePath: null,
+    models: [],
+    installerPath: null,
+    installerSize: 0,
+  }),
   ollamaRemoveInstaller: vi.fn().mockResolvedValue(undefined),
   ollamaListSources: vi.fn().mockResolvedValue([{ id: "auto", label: "自动", url: "" }]),
   ollamaProbeSources: vi.fn().mockResolvedValue([{ id: "auto", label: "自动", ok: true, speedBps: 0 }]),
@@ -71,7 +81,9 @@ vi.mock("@/api/ollama", () => ({
   ollamaDeleteModel: vi.fn().mockResolvedValue(undefined),
   ollamaModelDir: vi.fn().mockResolvedValue(""),
   ollamaOpenModelDir: vi.fn().mockResolvedValue(undefined),
-  ollamaStartService: vi.fn().mockResolvedValue(undefined),
+  ollamaStartService: vi.fn().mockResolvedValue({ ownership: null, lastActivityAt: 0 }),
+  ollamaRuntimeStatus: vi.fn().mockResolvedValue({ ownership: null, lastActivityAt: 0 }),
+  ollamaStopService: vi.fn().mockResolvedValue({ before: null, stopped: false, after: { ownership: null, lastActivityAt: 0 } }),
   probeOllamaHardware: vi.fn().mockResolvedValue({ available: false }),
   onOllamaInstallLog: vi.fn().mockRejectedValue(new Error("no tauri")),
   onOllamaInstallProgress: vi.fn().mockRejectedValue(new Error("no tauri")),
@@ -118,6 +130,16 @@ vi.mock("@/api/connections", () => ({
   ]),
   getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: "c1" }),
   setAiUsageBinding: vi.fn().mockResolvedValue(undefined),
+  saveAiConnection: vi.fn().mockResolvedValue({
+    id: "local-1",
+    name: "本机 Ollama",
+    deployment: "local",
+    protocol: "openai_chat",
+    baseUrl: "http://localhost:11434/v1",
+    model: "qwen3.5:4b",
+    hasKey: false,
+    enabled: true,
+  }),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
@@ -174,6 +196,12 @@ const emptyStore = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  usePlatformStore.setState({
+    status: "ready",
+    capabilities: { schemaVersion: 1, os: "windows", arch: "x86_64", managedOllama: true, preferredVideoProxy: "h264_mp4" },
+    error: null,
+    loadGeneration: 0,
+  });
   useSettingsStore.setState(emptyStore);
   // 默认：getSettings 成功返回一份完整设置
   vi.mocked(getSettings).mockResolvedValue(mkSettings());
@@ -366,6 +394,21 @@ describe("SettingsPage AI 打标审核流程", () => {
     fireEvent.click(screen.getByText("诊断与支持"));
     fireEvent.click(await screen.findByText("导出诊断包…"));
     await waitFor(() => expect(vi.mocked(exportDiagnostics)).toHaveBeenCalledWith("D:/diagnostics.zip"));
+  });
+});
+
+describe("SettingsPage 关于页", () => {
+  it("显示公测版 1.0、MIT 许可证和使用帮助入口，并调用系统浏览器打开帮助", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByText("关于"));
+    await waitFor(() => expect(screen.getByText("应用信息")).toBeInTheDocument());
+
+    expect(screen.getByText("公测版 1.0")).toBeInTheDocument();
+    expect(screen.getByText(/MIT License/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开使用帮助" }));
+    await waitFor(() => expect(openHelpPage).toHaveBeenCalledTimes(1));
   });
 });
 

@@ -29,6 +29,8 @@ export interface AssetGridViewProps extends LibraryGridActions {
   loadMore: () => void;
   /** §4.6（B2/B8）：全选 ID 一路到底 —— FetchAllIdsResult（= PlanIdsResult，不降级成 number[]） */
   fetchAllIds: () => Promise<FetchAllIdsResult>;
+  /** 查询条件代次；全选请求返回时若条件已变更，丢弃旧 ID 集合。 */
+  selectionRevision?: number;
   onPreview: (asset: Asset) => void;
   /** §12（FB-06）：外部主滚动容器。缺省时内部自建可滚容器（普通库页）；
    *  提供时虚拟滚动使用外部容器，内部不再 overflow 自身。 */
@@ -66,6 +68,7 @@ export default function AssetGridView({
   loading,
   loadMore,
   fetchAllIds,
+  selectionRevision,
   onPreview,
   onTag,
   onExport,
@@ -92,18 +95,27 @@ export default function AssetGridView({
   );
 
   // §4.6 截断策略：全选 → 记录 truncated/total；反选 → 触顶直接禁止（「不在前十万里」≠「不匹配」）
+  const selectionRevisionRef = useRef(selectionRevision);
+  // 在渲染阶段同步更新，避免一个已 resolve 的 Promise 在 effect 刷新前短暂接受旧结果。
+  selectionRevisionRef.current = selectionRevision;
   const selectAll = useCallback(() => {
-    void fetchAllIds().then((r) => setAll(r.ids, { truncated: r.truncated, total: r.total }));
-  }, [fetchAllIds, setAll]);
-  const invertAll = useCallback(() => {
+    const revisionAtRequest = selectionRevision;
     void fetchAllIds().then((r) => {
+      if (revisionAtRequest !== undefined && selectionRevisionRef.current !== revisionAtRequest) return;
+      setAll(r.ids, { truncated: r.truncated, total: r.total });
+    });
+  }, [fetchAllIds, selectionRevision, setAll]);
+  const invertAll = useCallback(() => {
+    const revisionAtRequest = selectionRevision;
+    void fetchAllIds().then((r) => {
+      if (revisionAtRequest !== undefined && selectionRevisionRef.current !== revisionAtRequest) return;
       if (r.truncated) {
         window.alert("当前结果超过 100000 张，反选在截断集合上没有定义，请先收窄条件。");
         return;
       }
       invert(r.ids, { truncated: false, total: r.total });
     });
-  }, [fetchAllIds, invert]);
+  }, [fetchAllIds, invert, selectionRevision]);
   // §4.6：可逆性差的批量操作在截断集合上二次确认；删除/反选直接禁用（见菜单）
   const guardTruncated = useCallback(
     (action: () => void, noun: string) => () => {

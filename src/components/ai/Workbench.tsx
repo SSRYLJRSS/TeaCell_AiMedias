@@ -301,10 +301,10 @@ export default function Workbench({
         </div>
       )}
 
-      {/* ②b 打标失败原因（v6：rejected 且带 lastError 时展示，替代“只看得到灰块”混淆） */}
-      {isRejected && s.lastError && (
+      {/* ②b 请求失败原因：普通失败为 rejected，限流中断保留 pending 以便续跑，但同样展示服务商错误。 */}
+      {s.lastError && (
         <div className="shrink-0 border-t border-[var(--color-danger)] px-3 py-2 text-[11px] text-[var(--color-danger)]">
-          <p className="font-medium">本张打标失败：</p>
+          <p className="font-medium">{isRejected ? "本张打标失败：" : "本张请求未完成："}</p>
           <p className="mt-0.5 leading-4 break-all">{s.lastError}</p>
         </div>
       )}

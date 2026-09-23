@@ -235,12 +235,32 @@ pub fn detect_installed() -> DetectResult {
     }
 }
 
-/// `ollama --version` 输出在 stdout/stderr 因版本而异，两路都收（如 "ollama version is 0.12.x"）
+/// 从 `ollama --version` 的 stdout/stderr 中提取版本号。
+///
+/// Ollama 在服务未启动时可能先输出
+/// `Warning: could not connect to a running Ollama instance`，不能把这类诊断
+/// 文案当成版本号展示给用户。
 pub fn parse_version_output(stdout: &str, stderr: &str) -> Option<String> {
     for s in [stdout, stderr] {
-        let t = s.trim();
-        if !t.is_empty() {
-            return Some(t.lines().next().unwrap_or(t).to_string());
+        for token in s.split_whitespace() {
+            let candidate = token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+                .trim_start_matches(['v', 'V']);
+            let mut parts = candidate.split('.');
+            let Some(first) = parts.next() else { continue };
+            let Some(second) = parts.next() else { continue };
+            if first.is_empty()
+                || second.is_empty()
+                || !first.chars().all(|c| c.is_ascii_digit())
+                || !second.chars().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+            let rest = parts.next();
+            if rest.is_some_and(|part| part.is_empty()) {
+                continue;
+            }
+            return Some(candidate.to_string());
         }
     }
     None
@@ -1044,14 +1064,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_output_prefers_nonempty() {
+    fn parse_version_output_extracts_version_and_ignores_warning() {
         assert_eq!(
             parse_version_output("ollama version is 0.12.5", "").as_deref(),
-            Some("ollama version is 0.12.5")
+            Some("0.12.5")
         );
         assert_eq!(
             parse_version_output("", "ollama version is 0.12.5\n").as_deref(),
-            Some("ollama version is 0.12.5")
+            Some("0.12.5")
+        );
+        assert_eq!(
+            parse_version_output(
+                "Warning: could not connect to a running Ollama instance\nollama version is 0.34.1",
+                "",
+            )
+            .as_deref(),
+            Some("0.34.1")
+        );
+        assert_eq!(
+            parse_version_output("Warning: service unavailable", ""),
+            None
         );
         assert!(parse_version_output("", "").is_none());
     }

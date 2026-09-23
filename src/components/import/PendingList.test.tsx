@@ -45,9 +45,9 @@ vi.stubGlobal(
 );
 
 const items: ImportPlanItem[] = [
-  { path: "d:/p/a.jpg", kind: "image", size: 1024 * 512 },
-  { path: "d:/p/b.mp4", kind: "video", size: 1024 * 1024 * 5 },
-  { path: "d:/p/c.mov", kind: "video", size: 1024 * 1024 * 4 },
+  { path: "d:/p/a.jpg", kind: "image", size: 1024 * 512, previewStatus: "ready" },
+  { path: "d:/p/b.mp4", kind: "video", size: 1024 * 1024 * 5, previewStatus: "ready" },
+  { path: "d:/p/c.mov", kind: "video", size: 1024 * 1024 * 4, previewStatus: "ready" },
 ];
 
 function renderGrid(props: { onOpenItem?: (p: string) => void; running?: boolean } = {}) {

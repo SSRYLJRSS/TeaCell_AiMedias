@@ -10,6 +10,7 @@ import type {
   SearchWarning,
   ShouldClause,
 } from "@/types/superSearch";
+import { metadataFilterOf, normalizeExprMetadata, normalizeMetadataCond } from "@/utils/queryExprUtils";
 
 /** S6：版本常量（与后端 db/search_plan.rs 单点声明对齐）。 */
 export const PLAN_SCHEMA_VERSION = 3;
@@ -30,13 +31,52 @@ export function weightForShouldPosition(index: number, length: number): number {
 
 /** 按优先区顺序截断并重算三档权重；不修改输入数组或 clause。 */
 export function normalizeShouldByPosition(should: ShouldClause[]): ShouldClause[] {
-  const kept = should.slice(0, MAX_SHOULD_CLAUSES);
+  // 不完整的手工草稿不得进入可执行计划。QueryBuilder 仍保留草稿行，
+  // 但 store / hydrate 的边界必须把历史残留的空条件挡在执行链外。
+  const canonical = should.map((clause) => ({ ...clause, cond: normalizeMetadataCond(clause.cond) }));
+  const kept = canonical.filter((clause) => isCompleteLeafCond(clause.cond)).slice(0, MAX_SHOULD_CLAUSES);
   return kept.map((clause, index) => ({ ...clause, weight: weightForShouldPosition(index, kept.length) }));
+}
+
+/** SearchPlanV3 的叶子完整性判定，与 QueryBuilder 的草稿收敛规则保持一致。 */
+export function isCompleteLeafCond(cond: LeafCond, circularKeys?: ReadonlySet<string>): boolean {
+  if (cond.type === "tag") return cond.tagIds.length > 0 || Boolean(cond.termQuery?.trim());
+  if (cond.type === "excludeTag") return cond.tagIds.length > 0;
+  if (cond.type === "search") return cond.value.trim().length > 0;
+  if (cond.type === "facetNumber") {
+    if (!Number.isFinite(cond.value)) return false;
+    if (cond.op === "between") {
+      return cond.maxValue != null && Number.isFinite(cond.maxValue) && cond.value <= cond.maxValue;
+    }
+    return true;
+  }
+  if (cond.type !== "metadata") return true;
+  const filter = metadataFilterOf(cond);
+  if (!filter) return false;
+  if (filter.op === "between") {
+    if (filter.min === undefined || filter.max === undefined) return false;
+    const lo = typeof filter.min === "number" ? filter.min : Number(filter.min);
+    const hi = typeof filter.max === "number" ? filter.max : Number(filter.max);
+    // Store-side normalization may not have loaded numeric domains yet. In that
+    // case preserve an inverted range and let the backend's single domain source
+    // decide (notably dominant_hue's wrap-around interval); the builder passes a
+    // concrete set and can remain conservative while editing.
+    if (Number.isFinite(lo) && Number.isFinite(hi) && lo > hi && circularKeys && !circularKeys.has(filter.key)) return false;
+    return true;
+  }
+  if (filter.op === "in") return Boolean(filter.values?.length);
+  return filter.value !== undefined && filter.value !== "";
 }
 
 /** SearchPlanV3 的单一归一化边界：min 恒为 0，should 顺序是唯一优先级来源。 */
 export function normalizeSearchPlan(plan: SearchPlanV3): SearchPlanV3 {
-  return { ...plan, should: normalizeShouldByPosition(plan.should), minimumShouldMatch: 0 };
+  return {
+    ...plan,
+    filter: plan.filter ? normalizeExprMetadata(plan.filter) : null,
+    mustNot: plan.mustNot ? normalizeExprMetadata(plan.mustNot) : null,
+    should: normalizeShouldByPosition(plan.should),
+    minimumShouldMatch: 0,
+  };
 }
 
 /** 不可变的优先区重排。to 是删除 source 后的最终插入下标。 */

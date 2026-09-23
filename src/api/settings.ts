@@ -25,6 +25,11 @@ export function openLogsDir(): Promise<void> {
   return invoke<void>("open_logs_dir");
 }
 
+/** 打开使用帮助（系统默认浏览器）。 */
+export function openHelpPage(): Promise<void> {
+  return invoke<void>("open_help_page");
+}
+
 export interface DiagnosticsReport {
   path: string;
   logFiles: number;

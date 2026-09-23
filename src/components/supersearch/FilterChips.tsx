@@ -10,6 +10,8 @@ import { useTagStore } from "@/stores/tagStore";
 import { useNumericDomainStore } from "@/stores/numericDomainStore";
 import type { MetadataFilter } from "@/types/asset";
 import type { LeafCond } from "@/types/queryExpr";
+import type { ResolvedTag } from "@/types/superSearch";
+import type { TagNode } from "@/types/tag";
 import {
   flattenExprForDisplay,
   type ExprChipModel,
@@ -38,6 +40,19 @@ const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "�
 
 function fmtValue(v: string | number) { return String(v); }
 
+function flattenTagNames(nodes: TagNode[], out: ResolvedTag[] = []): ResolvedTag[] {
+  for (const node of nodes) {
+    out.push({
+      tagId: node.tag.id,
+      text: node.tag.name,
+      facetKey: node.tag.facetKey,
+      path: node.tag.path,
+    });
+    flattenTagNames(node.children, out);
+  }
+  return out;
+}
+
 function metaLabel(f: MetadataFilter): string {
   const name = LABELS[f.key] ?? f.key;
   // U-3：palette_top3 eq + min → 「前三色含 红（占 ≥50%）」
@@ -65,7 +80,7 @@ function bonusLabel(cond: LeafCond, tagName: Map<number, string>): string {
     case "facetMissing":
       return `「${cond.facetKey}」没有标签`;
     case "tag":
-      return `标签：${names(cond.tagIds) || "未选择"}`;
+      return `标签：${names(cond.tagIds) || (cond.termQuery?.trim() ? `词：${cond.termQuery.trim()}` : "未选择")}`;
     case "excludeTag":
       return `排除：${names(cond.tagIds) || cond.facetKey}`;
     case "metadata":
@@ -96,17 +111,29 @@ export default function FilterChips() {
       clearConditions: s.clearConditions,
     })),
   );
+  const { tagTree, tagFacets } = useTagStore(
+    useShallow((s) => ({ tagTree: s.tree, tagFacets: s.facets })),
+  );
+  // 手动条件不经过 AI，因此不会写入 resolvedTags；把实时标签树作为名称事实源，
+  // 再用 AI 返回的 resolvedTags 覆盖同 ID 的显示文本（兼容新建/尚未刷新到树的标签）。
+  const namePool = (() => {
+    const byId = new Map<number, ResolvedTag>();
+    for (const tag of flattenTagNames(tagTree)) byId.set(tag.tagId, tag);
+    for (const tag of resolvedTags) byId.set(tag.tagId, tag);
+    return Array.from(byId.values());
+  })();
+  const facetNameByKey = new Map(tagFacets.map((facet) => [facet.key, facet.displayName]));
 
   type Chip = { key: string; label: string; group?: string; onRemove: () => void };
   const chips: Chip[] = [];
 
   if (expr) {
     // §3.10：必须区组标签统一「必须」；删除带 zone（§3.7 不变式 6）
-    const models: ExprChipModel[] = flattenExprForDisplay(expr, resolvedTags);
+    const models: ExprChipModel[] = flattenExprForDisplay(expr, namePool);
     for (const m of models) {
       chips.push({ key: `filter:${m.key}`, label: m.label, group: "必须", onRemove: () => removeAtZonePath("filter", m.path) });
     }
-  } else {
+  } else if (!plan) {
     // 纯手动条件链路（无 expr）：扁平 query 渲染，仍逐项删除
     if (query.search) {
       chips.push({ key: "search", label: `关键词：${query.search}`, onRemove: () => setQuery({ search: "" }) });
@@ -121,11 +148,11 @@ export default function FilterChips() {
       chips.push({ key: "untagged", label: "未打标", onRemove: () => setQuery({ untaggedOnly: false }) });
     }
     const nameById = new Map<number, { facetKey: string; text: string }>();
-    for (const rt of resolvedTags) nameById.set(rt.tagId, { facetKey: rt.facetKey, text: rt.text });
+    for (const rt of namePool) nameById.set(rt.tagId, { facetKey: rt.facetKey, text: rt.text });
     for (const f of query.facetFilters) {
       for (const tid of f.tagIds) {
         const info = nameById.get(tid);
-        const fname = useTagStore.getState().facets.find((x) => x.key === f.facetKey)?.displayName ?? FACET_NAMES[f.facetKey] ?? f.facetKey;
+        const fname = facetNameByKey.get(f.facetKey) ?? FACET_NAMES[f.facetKey] ?? f.facetKey;
         chips.push({
           key: `facet:${f.facetKey}:${tid}`,
           label: info ? `${fname}：${info.text}` : `${fname} · 标签#${tid}`,
@@ -157,7 +184,7 @@ export default function FilterChips() {
 
   // 排除区（plan.mustNot）：§3.10 组标签统一「排除」；删除带 zone（§3.7 不变式 6）
   if (plan?.mustNot) {
-    const models: ExprChipModel[] = flattenExprForDisplay(plan.mustNot, resolvedTags);
+    const models: ExprChipModel[] = flattenExprForDisplay(plan.mustNot, namePool);
     for (const m of models) {
       chips.push({ key: `exclude:${m.key}`, label: m.label, group: "排除", onRemove: () => removeAtZonePath("mustNot", m.path) });
     }
@@ -165,7 +192,7 @@ export default function FilterChips() {
 
   // U-5/§3.10：加分项（should）作为独立「优先」组 chips（按索引单条移除）
   if (plan && plan.should.length > 0) {
-    const tagName = new Map(resolvedTags.map((rt) => [rt.tagId, rt.text]));
+    const tagName = new Map(namePool.map((rt) => [rt.tagId, rt.text]));
     plan.should.forEach((sc, i) => {
       chips.push({
         key: `bonus:${i}:${JSON.stringify(sc.cond)}:${sc.weight}`,

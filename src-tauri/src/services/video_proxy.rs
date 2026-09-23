@@ -96,15 +96,17 @@ fn with_single_flight(
 }
 
 fn proxy_path(proxy_dir: &Path, asset_id: i64, variant: &str) -> PathBuf {
-    proxy_dir.join(format!("{asset_id}_{variant}.mp4"))
+    let ext = if variant == "vp8_webm" { "webm" } else { "mp4" };
+    proxy_dir.join(format!("{asset_id}_{variant}.{ext}"))
 }
 
 /// 生成临时路径（与目标同目录、同扩展名），用于「写入临时文件 → 原子 rename」。
 fn temp_path(out: &Path, uid: &str) -> PathBuf {
     out.parent().unwrap_or(Path::new(".")).join(format!(
-        "{}.{}.mp4",
+        "{}.{}.{}",
         out.file_stem().and_then(|s| s.to_str()).unwrap_or("p"),
-        uid
+        uid,
+        out.extension().and_then(|s| s.to_str()).unwrap_or("mp4")
     ))
 }
 
@@ -418,7 +420,8 @@ pub fn clear_all_proxies(db: &Arc<Mutex<Connection>>, proxy_dir: &Path) -> AppRe
     let mut removed: u64 = 0;
     if let Ok(rd) = fs::read_dir(proxy_dir) {
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().ends_with(".mp4") {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".mp4") || name.ends_with(".webm") {
                 if fs::remove_file(e.path()).is_ok() {
                     removed += 1;
                 } else {

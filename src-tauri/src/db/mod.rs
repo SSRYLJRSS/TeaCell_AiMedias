@@ -126,6 +126,7 @@ pub fn ensure_default_taxonomy(conn: &Connection) -> AppResult<()> {
     tag_facets::refresh_system_facet_defaults(conn, now)?;
     tag_facets::seed_system_facets_if_empty(conn)?;
     tags::seed_core_taxonomy_if_empty(conn)?;
+    tags::ensure_core_taxonomy_aliases(conn)?;
     Ok(())
 }
 

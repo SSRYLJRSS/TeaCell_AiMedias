@@ -14,14 +14,16 @@ const PAGE_SIZE = 200;
 const RAW_EXTS = new Set(["raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "iiq", "3fr", "erf", "srw", "kdc", "dcr", "mos", "mef", "x3f", "rwl"]);
 
 function kinshipKeyOf(a: Asset): { key: string; isRaw: boolean } {
-  const p = (a.filePath ?? "").split("\\").join("/").toLowerCase();
+  // 与后端 services/kinship.rs 对齐：只按 `/` 切目录，Unix 的反斜杠是合法文件名字符；
+  // 目录大小写保留，只折叠主干名，避免 Linux `/A` 与 `/a` 被错误合并。
+  const p = a.filePath ?? "";
   const slash = p.lastIndexOf("/");
   const dir = slash >= 0 ? p.slice(0, slash) : "";
   const name = slash >= 0 ? p.slice(slash + 1) : p;
   const dot = name.lastIndexOf(".");
   const stem = dot >= 0 ? name.slice(0, dot) : name;
-  const ext = dot >= 0 ? name.slice(dot + 1) : "";
-  return { key: `${dir}/${stem}`, isRaw: RAW_EXTS.has(ext) };
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  return { key: `${dir}/${stem.toLowerCase()}`, isRaw: RAW_EXTS.has(ext) };
 }
 
 export function collapseKinship(items: Asset[]): Asset[] {

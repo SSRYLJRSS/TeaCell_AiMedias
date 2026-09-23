@@ -10,17 +10,18 @@
 //!
 //! 判定纯函数，便于单测（W7）。
 
-/// 同源判定 key：目录 + 主干名（去扩展名，大小写不敏感）。
-/// file_path 已由 utils::path::normalize_path 统一为正斜杠小写盘符；
-/// 这里再做 lowercase 保证大小写不敏感（扩展名比较也走 lowercase）。
+/// 同源判定 key：目录 + 主干名。
+///
+/// 目录保留原大小写，只折叠文件主干名。Unix 目录大小写敏感，不能把整条路径
+/// lowercase；Unix 反斜杠也是合法文件名字符，不能无条件改成目录分隔符。Windows
+/// 入库路径由 `normalize_path` 在 Windows 编译目标统一成 `/`。
 ///
 /// 返回值附带「是否 RAW」信息以支持「一个 RAW 一个非 RAW」约束：
 /// (kinship_key, is_raw)。kinship_key 相同且 is_raw 不同的两条记录为同源。
 pub fn kinship_key(file_path: &str) -> (String, bool) {
-    let normalized = file_path.replace('\\', "/").to_lowercase();
-    let (dir, name) = match normalized.rfind('/') {
-        Some(i) => (&normalized[..i], &normalized[i + 1..]),
-        None => ("", normalized.as_str()),
+    let (dir, name) = match file_path.rfind('/') {
+        Some(i) => (&file_path[..i], &file_path[i + 1..]),
+        None => ("", file_path),
     };
     // 主干名 = 最后一个 '.' 之前；无扩展名则整个名字
     let (stem, ext) = match name.rfind('.') {
@@ -28,7 +29,7 @@ pub fn kinship_key(file_path: &str) -> (String, bool) {
         None => (name, ""),
     };
     let is_raw = crate::utils::mime::is_raw_ext(ext);
-    (format!("{dir}/{stem}"), is_raw)
+    (format!("{dir}/{}", stem.to_lowercase()), is_raw)
 }
 
 /// 两条路径是否同源（同 key 且一个 RAW 一个非 RAW）。
@@ -60,10 +61,19 @@ mod tests {
         let (k4, _) = kinship_key("d:/x/my.photo.v2.jpg");
         assert!(k4.ends_with("/my.photo.v2"));
 
-        // 大小写不敏感
-        let (k5, _) = kinship_key("D:/All/ABC.JPG");
-        let (k6, _) = kinship_key("d:/all/abc.jpg");
+        // 同目录下主干名大小写不敏感
+        let (k5, _) = kinship_key("d:/All/ABC.JPG");
+        let (k6, _) = kinship_key("d:/All/abc.jpg");
         assert_eq!(k5, k6);
+
+        // Unix 不同大小写目录是不同目录，不得错误合并
+        let (kd1, _) = kinship_key("/photos/A/X.RW2");
+        let (kd2, _) = kinship_key("/photos/a/X.JPG");
+        assert_ne!(kd1, kd2);
+        assert!(!is_kinship("/photos/A/X.RW2", "/photos/a/X.JPG"));
+
+        // Unix 反斜杠是文件名字符，不是目录分隔符
+        assert!(is_kinship("/home/a\\b.RW2", "/home/a\\b.JPG"));
 
         // 同名不同目录：不算同源
         let (k7, _) = kinship_key("d:/a/IMG_0001.RW2");

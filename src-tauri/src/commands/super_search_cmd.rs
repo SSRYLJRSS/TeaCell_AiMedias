@@ -1,6 +1,6 @@
 //! 超级搜索命令（FB5-05 §9）：AI 自然语言 → SearchIntentV3 → QueryExpr + SearchPlanV3。
 //! 薄壳：校验输入长度 → 短锁读配置/分面/标签 → 放锁 → spawn_blocking 网络请求
-//! → V3 解析（degrade_parse_v3 内含 evidence 守卫/清洗/校验）→ 短锁生成 expr（V2 视图，
+//! → V3 解析（含 evidence 守卫、偏好错位纠偏/清洗/校验）→ 短锁生成 expr（V2 视图，
 //! 兼容现有列表链路）+ plan（含 should 加分，供 U 波次三段式 UI）→ 返回。
 
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use crate::db::search_plan::PlanDiagnostics;
 use crate::db::settings;
 use crate::db::tag_facets;
 use crate::error::{AppError, AppResult};
+use crate::services::ollama_runtime;
 use crate::services::super_search_ai;
 use crate::services::super_search_ai::{AiSearchParseResult, SearchIntentV3};
 use crate::state::AppState;
@@ -30,6 +31,7 @@ pub async fn ai_parse_search_query(
     text: String,
 ) -> AppResult<AiSearchParseResult> {
     let db = Arc::clone(&state.db);
+    let runtime = Arc::clone(&state.ollama_runtime);
     tauri::async_runtime::spawn_blocking(move || {
         // 1. 校验文本长度
         if text.trim().is_empty() {
@@ -42,29 +44,47 @@ pub async fn ai_parse_search_query(
             )));
         }
         // 2. 短锁读取 AI 档案（用途绑定优先）+ 分面 + 标签词典 + 库能力摘要，读取后立即放锁
-        let (cfg, facets, dict, capabilities) = {
+        let (cfg, proxy, facets, dict, capabilities) = {
             let conn = lock_db(&db)?;
             let mut s = settings::get_settings(&conn)?;
             if s.ai.active().is_none() {
                 return Err(AppError::not_found("请先在设置页添加 API 配置（中转站）"));
             }
-            // §4.4：超级搜索按用途绑定读取连接档案；无绑定时回退默认 active 档案。
+            // §4.4：超级搜索按用途绑定读取连接档案；无绑定时继续使用默认 active
+            // 档案，但绑定读取/凭据解析失败必须 fail-closed，避免误用另一用途的连接。
             let _ =
                 crate::db::ai_connections::apply_usage_binding(&conn, "super_search", &mut s.ai)
                     .map_err(|e| {
-                        tracing::warn!("超级搜索读取用途绑定失败，回退默认档案: {e}");
+                        tracing::warn!("超级搜索读取用途绑定失败，已中止本次搜索: {e}");
                         e
                     })?;
             let facets = tag_facets::build_prompt_context(&conn, "all")?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             // C-3：实时库能力摘要（缓存 60s，只告知不改写）；失败时静默给空串不阻塞搜索
             let capabilities = super_search_ai::library_capabilities(&conn).unwrap_or_default();
-            (s.ai, facets, dict, capabilities)
+            (s.ai, s.model_download_proxy, facets, dict, capabilities)
         };
         // 3. 锁外网络请求 + V3 解析（V3→V2→关键词 三层降级；配置错误仍真报错）。
-        //    degrade_parse_v3 已含 sanitize + guard_preferred + validate。
-        let (intent, ai_warnings): (SearchIntentV3, Vec<String>) =
-            super_search_ai::request_intent(&cfg, &text, &facets, &dict, &capabilities)?;
+        //    request_intent 已完成 sanitize + guard_preferred + 偏好错位纠偏 + validate。
+        let managed_ollama = cfg
+            .active()
+            .is_some_and(crate::services::ai_cloud::is_managed_ollama_profile);
+        if managed_ollama {
+            ollama_runtime::ensure_ready(&runtime, &proxy)?;
+            runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .begin_request();
+        }
+        let intent_result =
+            super_search_ai::request_intent(&cfg, &text, &facets, &dict, &capabilities);
+        if managed_ollama {
+            runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .end_request();
+        }
+        let (intent, ai_warnings): (SearchIntentV3, Vec<String>) = intent_result?;
         // W6-5：是否落在第 3 层（关键词兜底）→ 解释文案与前端三态据此
         let keyword_mode = super_search_ai::is_keyword_fallback_v3(&intent, &text);
         let mut warnings = ai_warnings;

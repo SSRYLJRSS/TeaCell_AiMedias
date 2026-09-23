@@ -10,7 +10,7 @@ import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { backupDb, clearThumbnailCache, exportDiagnostics, getDataDir, openDataDir, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
+import { backupDb, clearThumbnailCache, exportDiagnostics, getDataDir, openDataDir, openHelpPage, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
@@ -480,6 +480,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     }
   };
 
+  const onOpenHelp = async () => {
+    setError(null);
+    try {
+      await openHelpPage();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const aiRoute: "ai.superSearch" | "ai.tagging" | null =
     route === "ai.superSearch" || route === "ai.tagging" ? route : null;
 
@@ -607,15 +616,18 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
 
           {route === "ai.services" && (
-            <Group title="服务管理">
-              <ServiceManagement
-                draft={draft}
-                onPatchAi={patchAi}
-                onPatchSettings={(patch) => dirty({ ...draft, ...patch })}
-                notify={setNotice}
-                fail={setError}
-              />
-            </Group>
+            <>
+              <PageHeader title="服务管理" description="管理在线服务、本机 Ollama 引擎、模型和实际用途连接。" />
+              <Group title="AI 服务与本机引擎">
+                <ServiceManagement
+                  draft={draft}
+                  onPatchAi={patchAi}
+                  onPatchSettings={(patch) => dirty({ ...draft, ...patch })}
+                  notify={setNotice}
+                  fail={setError}
+                />
+              </Group>
+            </>
           )}
 
           {route === "tags" && (
@@ -1115,13 +1127,18 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
 
           {route === "about" && (
             <>
-            <PageHeader title="关于" description="查看当前版本与许可证信息。" />
+            <PageHeader title="关于" description="查看当前版本、许可证和使用帮助。" />
             <Group title="应用信息">
-              <Field label="版本" hint="茶包素材 BagerTea AiMdeias V2 · 本地素材库">
-                <span className="text-sm text-[var(--color-text-secondary)]">v1.0.1（演示构建）</span>
+              <Field label="版本" hint="茶包素材 BagerTea AiMedias V2 · 本地素材库">
+                <span className="text-sm text-[var(--color-text-secondary)]">公测版 1.0</span>
               </Field>
-              <Field label="许可证" hint="本软件使用的开源组件许可证信息。">
-                <span className="text-xs text-[var(--color-text-secondary)]">本地私有工具 · 部分组件 Apache-2.0 / MIT</span>
+              <Field label="许可证" hint="本项目自有代码采用 MIT 许可证，允许自由使用、修改、再发布和商业使用。">
+                <span className="max-w-[32rem] text-right text-xs text-[var(--color-text-secondary)]">
+                  MIT License · 第三方依赖按各自许可证执行
+                </span>
+              </Field>
+              <Field label="使用帮助" hint="打开飞书使用说明和操作指南。">
+                <Button onClick={() => void onOpenHelp()}>打开使用帮助</Button>
               </Field>
             </Group>
             </>

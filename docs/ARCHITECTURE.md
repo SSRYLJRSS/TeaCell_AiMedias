@@ -48,7 +48,7 @@ Rust commands -> services -> db
 - `tagStore`：标签树、分面和治理状态。
 - `aiStore`：批次、建议、进度和确认状态。
 - `settingsStore`：设置加载、保存、主题和错误状态。
-- `taskStore`：导入、导出、AI 等全局任务进度。
+- `taskStore`：导入、导出任务状态；入库页消费导入进度，底栏全局任务层只展示导出进度。
 - `superSearchStore`：SearchPlanV3、AI 合并、持久化和诊断。
 - `metadataStore`：元数据筛选项和派生值。
 - `numericDomainStore`：数值分面范围和类型信息。
@@ -124,15 +124,17 @@ commands 不允许：
 | `thumbnail.rs` / `preview.rs` | 双层缩略图和待入库预览瘦壳 |
 | `importer.rs` | 扫描、哈希、改名、托管、元数据和落库管线 |
 | `exif_meta.rs` | EXIF 提取与 RAW 元数据兜底 |
-| `video.rs` / `video_proxy.rs` | 视频元数据、抽帧、兼容代理 |
+| `video.rs` / `video_proxy.rs` | 视频元数据、抽帧、有限变体兼容代理（H.264/MP4 或 VP8/WebM） |
+| `media_tools.rs` / `platform.rs` | 随包媒体工具解析和编译目标静态能力 |
 | `export_local.rs` | 复制/移动、目录布局、CSV 和任务状态 |
 | `dedup.rs` / `perceptual.rs` | 文件哈希去重、dHash、相似图和同源关系 |
 | `palette.rs` | 主色提取、色板状态和回填 |
 | `kinship.rs` | 同源/连拍关系判定 |
 | `media_refill.rs` | 存量媒体元数据、GPS、尺寸和色板回填 |
-| `ai_cloud.rs` | OpenAI 兼容/Anthropic 请求、解析、批次执行、取消和重试 |
+| `ai_cloud.rs` | OpenAI 兼容/Anthropic 请求、解析、批次执行、取消和重试；接入外部连接限流与 429 错误直传 |
+| `ai_rate_limit.rs` | 按连接共享的并发、分钟窗口和小时窗口限流；0 表示不限 |
 | `super_search_ai.rs` | SearchIntentV2、Schema、降级、守卫和解析 |
-| `ollama_setup.rs` / `ollama_installer.rs` / `ollama_runtime.rs` | 检测、推荐、拉取、安装和服务生命周期 |
+| `ollama_setup.rs` / `ollama_installer.rs` / `ollama_runtime.rs` | 检测、推荐、拉取、安装和服务生命周期；默认 `localhost:11434` 使用 ownership + 活动租约管理 |
 | `credentials.rs` | 系统凭据读写 |
 | `heic_decode.rs` / `raw_decode.rs` | imaging 的专用解码下游 |
 
@@ -214,10 +216,11 @@ commands 不允许：
 
 1. 读取尺寸或内嵌预览。
 2. 尝试 TIFF/CR3 等容器预览。
-3. 必要时进入 `heic_decode` 或 `raw_decode`。
-4. 使用全局许可限制并发。
+3. RAW 容器优先尝试 `raw_decode` 对应的 rawler 缩略图/预览提取，再按需进入完整显影。
+4. 必要时进入 `heic_decode` 或 `raw_decode`。
+5. 使用全局许可限制并发。
 
-占位层优先快速预览，禁止对 RAW 做昂贵全解码。高清层按需生成并缓存。dev 和 release 的图像依赖必须保持合理优化配置，新增图像依赖要核对 `Cargo.toml`。
+占位层优先快速预览，禁止对 RAW 做昂贵全解码。入库扫描会实际验证图片是否能生成快速缩略图：能生成的特殊格式标记为能力可能受限，无法生成的图片在确认前从队列剔除。高清层按需生成并缓存。dev 和 release 的图像依赖必须保持合理优化配置，新增图像依赖要核对 `Cargo.toml`。
 
 ### 5.2 普通搜索
 
@@ -279,11 +282,19 @@ pending -> processing -> done
 - `subject` / `scene` / `people` 默认上限分别为 3 / 3 / 8；场景只记录空间、环境和地点，不接收树木、水面、楼梯等主体物。
 - `confidenceMinSuggest` 保持 0.30；核心分面新词不硬拒绝，但确认时统一归入「其他」，便于后续治理。
 - 请求层优先使用结构化输出：本地 Ollama 原生 JSON Schema、OpenAI 兼容 `json_schema`、Anthropic tool use；不可用时按批次缓存并降级为 `json_object` 或纯文本。
+- 本地打标仅指 Windows 上由应用管理的默认 Ollama：原生 `/api/chat` 使用 `think: false`；用户配置的 localhost、局域网地址、自定义 Ollama 端口和其他兼容服务都属于外部 API，只走标准协议，不接收 Ollama 扩展字段。外部连接的 API Key 可为空，由目标服务自行返回鉴权结果。
+- AI 图片请求统一经 `imaging.rs` 解码并编码为最大边 1024 的 JPEG（质量 85），不直接发送 UI 高清 WebP；明确上下文超限时只降到 768 重试一次。
 - 无效结构、必需分面缺失、描述过短或人物判断矛盾时最多修复一次；网络、鉴权和额度错误不触发修复。
 - 主体为空且描述非空时同样最多修复一次；修复后仍为空则保留空值并显示为「未识别」，不生成占位标签。
 - 低于 `confidenceMinSuggest` 的标签直接拦截，其余建议全部保持 pending，确认后才写正式标签。
 - 续跑以是否已有分析结果为判断依据，不把低置信度全被拦截或纯描述结果误判为未处理。
 - 批量确认按页提交并在页间释放数据库锁，避免整批建议形成长时间单一写事务。
+- 在线连接可分别设置最大并发、每分钟请求数和每小时请求数；限流器按连接 id 在进程内跨批次共享，
+  每次打标或 AI 搜索的实际请求（包括重试、结构化降级和校验修复）都会占用额度，等待期间支持取消。0 表示不限。
+- 服务返回 `AI_RATE_LIMITED`（通常为 HTTP 429）时不再自动重试或继续发送后续请求；当前建议保留
+  `pending` 并记录脱敏后的供应商错误，批次中断，用户调整 RPM/并发后可续跑。普通网络/解析失败仍沿用单次重试。
+- 限流只用于外部在线服务；Windows 应用托管的默认 Ollama 不受在线额度设置影响。localhost、局域网和
+  自定义 Ollama 仍按外部连接处理并遵守限额。
 - 视频多帧结果按证据合并，保留合并标签的置信度；失败帧记录 warning，单帧噪声不直接进入建议。
 - 打标工作台不区分 AI/手动模式；批次创建后可立即手工填写，也可启动 AI 生成建议。
 - 批次创建和执行都以 `ai_usage_bindings.tagging` 当前绑定的连接为准；允许建批后切换服务，开始/续跑时按新连接执行，不回退旧 `settings.ai` 激活档案。
@@ -316,6 +327,24 @@ pending -> processing -> done
 - 所有批处理都要区分成功、失败、重复和取消。
 - 失败必须保留可恢复信息，不允许 UI 假成功。
 
+### 5.8 平台能力边界
+
+平台支持契约见 [PLATFORM.md](PLATFORM.md)。平台差异的目标数据流是：
+
+```text
+Cargo target dependencies / cfg
+            -> services 平台能力与所属 OS service
+            -> commands 薄壳
+            -> src/api + 单一 platform store
+            -> UI 禁用、降级或平台原生行为
+```
+
+静态能力只表达编译目标能否提供某项能力，不顺带探测网络、数据库、外部进程或凭据服务；运行时
+健康由能力所属 service 单独返回。前端不自行猜测操作系统，能力加载失败时采用保守行为。
+
+该结构是平台改造的架构约束，不是完成证明。模块是否已经接入、三端是否已验证，以代码、测试和
+[PROJECT_PLAN.md](PROJECT_PLAN.md) 的当前证据为准。
+
 ## 6. 状态流
 
 | 链路 | 流程 |
@@ -332,6 +361,10 @@ pending -> processing -> done
 | 日志回传 | 前端 logger -> raw invoke -> observability -> 文件日志 |
 | 诊断包 | SettingsPage -> exportDiagnostics -> command -> zip 摘要/日志文件 |
 
+本机 Ollama 的默认地址由 `ollama_runtime` 统一管理：请求前先保证服务就绪，应用自启的
+`AppOwned` 服务在连续空闲 2 分钟后由后台巡检停止；用户或其他程序先启动的 `External`
+服务只观测、不停止。页面启动按钮只发起启动并持续复检，避免把慢启动误报成失败。
+
 ## 7. 设计约束
 
 1. 前端不直连 invoke，commands 不写业务和业务 SQL。
@@ -345,6 +378,7 @@ pending -> processing -> done
 9. 性能路径不引入第二个缓存或第二个事实源，除非契约明确。
 10. 文档只保留当前事实，过程历史交给 Git。
 11. 日志只能在统一可观测性边界内落盘；前端日志例外使用 raw invoke，且不得传递敏感原文。
+12. 平台差异通过统一能力边界和目标依赖表达；核心数据结构、数据库和搜索语义不按平台分叉。
 
 ## 8. 分发与许可
 

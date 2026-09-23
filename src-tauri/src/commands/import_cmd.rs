@@ -57,6 +57,43 @@ pub async fn import_files(
     if paths.is_empty() {
         return Err(AppError::invalid_arg("未选择任何文件"));
     }
+    // 防止绕过入库页直接调用 IPC：正式复制/写库前再次确认所有图片都能生成
+    // 快速缩略图。不可预览项必须先从队列剔除，不能进入半成功的导入任务。
+    let preflight_paths = paths.clone();
+    let preflight =
+        tauri::async_runtime::spawn_blocking(move || importer::inspect_paths(&preflight_paths))
+            .await
+            .map_err(|e| AppError::msg(format!("入库预检查线程异常: {e}")))?;
+    let blocked: Vec<String> = preflight
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.preview_status,
+                importer::ImportPreviewStatus::Unsupported
+            )
+        })
+        .map(|item| item.path.clone())
+        .collect();
+    if !blocked.is_empty() {
+        let shown = blocked
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
+        let suffix = if blocked.len() > 5 {
+            format!(" 等 {} 个文件", blocked.len())
+        } else {
+            String::new()
+        };
+        return Err(AppError::unsupported(format!(
+            "有 {} 个文件无法解析入库缩略图，请先从队列剔除：{}{}",
+            blocked.len(),
+            shown,
+            suffix
+        )));
+    }
     state.import_cancel.store(false, Ordering::Relaxed);
     // W5c：入库进行中标志（restore_db 阻断依据）
     state.import_running.store(true, Ordering::Relaxed);

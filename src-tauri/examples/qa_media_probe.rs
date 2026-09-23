@@ -110,25 +110,39 @@ fn main() {
     println!("=== 茶包素材 · 测试素材解码验证 ===");
     println!("根目录 : {}", root.display());
     println!("每类上限: {limit}\n");
-    println!("  {:<38} {:>8} {:>13} {:>13} {:>9} {}",
-             "文件", "体积", "像素尺寸", "缩略图输出", "耗时", "备注");
+    println!(
+        "  {:<38} {:>8} {:>13} {:>13} {:>9} 备注",
+        "文件", "体积", "像素尺寸", "缩略图输出", "耗时"
+    );
 
     // (类别名, 目录, 扩展名)
     let groups: Vec<(&str, PathBuf, Vec<&str>)> = vec![
-        ("S1 宣传图(JPG)", root.join("S1_showcase"), vec!["jpg", "jpeg"]),
+        (
+            "S1 宣传图(JPG)",
+            root.join("S1_showcase"),
+            vec!["jpg", "jpeg"],
+        ),
         ("S2 PNG", root.join("S2_formats/common/png"), vec!["png"]),
         ("S2 WEBP", root.join("S2_formats/common/webp"), vec!["webp"]),
         ("S2 GIF", root.join("S2_formats/common/gif"), vec!["gif"]),
         ("S2 BMP", root.join("S2_formats/common/bmp"), vec!["bmp"]),
-        ("S2 TIFF", root.join("S2_formats/common/tiff"), vec!["tiff", "tif"]),
-        ("S2 HEIC", root.join("S2_formats/common/heic"), vec!["heic", "heif"]),
+        (
+            "S2 TIFF",
+            root.join("S2_formats/common/tiff"),
+            vec!["tiff", "tif"],
+        ),
+        (
+            "S2 HEIC",
+            root.join("S2_formats/common/heic"),
+            vec!["heic", "heif"],
+        ),
         (
             "S2 RAW",
             root.join("S2_formats/raw"),
             vec![
-                "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf",
-                "orf", "rw2", "pef", "srw", "x3f", "mrw", "iiq", "3fr", "fff", "kdc", "dcr",
-                "mos", "mef", "erf",
+                "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf",
+                "rw2", "pef", "srw", "x3f", "mrw", "iiq", "3fr", "fff", "kdc", "dcr", "mos", "mef",
+                "erf",
             ],
         ),
     ];

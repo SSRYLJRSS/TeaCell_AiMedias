@@ -1,5 +1,5 @@
 /** 设置页「本地模型」向导卡片（方案 A3 + 改造方案：下载源自选 + 延迟检测）：
- * 小白动线全程两个按钮；写配置只改 draft（单一数据源，保存设置才落库，与 A2 约定一致）。
+ * 小白动线全程两个按钮；下载源等偏好写 draft，模型选择直接同步真实 AI 连接。
  * 改造点：阶段1 增加「下载源下拉 + 测速 + 自定义源表单」，进度 label 取实际源；
  * 自定义源即时落库（后端直接写 settings），此处同步回填 draft 防「保存设置」回滚。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -33,13 +33,14 @@ import {
 } from "@/api/ollama";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useOllamaPull } from "@/hooks/useOllama";
-import type { ApiProfile, CustomSource, Settings } from "@/types/settings";
+import { selectManagedOllama, usePlatformStore } from "@/stores/platformStore";
+import type { CustomSource, Settings } from "@/types/settings";
 
 const DEFAULT_LOCAL_BASE = "http://localhost:11434/v1";
 const PROBE_CACHE_MS = 5 * 60 * 1000; // 测速结果内存缓存 5 分钟
 
-/** §8.5 空闲保留时长展示文案（与后端 KEEP_ALIVE_IDLE=2m 一致） */
-const KEEP_ALIVE_LABEL = "2 分钟";
+/** §8.5 空闲保留时长展示文案（与后端 AUTO_STOP_IDLE=2m 一致） */
+const AUTO_STOP_LABEL = "2 分钟";
 
 const fmtMb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(0)} MB`;
 const fmtSpeed = (bps: number) =>
@@ -66,16 +67,29 @@ interface Props {
     onPatchAi: (patch: Partial<Settings["ai"]>) => void;
     /** 顶层设置补丁（改造方案：自定义源即时落库后回填 draft，防止保存回滚） */
     onPatchSettings: (patch: Partial<Settings>) => void;
+    /** 模型拉取完成后同步到真实 ai_connections，而不是旧 settings.ai.profiles。 */
+    onModelSelected?: (model: string) => Promise<void>;
     notify: (msg: string) => void;
     fail: (msg: string) => void;
 }
 
-export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, notify, fail }: Props) {
+export default function LocalModelGroup({
+    draft,
+    onPatchAi,
+    onPatchSettings,
+    onModelSelected,
+    notify,
+    fail,
+}: Props) {
+    // 防御性闸门：即使未来有其他页面直接复用该组件，非 Windows 也不启动任何管理探针。
+    const managedOllama = usePlatformStore(selectManagedOllama);
     const [status, setStatus] = useState<InstallStatus | null>(null);
     const [detectError, setDetectError] = useState(false);
     const [hw, setHw] = useState<HardwareReport | null>(null);
     const [installProg, setInstallProg] = useState<InstallProgress | null>(null);
     const [busy, setBusy] = useState(false);
+    const [starting, setStarting] = useState(false);
+    const [startTimedOut, setStartTimedOut] = useState(false);
     const { pullState, pullBusy, pull } = useOllamaPull();
 
     // ---- 下载引自选 / 测速（改造方案） ----
@@ -140,36 +154,102 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     }, [logs]);
 
     const refresh = useCallback(async () => {
+        if (!managedOllama) return null;
         setDetectError(false);
         try {
             const st = await ollamaInstallStatus();
             setStatus(st);
+            if (st.running) {
+                setStarting(false);
+                setStartTimedOut(false);
+            }
             if (st.running) setHw(await probeOllamaHardware().catch(() => null));
             else setHw(null);
             // L2：同步运行态（ownership 只在服务运行时有意义；失败不阻塞向导）
             setRuntime(await ollamaRuntimeStatus().catch(() => null));
+            return st;
         } catch {
             // A-3：检测失败只在「本地打标」分组显示局部错误，不阻塞在线打标/视频开关
             setStatus(null);
             setDetectError(true);
+            return null;
         }
-    }, []);
+    }, [managedOllama]);
+
+    // 服务可能在页面停留期间被后台空闲回收；只更新运行态，不重复做硬件探测。
+    const refreshServiceStatus = useCallback(async () => {
+        if (!managedOllama) return null;
+        try {
+            const st = await ollamaInstallStatus();
+            setStatus(st);
+            if (st.running) {
+                setStarting(false);
+                setStartTimedOut(false);
+            }
+            return st;
+        } catch {
+            return null;
+        }
+    }, [managedOllama]);
 
     const loadSources = useCallback(async () => {
+        if (!managedOllama) return;
         try {
             setSources(await ollamaListSources());
         } catch {
             setSources([]);
         }
-    }, []);
+    }, [managedOllama]);
 
     useEffect(() => {
+        if (!managedOllama) return;
         void refresh();
         void loadSources();
-    }, [refresh, loadSources]);
+    }, [managedOllama, refresh, loadSources]);
+
+    // 页面重新获得焦点时复检，避免服务在后台慢启动后页面保留旧状态。
+    useEffect(() => {
+        const onFocus = () => void refresh();
+        window.addEventListener("focus", onFocus);
+        return () => window.removeEventListener("focus", onFocus);
+    }, [refresh]);
+
+    // Ollama 首次启动可能超过 20 秒；启动命令立即返回后，前端持续复检直到就绪。
+    useEffect(() => {
+        if (!starting) return;
+        let cancelled = false;
+        const startedAt = Date.now();
+        const poll = async () => {
+            const st = await refresh();
+            if (cancelled) return;
+            if (st?.running) {
+                setStarting(false);
+                return;
+            }
+            if (Date.now() - startedAt >= 90_000) {
+                setStarting(false);
+                setStartTimedOut(true);
+            }
+        };
+        void poll();
+        // 状态探测本身最多包含两个 2 秒 HTTP 超时，间隔不能短到产生并发探测。
+        const timer = window.setInterval(() => void poll(), 5_000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+        };
+    }, [starting, refresh]);
+
+    // 就绪页保持低频状态同步，让自动停服在页面上及时反映为“服务未运行”。
+    useEffect(() => {
+        if (!status?.running || starting || busy || pullBusy) return;
+        const timer = window.setInterval(() => void refreshServiceStatus(), 30_000);
+        return () => window.clearInterval(timer);
+    }, [status?.running, starting, busy, pullBusy, refreshServiceStatus]);
 
     // ---- 已装模型管理：服务就绪（且为 Ollama）时加载列表与存储目录 ----
     const loadModels = useCallback(async () => {
+        if (!managedOllama) return;
         setModelsLoading(true);
         try {
             setModels(await ollamaListLocalModels(DEFAULT_LOCAL_BASE));
@@ -179,9 +259,10 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
         } finally {
             setModelsLoading(false);
         }
-    }, []);
+    }, [managedOllama]);
 
     useEffect(() => {
+        if (!managedOllama) return;
         if (status?.running) {
             void loadModels();
             ollamaModelDir().then(setModelDir).catch(() => setModelDir(null));
@@ -189,7 +270,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
             setModels([]);
             setModelDir(null);
         }
-    }, [status?.running, loadModels]);
+    }, [managedOllama, status?.running, loadModels]);
 
     /** 删除模型：首次点击进入确认态（3s 自动复位），二次点击执行（防误触） */
     const onDeleteModel = async (name: string) => {
@@ -205,15 +286,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
         try {
             await ollamaDeleteModel(DEFAULT_LOCAL_BASE, name);
             setModels((prev) => prev.filter((m) => m.name !== name));
-            // 若删除的正是当前激活本地档案使用的模型，一并提醒
-            const active = draft.ai.profiles.find(
-                (p) => p.kind === "local" && p.id === draft.ai.activeProfile,
-            );
-            notify(
-                active && active.model === name
-                    ? `已删除模型 ${name}；当前打标档案使用的正是它，请重新拉取或更换模型`
-                    : `已删除模型 ${name}`,
-            );
+            notify(`已删除模型 ${name}`);
             void refresh(); // 同步「推荐模型」的已安装标记与已装模型文本
         } catch (e) {
             fail(errMsg(e));
@@ -333,14 +406,16 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
 
     const onStartService = async () => {
         setBusy(true);
+        setStarting(true);
+        setStartTimedOut(false);
         try {
             await ollamaStartService();
-            notify("Ollama 服务已就绪");
+            notify("已请求启动 Ollama，正在复检服务状态");
         } catch (e) {
+            setStarting(false);
             fail(errMsg(e));
         } finally {
             setBusy(false);
-            void refresh();
         }
     };
 
@@ -362,43 +437,23 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
         }
     };
 
-    /** 确保存在本地档案并写入模型、置为激活（只改 draft，保存设置才生效） */
-    const ensureLocalProfile = (model: string) => {
-        const existing = draft.ai.profiles.find((p) => p.kind === "local");
-        if (existing) {
-            onPatchAi({
-                profiles: draft.ai.profiles.map((p) =>
-                    p.id === existing.id ? { ...p, model, baseUrl: p.baseUrl || DEFAULT_LOCAL_BASE } : p,
-                ),
-                activeProfile: existing.id,
-            });
-        } else {
-            const p: ApiProfile = {
-                id: crypto.randomUUID(),
-                name: "本机 Ollama",
-                apiMode: "openai",
-                kind: "local",
-                baseUrl: DEFAULT_LOCAL_BASE,
-                apiKey: "",
-                model,
-            };
-            onPatchAi({ profiles: [...draft.ai.profiles, p], activeProfile: p.id });
-        }
-    };
-
     const modelInstalled = (name: string) =>
         (status?.models ?? []).some((m) => m === name || m === `${name}:latest` || m.startsWith(`${name}:`));
 
     const onPick = async (name: string) => {
         if (modelInstalled(name)) {
-            ensureLocalProfile(name);
-            notify("模型已就绪，点「保存设置」后即可开始打标");
+            try {
+                await onModelSelected?.(name);
+                notify("模型已就绪，已同步到本机 AI 连接");
+            } catch (e) {
+                fail(errMsg(e));
+            }
             return;
         }
         try {
             await pull(DEFAULT_LOCAL_BASE, name);
-            ensureLocalProfile(name);
-            notify("配置完成，点「保存设置」后即可开始打标");
+            await onModelSelected?.(name);
+            notify("配置完成，已同步到本机 AI 连接");
             void refresh();
         } catch (e) {
             fail(errMsg(e));
@@ -631,10 +686,29 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     if (!status.running) {
         return (
             <div className="flex flex-col gap-2 p-3">
-                <p className="text-sm text-[var(--color-text)]">已检测到 Ollama{status.version ? `（${status.version}）` : ""}，但服务未运行</p>
+                <div className="flex items-center gap-2">
+                    <span
+                        aria-hidden="true"
+                        className={`h-2 w-2 rounded-full ${starting ? "bg-[var(--color-status)]" : "bg-[var(--color-text-tertiary)]"}`}
+                    />
+                    <p className="text-sm text-[var(--color-text)]">
+                        已安装 Ollama{status.version ? `（${status.version}）` : ""}，
+                        {starting ? "正在启动并复检" : "服务未运行"}
+                    </p>
+                </div>
+                {starting && (
+                    <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+                        首次启动可能需要几十秒，页面会自动继续检查，不需要重复点击。
+                    </p>
+                )}
+                {startTimedOut && (
+                    <p className="text-xs leading-5 text-[var(--color-danger)]">
+                        等待 90 秒后仍未就绪。请检查端口 11434 是否被占用，或停止后再次重试。
+                    </p>
+                )}
                 <div>
-                    <Button variant="primary" disabled={busy} onClick={() => void onStartService()}>
-                        {busy ? "正在启动…" : "启动服务并复检"}
+                    <Button variant="primary" disabled={busy || starting} onClick={() => void onStartService()}>
+                        {starting || busy ? "正在启动…" : "启动服务并复检"}
                     </Button>
                 </div>
             </div>
@@ -663,7 +737,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                                 <>
                                     运行中（应用启动 · PID {runtime.ownership.detail.pid}）
                                     <span className="ml-1.5 text-[10px] text-[var(--color-text-secondary)]">
-                                        空闲 {KEEP_ALIVE_LABEL} 后模型自动释放内存
+                                        空闲 {AUTO_STOP_LABEL} 后服务自动关闭，模型会先释放内存
                                     </span>
                                 </>
                             ) : (
@@ -786,7 +860,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
             </div>
 
             <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-                模型文件约 1.0–6.6GB（取决于模型规格），默认保存在用户目录的 .ollama 文件夹。可在上方「已安装模型」中删除不需要的模型以释放磁盘空间。下载较慢时，可配置下方代理，或使用离线导入。修改后需点击页面底部「保存设置」生效。
+                模型文件约 1.0–6.6GB（取决于模型规格），默认保存在用户目录的 .ollama 文件夹。可在上方「已安装模型」中删除不需要的模型以释放磁盘空间。下载较慢时，可配置下方代理，或使用离线导入。
             </p>
 
             {/* 模型下载代理（加速项 A：拉起 serve 时注入 HTTPS_PROXY） */}

@@ -15,19 +15,21 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
+/// 省略 variant 时由后端按目标平台决定；显式值必须属于有限枚举。
+fn resolve_variant(value: Option<String>) -> AppResult<(String, video::ProxyVariant)> {
+    let value =
+        value.unwrap_or_else(|| crate::services::platform::preferred_video_proxy().to_string());
+    let parsed = video::ProxyVariant::parse(&value)?;
+    Ok((value, parsed))
+}
+
 #[tauri::command]
 pub async fn ensure_video_proxy(
     state: State<'_, AppState>,
     asset_id: i64,
     variant: Option<String>,
 ) -> AppResult<VideoProxy> {
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
-    if !variant
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppError::invalid_arg("非法代理变体"));
-    }
+    let (variant, parsed_variant) = resolve_variant(variant)?;
     let db = Arc::clone(&state.db);
     let proxy_dir = state.data_dir.join("proxies");
     let cancel = Arc::new(AtomicBool::new(false));
@@ -47,7 +49,7 @@ pub async fn ensure_video_proxy(
             asset_id,
             &variant,
             &cancel,
-            |src, tmp, c| video::transcode_to_h264(src, tmp, Some(c)),
+            move |src, tmp, c| video::transcode_variant(src, tmp, parsed_variant, Some(c)),
         );
         // 收尾清理取消标志
         if let Ok(mut m) = proxy_cancel_reg.lock() {
@@ -68,8 +70,8 @@ pub fn get_video_proxy_status(
     asset_id: i64,
     variant: Option<String>,
 ) -> AppResult<Option<VideoProxy>> {
+    let (variant, _) = resolve_variant(variant)?;
     let conn = lock_db(&state)?;
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
     crate::db::video_proxy::get(&conn, asset_id, &variant)
 }
 
@@ -80,7 +82,7 @@ pub fn cancel_video_proxy(
     asset_id: i64,
     variant: Option<String>,
 ) -> AppResult<()> {
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
+    let (variant, _) = resolve_variant(variant)?;
     let key = format!("{asset_id}:{variant}");
     let m = state
         .video_proxy_cancel

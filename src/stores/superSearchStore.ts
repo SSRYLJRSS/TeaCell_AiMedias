@@ -10,7 +10,7 @@ import { persist } from "zustand/middleware";
 import { listSuperAssets, listSuperAssetIdsByPlan, aiParseSearchQuery } from "@/api/superSearch";
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
-import type { QueryExpr, TermMatch } from "@/types/queryExpr";
+import type { LeafCond, QueryExpr, TermMatch } from "@/types/queryExpr";
 import type { AiApplyMode, ResolvedTag, SearchPlanV3, SearchWarning, ShouldClause, FetchAllIdsResult } from "@/types/superSearch";
 import {
   appendToExpr,
@@ -20,7 +20,15 @@ import {
   serializeExpr,
   syncQueryFromExpr,
 } from "@/utils/queryExprUtils";
-import { appendPlanMerge, fieldRanking, migratePlanV3 as migratePlanWithNormalization, normalizeSearchPlan, resolvedQueryToPlan } from "@/utils/planUtils";
+import {
+  MAX_SHOULD_CLAUSES,
+  appendPlanMerge,
+  fieldRanking,
+  mergeMustNotExpr,
+  migratePlanV3 as migratePlanWithNormalization,
+  normalizeSearchPlan,
+  resolvedQueryToPlan,
+} from "@/utils/planUtils";
 import type { ExprPath } from "@/utils/queryExprUtils";
 
 const PAGE_SIZE = 200;
@@ -39,7 +47,8 @@ function defaultQuery(): ResolvedSearchQuery {
   };
 }
 
-let requestSeq = 0;
+let listRequestSeq = 0;
+let aiRequestSeq = 0;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleRefresh(refresh: () => Promise<void>) {
@@ -51,7 +60,124 @@ function scheduleRefresh(refresh: () => Promise<void>) {
 }
 
 function invalidatePendingRequests() {
-  requestSeq += 1;
+  listRequestSeq += 1;
+}
+
+function invalidateAiRequests() {
+  aiRequestSeq += 1;
+}
+
+function collectExprLeaves(expr: QueryExpr | undefined | null, predicate: (cond: LeafCond) => boolean): QueryExpr | undefined {
+  if (!expr) return undefined;
+  if (expr.op === "leaf") return predicate(expr.cond) ? expr : undefined;
+  if (expr.op === "not") {
+    const child = collectExprLeaves(expr.child, predicate);
+    return child ? { op: "not", child } : undefined;
+  }
+  const children = expr.children
+    .map((child) => collectExprLeaves(child, predicate))
+    .filter((child): child is QueryExpr => Boolean(child));
+  return children.length > 0 ? normalizeExpr({ op: expr.op, children }) : undefined;
+}
+
+function collectCondKeys(expr: QueryExpr | undefined | null, predicate: (cond: LeafCond) => boolean): Set<string> {
+  const keys = new Set<string>();
+  const visit = (node: QueryExpr | undefined | null) => {
+    if (!node) return;
+    if (node.op === "leaf") {
+      if (predicate(node.cond)) keys.add(JSON.stringify(node.cond));
+      return;
+    }
+    if (node.op === "not") {
+      visit(node.child);
+      return;
+    }
+    node.children.forEach(visit);
+  };
+  visit(expr);
+  return keys;
+}
+
+function removeExprLeaves(expr: QueryExpr | undefined | null, predicate: (cond: LeafCond) => boolean): QueryExpr | undefined {
+  if (!expr) return undefined;
+  if (expr.op === "leaf") return predicate(expr.cond) ? undefined : expr;
+  if (expr.op === "not") {
+    const child = removeExprLeaves(expr.child, predicate);
+    return child ? { op: "not", child } : undefined;
+  }
+  const children = expr.children
+    .map((child) => removeExprLeaves(child, predicate))
+    .filter((child): child is QueryExpr => Boolean(child));
+  return children.length > 0 ? normalizeExpr({ op: expr.op, children }) : undefined;
+}
+
+function appendExpr(a: QueryExpr | undefined | null, b: QueryExpr | undefined): QueryExpr | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return normalizeExpr(a.op === "and" ? { op: "and", children: [b, ...a.children] } : { op: "and", children: [b, a] });
+}
+
+/**
+ * 替换零结果诊断对应的按词查叶子。建议词只替换用户刚刚失败的那一个条件，
+ * 保留其他关键词、布尔组和分面条件；找不到源叶子时才退回追加语义。
+ */
+function replaceFirstTermLeaf(
+  expr: QueryExpr,
+  sourceTerm: string,
+  replacement: string,
+  match: TermMatch,
+): { expr: QueryExpr; replaced: boolean } {
+  if (expr.op === "leaf") {
+    const cond = expr.cond;
+    if (cond.type === "tag" && cond.tagIds.length === 0 && cond.termQuery?.trim() === sourceTerm) {
+      return {
+        expr: { op: "leaf", cond: { ...cond, termQuery: replacement, termMatch: match } },
+        replaced: true,
+      };
+    }
+    return { expr, replaced: false };
+  }
+  if (expr.op === "not") {
+    const child = replaceFirstTermLeaf(expr.child, sourceTerm, replacement, match);
+    return { expr: child.replaced ? { op: "not", child: child.expr } : expr, replaced: child.replaced };
+  }
+  let replaced = false;
+  const children = expr.children.map((child) => {
+    if (replaced) return child;
+    const next = replaceFirstTermLeaf(child, sourceTerm, replacement, match);
+    replaced = next.replaced;
+    return next.expr;
+  });
+  return { expr: replaced ? normalizeExpr({ op: expr.op, children }) ?? expr : expr, replaced };
+}
+
+/** 把扁平 query 的局部修改应用到现有 plan，而不是把 AI 的复杂树整棵拍平。 */
+function patchExistingPlan(plan: SearchPlanV3, previous: ResolvedSearchQuery, next: ResolvedSearchQuery, patch: Partial<ResolvedSearchQuery>): SearchPlanV3 {
+  const rebuilt = resolvedQueryToPlan(next);
+  const previousPlan = resolvedQueryToPlan(previous);
+  let filter: QueryExpr | null | undefined = plan.filter;
+  let mustNot: QueryExpr | null | undefined = plan.mustNot;
+  const keys = new Set(Object.keys(patch));
+  const filterRules: [string, (cond: LeafCond) => boolean][] = [
+    ["search", (cond) => cond.type === "search"],
+    ["assetType", (cond) => cond.type === "assetType"],
+    ["untaggedOnly", (cond) => cond.type === "untagged"],
+    ["facetFilters", (cond) => cond.type === "tag"],
+    ["metadataFilters", (cond) => cond.type === "metadata"],
+  ];
+  for (const [key, matches] of filterRules) {
+    if (!keys.has(key)) continue;
+    // 只摘除上一版扁平 query 实际贡献的叶子；AI/嵌套条件即使类型相同也继续保留。
+    const oldKeys = collectCondKeys(previousPlan.filter, matches);
+    filter = removeExprLeaves(filter, (cond) => oldKeys.has(JSON.stringify(cond)));
+    filter = appendExpr(filter, collectExprLeaves(rebuilt.filter, matches));
+  }
+  if (keys.has("excludeTagIds")) {
+    const oldKeys = collectCondKeys(previousPlan.mustNot, (cond) => cond.type === "tag" || cond.type === "excludeTag");
+    mustNot = removeExprLeaves(mustNot, (cond) => oldKeys.has(JSON.stringify(cond)));
+    mustNot = mergeMustNotExpr(mustNot ?? null, rebuilt.mustNot);
+  }
+  return normalizeSearchPlan({ ...plan, filter: filter ?? null, mustNot: mustNot ?? null });
 }
 
 function dedupItems(arr: Asset[]): Asset[] {
@@ -205,9 +331,9 @@ export interface SuperSearchState {
   removePlanMustNotAt: (path: ExprPath) => void;
   /** §3.7：把条件从一区移到另一区（filter↔mustNot；按目标区语义 AND/OR 并入） */
   moveConditionBetweenZones: (from: "filter" | "mustNot" | "should", to: "filter" | "mustNot" | "should", path: ExprPath | number) => void;
-  /** S5 5-4（不变量 11）：零结果相近词建议 —— 用户点了才把「按词查」加进必须区；
+  /** S5 5-4（不变量 11）：零结果相近词建议 —— 用户点了才替换失败的按词查条件；
    *  系统绝不主动改写语义（未点击前条件保持原样）。 */
-  applyTermSuggestion: (term: string, match: TermMatch) => void;
+  applyTermSuggestion: (sourceTerm: string, term: string, match: TermMatch) => void;
   /** §3.7：清空某一区（不变式 3：三区全空才清 plan） */
   clearZone: (zone: "filter" | "should" | "mustNot") => void;
   /** U-5：加分项（should）编辑 —— 覆盖整个 should 数组与最低命中数（不变式 4 自动收敛） */
@@ -261,25 +387,29 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const next = { ...prev, ...patch };
     if (queryEqual(prev, next)) return;
     invalidatePendingRequests();
+    invalidateAiRequests();
     const curPlan = get().plan;
     // §3.7 不变式 8：排序/方向变化 = 只换 ranking，plan.filter/mustNot/should 原样保留
     // （否则重建会把 AI 的嵌套 filter 树拍平成扁平字段，丢掉结构）。
     const onlySort = Object.keys(patch).every((k) => k === "sortBy" || k === "sortDir");
     if (onlySort && curPlan) {
       const plan = { ...curPlan, ranking: fieldRanking(next.sortBy ?? "created_at", next.sortDir ?? "desc") };
-      set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1 });
+      set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1, aiLoading: false });
       useSelectionStore.getState().clear();
       scheduleRefresh(get().refresh);
       return;
     }
-    // §3.7：plan 唯一事实源 —— 扁平条件经 resolvedQueryToPlan 重建 plan；
-    // 不变式 1：手工改条件不清 AI 的优先项（should 原样保留）。
-    const rebuilt = resolvedQueryToPlan(next);
-    const plan = curPlan && curPlan.should.length > 0
-      ? normalizeSearchPlan({ ...rebuilt, should: curPlan.should, minimumShouldMatch: 0 })
-      : rebuilt;
+    // §3.7：plan 是唯一事实源。扁平字段修改只替换对应类型的叶子，
+    // 保留 AI 生成的复杂布尔树、mustNot 和 should，不再整棵重建覆盖。
+    const plan = curPlan
+      ? maybeNullPlan(patchExistingPlan(curPlan, prev, next, patch))
+      : maybeNullPlan(resolvedQueryToPlan(next));
+    const query = syncQueryFromExpr(
+      { ...defaultQuery(), sortBy: next.sortBy, sortDir: next.sortDir },
+      plan?.filter ?? undefined,
+    );
     const resolvedTags = filterResolvedTagsByPlan(get().resolvedTags, plan);
-    set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
+    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -289,6 +419,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const currentExpr = cur.expr;
     if ((!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr))) return;
     invalidatePendingRequests();
+    invalidateAiRequests();
     // §3.7 不变式 1：只动 plan.filter；should/mustNot/ranking 原样保留
     const curPlan = cur.plan;
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
@@ -306,11 +437,13 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const curMustNot = curPlan?.mustNot ?? null;
     if ((!expr && !curMustNot) || (expr && curMustNot && serializeExpr(expr) === serializeExpr(curMustNot))) return;
     invalidatePendingRequests();
+    invalidateAiRequests();
     // 无 plan 时从当前 filter 起一个最小 plan（纯排除条件也可独立成 plan）
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
     const plan = maybeNullPlan(normalizeSearchPlan({ ...base, mustNot: expr ?? null }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, plan);
-    set({ plan, expr: plan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags });
+    const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, plan?.filter ?? undefined);
+    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -323,6 +456,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const sameExpr = (!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr));
     if (queryEqual(prev, query) && sameExpr) return;
     invalidatePendingRequests();
+    invalidateAiRequests();
     // 换源：expr 优先作为 plan.filter；否则扁平条件重建 plan（should 不跨 replace 保留）
     const plan = expr
       ? { ...minimalPlanFrom({ expr, query }), filter: expr, ranking: fieldRanking(query.sortBy ?? "created_at", query.sortDir ?? "desc") }
@@ -332,33 +466,37 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     scheduleRefresh(get().refresh);
   },
 
-  setAiInput: (v) =>
-    set((s) =>
-      v === s.aiInput
-        ? {}
-        : { aiInput: v, aiError: null, aiExplanation: null, warnings: [] },
-    ),
+  setAiInput: (v) => {
+    if (v === get().aiInput) return;
+    // 输入框是新的用户意图：旧解析即使稍后返回，也不能覆盖正在编辑的文本。
+    invalidateAiRequests();
+    set({ aiInput: v, aiError: null, aiExplanation: null, warnings: [], parseStatus: null, aiLoading: false });
+  },
   setAiResult: (explanation, warnings) =>
     set({ aiExplanation: explanation, warnings, parseStatus: warnings.length > 0 ? "partial" : "full" }),
-  clearAiResult: () =>
-    set({ aiExplanation: null, warnings: [], parseStatus: null, resolvedTags: [], aiError: null }),
+  clearAiResult: () => {
+    invalidateAiRequests();
+    set({ aiExplanation: null, warnings: [], parseStatus: null, resolvedTags: [], aiError: null, aiLoading: false });
+  },
 
   applyAiSearch: async (text, mode = "replace") => {
-    const aiSeq = ++requestSeq;
+    const aiSeq = ++aiRequestSeq;
     const cur = get().query;
     set({ aiLoading: true, aiError: null });
     try {
       const result = await aiParseSearchQuery(text);
-      if (aiSeq !== requestSeq) return;
+      if (aiSeq !== aiRequestSeq) return;
+      // AI 结果即将替换执行计划：让在途列表响应失效，避免旧结果回写覆盖新计划。
+      invalidatePendingRequests();
       // §3.7：AI 返回的 expr 摄入时即丢弃（改用 plan 的 filter/mustNot 区，避免排除双算）
-     const aiPlan = normalizeSearchPlan(result.plan ?? planFromParseResult(result.expr, result.sortBy, result.sortDir));
+      const aiPlan = normalizeSearchPlan(result.plan ?? planFromParseResult(result.expr, result.sortBy, result.sortDir));
       let nextExpr: QueryExpr | undefined;
       let nextPlan: SearchPlanV3 | null;
       let nextQuery: ResolvedSearchQuery;
       let nextResolvedTags: ResolvedTag[];
       let aiWarnings: string[] = result.warnings;
       if (mode === "replace") {
-       nextPlan = normalizeSearchPlan(aiPlan);
+        nextPlan = normalizeSearchPlan(aiPlan);
         nextExpr = aiPlan.filter ?? undefined;
         // query 只同步 sortBy/sortDir，不从复杂 plan 反推扁平条件（§9.6）
         nextQuery = { ...defaultQuery(), sortBy: result.sortBy, sortDir: result.sortDir };
@@ -367,7 +505,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         // §4.8：append 按表逐字段合并 plan（filter AND / mustNot OR / should 拼接 / ranking+retrievers 保留用户）
         const basePlan = get().plan ?? resolvedQueryToPlan(cur);
         const merged = appendPlanMerge(basePlan, aiPlan);
-         nextPlan = normalizeSearchPlan(merged.plan);
+        nextPlan = normalizeSearchPlan(merged.plan);
         nextExpr = merged.plan.filter ?? undefined;
         nextQuery = cur; // append 不改用户排序（§4.8）
         nextResolvedTags = mergeResolvedTags(get().resolvedTags, result.resolvedTags);
@@ -387,7 +525,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       useSelectionStore.getState().clear();
       scheduleRefresh(get().refresh);
     } catch (e) {
-      if (aiSeq !== requestSeq) return;
+      if (aiSeq !== aiRequestSeq) return;
       // §9.7：AI 解析失败只设 aiError；保留当前 query/expr/items/total，不触发 refresh
       set({ aiLoading: false, aiError: e instanceof Error ? e.message : String(e) });
     }
@@ -405,18 +543,28 @@ export const useSuperSearchStore = create<SuperSearchState>()(
 
   removeExprAtPath: (path) => get().removeAtZonePath("filter", path),
 
-  /** S5 5-4：零结果建议「试试相近的词：X」可点 —— 点击才把词查 leaf AND 进必须区。
+  /** S5 5-4：零结果建议「试试相近的词：X」可点 —— 点击才替换失败的按词查 leaf。
    *  后端建议只是提示（不改写）；此处是用户显式动作的落点。 */
-  applyTermSuggestion: (term, match) => {
-    const t = term.trim();
-    if (!t) return;
+  applyTermSuggestion: (sourceTerm, term, match) => {
+    const source = sourceTerm.trim();
+    const replacement = term.trim();
+    if (!replacement) return;
     const cur = get();
+    const current = cur.plan?.filter ?? cur.expr;
     const node: QueryExpr = {
       op: "leaf",
-      cond: { type: "tag", facetKey: "", tagIds: [], mode: "any", includeDescendants: true, termQuery: t, termMatch: match },
+      cond: { type: "tag", facetKey: "", tagIds: [], mode: "any", includeDescendants: true, termQuery: replacement, termMatch: match },
     };
-    const merged = normalizeExpr(mergeQueryExpr(cur.plan?.filter ?? cur.expr ?? undefined, node) as QueryExpr);
-    cur.setPlanFilter(merged);
+    if (current && source) {
+      const replaced = replaceFirstTermLeaf(current, source, replacement, match);
+      if (replaced.replaced) {
+        cur.setPlanFilter(replaced.expr);
+        return;
+      }
+    }
+    // 兼容没有原始失败叶子的旧 warning 或手工点击路径：追加而不覆盖现有条件。
+    const merged = mergeQueryExpr(current, node);
+    cur.setPlanFilter(merged ? normalizeExpr(merged) : undefined);
   },
 
   removePlanFilterAt: (path) => {
@@ -443,6 +591,19 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     let mustNot = plan.mustNot;
     let should = plan.should;
     let min = plan.minimumShouldMatch;
+    if (to === "should" && from !== "should" && should.length >= MAX_SHOULD_CLAUSES) {
+      set((state) => ({
+        executionWarnings: [
+          ...state.executionWarnings,
+          {
+            source: "plan",
+            zone: "should",
+            message: `优先条件已达到上限（${MAX_SHOULD_CLAUSES} 条），未移动该条件。`,
+          },
+        ],
+      }));
+      return;
+    }
     if (from === "should") {
       // 优先区按 index 取整条加分项（叶子）
       const idx = typeof path === "number" ? path : Number(path[0]);
@@ -475,9 +636,12 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       should = [...should, { cond: node.cond, weight: 1, label: "", evidence: null }].slice(0, 12);
       min = should.length ? min : 0;
     }
-     const nextPlan = maybeNullPlan(normalizeSearchPlan({ ...plan, filter, mustNot, should, minimumShouldMatch: min }));
+    const nextPlan = maybeNullPlan(normalizeSearchPlan({ ...plan, filter, mustNot, should, minimumShouldMatch: min }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, nextPlan);
-    set({ plan: nextPlan, expr: nextPlan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags });
+    invalidateAiRequests();
+    const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, nextPlan?.filter ?? undefined);
+    invalidatePendingRequests();
+    set({ query, plan: nextPlan, expr: nextPlan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -495,11 +659,17 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   setPlanShould: (should, _minimumShouldMatch) => {
     const cur = get();
     if (!cur.plan && should.length === 0) return; // 没有 plan 也没有加分项：无事可做
-  const clamped = 0;
+    const clamped = 0;
     // U-5：手动条件首次加分时，从当前 expr/query 起一个最小 plan（filter 单源镜像）
     const plan: SearchPlanV3 = cur.plan ?? minimalPlanFrom(cur);
-     const next = maybeNullPlan(normalizeSearchPlan({ ...plan, should, minimumShouldMatch: clamped }));
-    set({ plan: next, planRevision: cur.planRevision + 1 });
+    const next = maybeNullPlan(normalizeSearchPlan({ ...plan, should, minimumShouldMatch: clamped }));
+    const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, next?.filter ?? undefined);
+    const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, next);
+    invalidatePendingRequests();
+    invalidateAiRequests();
+    set({ query, plan: next, expr: next?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
+    useSelectionStore.getState().clear();
+    scheduleRefresh(get().refresh);
   },
 
   removePlanShould: (index) => {
@@ -517,6 +687,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
 
   clearConditions: () => {
     invalidatePendingRequests();
+    invalidateAiRequests();
     const def = defaultQuery();
     set({ query: def, expr: undefined, plan: null, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
     useSelectionStore.getState().clear();
@@ -524,7 +695,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   },
 
   refresh: async () => {
-    const seq = ++requestSeq;
+    const seq = ++listRequestSeq;
     const { query, plan } = get();
     // B7：执行 warning 生命周期 = 每次 refresh（请求开始清空、响应写入）
     set({ loading: true, error: null, executionWarnings: [] });
@@ -532,10 +703,10 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       // §3.7：列表执行一律走 plan（空条件时由扁平 query 派生空 plan）—— 单一编译器
       const execPlan = plan ?? resolvedQueryToPlan(query);
       const page = await listSuperAssets(query, 0, PAGE_SIZE, execPlan);
-      if (seq !== requestSeq) return;
+      if (seq !== listRequestSeq) return;
       set({ items: dedupItems(page.items), total: page.total, loading: false, executionWarnings: normalizeWarnings(page.warnings) });
     } catch (e) {
-      if (seq !== requestSeq) return;
+      if (seq !== listRequestSeq) return;
       set({ error: e instanceof Error ? e.message : String(e), loading: false });
     }
   },
@@ -543,12 +714,12 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   loadMore: async () => {
     const { items, total, loading, query, plan } = get();
     if (loading || items.length >= total) return;
-    const seq = ++requestSeq;
+    const seq = ++listRequestSeq;
     set({ loading: true });
     try {
       const execPlan = plan ?? resolvedQueryToPlan(query);
       const page = await listSuperAssets(query, items.length, PAGE_SIZE, execPlan);
-      if (seq !== requestSeq) return;
+      if (seq !== listRequestSeq) return;
       const known = new Set(items.map((a) => a.id));
       set({
         items: [...items, ...page.items.filter((a) => !known.has(a.id))],
@@ -557,7 +728,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         executionWarnings: normalizeWarnings(page.warnings),
       });
     } catch (e) {
-      if (seq !== requestSeq) return;
+      if (seq !== listRequestSeq) return;
       set({ error: e instanceof Error ? e.message : String(e), loading: false });
     }
   },
@@ -592,10 +763,20 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   //（SuperSearchPage 的 query.search.trim()；onRehydrateStorage 补全来不及在首帧前生效）。
   merge: (persisted, current) => {
     const p = persisted as { plan?: SearchPlanV3 | null; query?: Partial<ResolvedSearchQuery> } | null;
+    const migratedPlan = p?.plan ? migratePlanV3(p.plan) : null;
+    const futurePlanWasDiscarded = Boolean(p?.plan && !migratedPlan);
+    const futureWarning: SearchWarning = {
+      source: "plan",
+      message: "保存的搜索条件来自更新版本，已重置搜索条件。",
+    };
     return {
       ...current,
-      plan: p?.plan ? migratePlanV3(p.plan) : null,
+      plan: migratedPlan,
+      expr: migratedPlan?.filter ?? undefined,
       query: { ...defaultQuery(), ...(p?.query ?? {}) },
+      executionWarnings: futurePlanWasDiscarded && !current.executionWarnings.some((w) => w.message === futureWarning.message)
+        ? [...current.executionWarnings, futureWarning]
+        : current.executionWarnings,
     } as typeof current;
   },
   partialize: (state) => ({
@@ -623,37 +804,21 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         ranking: fieldRanking(p.query?.sortBy ?? "created_at", p.query?.sortDir ?? "desc"),
       };
     }
-    if (plan) {
-      const migrated = migratePlanV3(plan);
-      plan = migrated;
-    }
+    // 版本判断统一放在 merge：这样未来版本 plan 仍能被识别并产生一次用户 warning，
+    // 不会在 migrate 阶段先变成 null 而丢掉提示。
     return {
       plan,
       query: { sortBy: p?.query?.sortBy ?? "created_at", sortDir: p?.query?.sortDir ?? "desc" },
     } as never;
   },
-  // §4.4（B5 v3）：hydrate 无条件跑一次 migratePlanV3 —— 用户装了新版本又回退旧版本时，
-  // localStorage 里的未来版本 plan 必须丢弃（带提示）而不是照常执行；同时恢复 expr=plan.filter。
+  // hydrate 只补齐兼容 query/expr；plan 的迁移和未来版本 warning 已在 merge 原子完成。
   onRehydrateStorage: () => (state) => {
     const p = state as { plan?: SearchPlanV3 | null; query?: Partial<ResolvedSearchQuery> } | undefined;
     const def = defaultQuery();
     useSuperSearchStore.setState({
       query: { ...def, sortBy: p?.query?.sortBy ?? def.sortBy, sortDir: p?.query?.sortDir ?? def.sortDir },
     });
-    if (!p?.plan) return;
-    const migrated = migratePlanV3(p.plan);
-    if (!migrated) {
-      useSuperSearchStore.setState((s) => ({
-        plan: null,
-        expr: undefined,
-        executionWarnings: [
-          ...s.executionWarnings,
-          { source: "plan", message: "保存的搜索条件来自更新版本，已重置搜索条件。" },
-        ],
-      }));
-    } else {
-      useSuperSearchStore.setState({ plan: migrated, expr: migrated.filter ?? undefined });
-    }
+    useSuperSearchStore.setState({ expr: p?.plan?.filter ?? undefined });
   },
 },
   ),

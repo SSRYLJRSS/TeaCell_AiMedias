@@ -47,6 +47,8 @@ export interface ImportPlanItem {
   path: string;
   kind: "image" | "video";
   size: number;
+  previewStatus: "ready" | "limited" | "unsupported";
+  previewMessage?: string;
 }
 
 export interface ImportPlan {

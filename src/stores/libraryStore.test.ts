@@ -335,6 +335,20 @@ describe("W5h-d kinship 合并显示", () => {
     expect(merged.map((a) => a.id)).toEqual([1, 3]);
   });
 
+  it("不折叠大小写不同的 Unix 目录", async () => {
+    const upperDir = mkAsset(4, "/photos/A/X.RW2");
+    const lowerDir = mkAsset(5, "/photos/a/X.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    expect(collapseKinship([upperDir, lowerDir]).map((a) => a.id)).toEqual([4, 5]);
+  });
+
+  it("保留 Unix 文件名中的反斜杠", async () => {
+    const raw = mkAsset(6, "/home/a\\b.RW2");
+    const jpg = mkAsset(7, "/home/a\\b.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    expect(collapseKinship([raw, jpg]).map((a) => a.id)).toEqual([7]);
+  });
+
   it("RAW 在前时 JPG 仍为代表", async () => {
     const raw = mkAsset(1, "d:/all/A.RW2");
     const jpg = mkAsset(2, "d:/all/A.JPG");

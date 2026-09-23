@@ -19,6 +19,9 @@ use crate::db::{
     assets,
     settings::{AiSettings, ApiProfile},
 };
+use crate::services::ai_rate_limit::{self, AiRateLimiter};
+use crate::services::imaging::{self, AiImagePayload};
+use crate::services::ollama_runtime;
 
 /// A2：提示词版本（手工维护常量）—— 改提示词时必须递增，随 request_config 一起落库溯源。
 pub const PROMPT_VERSION: &str = "tagging-v2.1-2026-09";
@@ -26,6 +29,41 @@ pub const ANALYSIS_SCHEMA_VERSION: i64 = 2;
 pub const MIN_DESCRIPTION_CHARS: usize = 12;
 pub const MAX_DESCRIPTION_CHARS: usize = 30;
 pub const DEFAULT_CONFIDENCE_MIN_SUGGEST: f64 = 0.30;
+
+/// 产品层的打标传输边界：只有 Windows 上由应用管理的默认 Ollama 才属于“本地打标”。
+/// 其他 localhost、局域网地址或自定义 Ollama 都按外部 API 处理，不触发 Ollama 生命周期
+/// 和扩展字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisionTransport {
+    ManagedWindowsOllama,
+    ExternalOpenAi,
+    ExternalAnthropic,
+}
+
+pub fn is_managed_ollama_profile(profile: &ApiProfile) -> bool {
+    cfg!(target_os = "windows")
+        && profile.api_mode == "openai"
+        && profile.is_local()
+        && ollama_runtime::is_managed_ollama_base(&profile.base_url)
+}
+
+fn vision_transport(profile: &ApiProfile) -> VisionTransport {
+    if profile.api_mode == "anthropic" {
+        VisionTransport::ExternalAnthropic
+    } else if is_managed_ollama_profile(profile) {
+        VisionTransport::ManagedWindowsOllama
+    } else {
+        VisionTransport::ExternalOpenAi
+    }
+}
+
+fn vision_transport_name(transport: VisionTransport) -> &'static str {
+    match transport {
+        VisionTransport::ManagedWindowsOllama => "managed_windows_ollama",
+        VisionTransport::ExternalOpenAi => "external_openai_compatible",
+        VisionTransport::ExternalAnthropic => "external_anthropic",
+    }
+}
 
 /// A2：请求配置的稳定序列化（递归按键排序）后 sha256 前 16 位 hex。
 /// 同输入同 hash、改任一项则变（request_config_hash_is_stable 守护）。
@@ -66,6 +104,33 @@ pub fn build_batch_request_config(
     json_tier: TextJsonTier,
     min_confidence: f64,
 ) -> serde_json::Value {
+    build_batch_request_config_with_image_max(
+        system_prompt,
+        facets,
+        top_tags,
+        model,
+        media_kind,
+        max_tokens,
+        is_local,
+        json_tier,
+        min_confidence,
+        imaging::AI_IMAGE_MAX_PX,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_batch_request_config_with_image_max(
+    system_prompt: &str,
+    facets: &[FacetPromptContext],
+    top_tags: &[(String, String)],
+    model: &str,
+    media_kind: &str,
+    max_tokens: i64,
+    managed_ollama: bool,
+    json_tier: TextJsonTier,
+    min_confidence: f64,
+    image_max_px: u32,
+) -> serde_json::Value {
     let facet_items: Vec<serde_json::Value> = facets
         .iter()
         .map(|f| {
@@ -88,8 +153,8 @@ pub fn build_batch_request_config(
         .iter()
         .map(|(facet, words)| serde_json::json!({ "facet": facet, "words": words }))
         .collect();
-    // modelParams 忠实记录实际发出的请求：response_format json_object 与 keep_alive
-    // 仅本地档案会附加（见 request_analysis 两个协议分支），云端按服务商而定不记录。
+    // modelParams 记录影响结果的请求参数；本地档案还会关闭思考模式，避免思考 token
+    // 吃满输出预算后只返回 message.thinking、把最终 content 留空。
     let tier = match json_tier {
         TextJsonTier::Structured => "structured",
         TextJsonTier::JsonObject => "json_object",
@@ -100,8 +165,9 @@ pub fn build_batch_request_config(
         "maxTokens": max_tokens,
         "jsonTier": tier
     });
-    if is_local {
-        model_params["keepAlive"] = serde_json::json!("5m");
+    if managed_ollama {
+        model_params["keepAlive"] = serde_json::json!(KEEP_ALIVE_IDLE);
+        model_params["thinkingDisabled"] = serde_json::json!(true);
     }
     serde_json::json!({
         "promptVersion": PROMPT_VERSION,
@@ -111,7 +177,12 @@ pub fn build_batch_request_config(
         "modelParams": model_params,
         "minConfidence": min_confidence,
         "mediaKind": media_kind,
-        "imagePreprocess": { "maxPx": 1024, "format": "jpeg", "quality": 85 },
+        "imagePreprocess": {
+            "maxPx": image_max_px,
+            "fallbackMaxPx": imaging::AI_IMAGE_FALLBACK_MAX_PX,
+            "format": "jpeg",
+            "quality": imaging::AI_JPEG_QUALITY,
+        },
     })
 }
 use crate::error::{AppError, AppResult};
@@ -132,9 +203,73 @@ fn http_status_from_message(message: &str) -> Option<u16> {
     (100..=599).contains(&status).then_some(status)
 }
 
+fn is_ai_rate_limited(error: &AppError) -> bool {
+    error.code() == "AI_RATE_LIMITED"
+}
+
 /// HTTP 状态错误只保留服务名、状态码和稳定建议，不回显响应体，
 /// 避免把模型原文或凭据带进结构化日志。
+#[cfg(test)]
 fn ai_http_status_error(service: &str, status: u16) -> AppError {
+    ai_http_status_error_with_body(service, status, "")
+}
+
+/// 从服务商错误 JSON 中提取有限长度的公开错误说明。
+/// 默认只保留上下文/格式类诊断；限流错误另外允许保留服务商的 RPM/配额提示，
+/// 但仍会脱敏并截断，避免模型原文、凭据或代理诊断信息进入用户错误和日志。
+fn safe_http_detail(body: &str) -> Option<String> {
+    safe_http_detail_with_plain_text(body, false)
+}
+
+fn safe_http_rate_limit_detail(body: &str) -> Option<String> {
+    safe_http_detail_with_plain_text(body, true)
+}
+
+fn safe_http_detail_with_plain_text(body: &str, allow_plain_text: bool) -> Option<String> {
+    let detail = if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let candidate = value
+            .pointer("/error/message")
+            .or_else(|| value.pointer("/error/code"))
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("error"))?;
+        candidate
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| candidate.as_object().map(|_| candidate.to_string()))?
+    } else {
+        let text = body.trim();
+        let lower = text.to_ascii_lowercase();
+        if text.is_empty()
+            || text.len() > 240
+            || (!allow_plain_text
+                && !(lower.contains("context")
+                    || lower.contains("token")
+                    || lower.contains("prompt is too long")
+                    || lower.contains("input too long")
+                    || lower.contains("上下文")
+                    || lower.contains("令牌")))
+        {
+            return None;
+        }
+        text.to_string()
+    };
+    let detail = crate::observability::redact_secrets(detail.trim());
+    let detail = detail.trim();
+    if detail.is_empty() || detail.len() > 240 {
+        return None;
+    }
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("api_key")
+        || lower.contains("authorization")
+        || lower.contains("bearer ")
+        || lower.contains("sk-")
+    {
+        return None;
+    }
+    Some(detail.to_string())
+}
+
+fn ai_http_status_error_with_body(service: &str, status: u16, body: &str) -> AppError {
     let message = match status {
         401 | 403 => format!("{service}鉴权失败（HTTP {status}），请检查 API Key 和访问权限"),
         408 => format!("{service}请求超时（HTTP {status}）"),
@@ -142,6 +277,14 @@ fn ai_http_status_error(service: &str, status: u16) -> AppError {
         500..=599 => format!("{service}服务异常（HTTP {status}），请稍后重试"),
         _ => format!("{service}返回 HTTP {status}"),
     };
+    let detail = if status == 429 {
+        safe_http_rate_limit_detail(body)
+    } else {
+        safe_http_detail(body)
+    };
+    let message = detail
+        .map(|detail| format!("{message}：{detail}"))
+        .unwrap_or(message);
     match status {
         401 | 403 => AppError::unauthorized(message),
         408 => AppError::timeout(message),
@@ -154,9 +297,9 @@ fn vision_transport_error(service: &str, error: reqwest::Error, cfg: &ApiProfile
     if error.is_timeout() {
         return AppError::timeout(format!("{service}请求超时，请检查网络或服务状态"));
     }
-    if cfg.is_local() {
+    if is_managed_ollama_profile(cfg) {
         AppError::internal(format!(
-            "无法连接本地服务 {}：请确认 Ollama/LM Studio 已启动，或在设置页切回云端档案: {error}",
+            "无法连接应用管理的 Ollama {}：请确认本地服务已启动: {error}",
             cfg.base_url
         ))
     } else {
@@ -575,12 +718,11 @@ fn unload_ollama_model(cfg: &ApiProfile) {
     }
 }
 
-/// §8.4：本地（Ollama 原生兼容）请求体统一注入 keep_alive，不依赖服务器默认值。
-/// - 仅本地档案注入（云端服务商不接受未知字段）；
-/// - 值默认 2m（与服务级 OLLAMA_KEEP_ALIVE 一致；连续批次由 lease 延长是 L3 目标态）。
-/// - /v1 兼容端点不保证支持该字段 → 这里注入但不依赖其生效；卸载走原生根地址（见 unload_ollama_model）。
-fn apply_keep_alive(body: &mut serde_json::Value, is_local: bool) {
-    if is_local {
+/// §8.4：只有应用管理的 Windows Ollama 原生请求才注入 keep_alive。
+/// 自定义 localhost/局域网服务即使使用 OpenAI 兼容协议，也不得收到 Ollama 扩展字段。
+#[cfg(test)]
+fn apply_keep_alive(body: &mut serde_json::Value, managed_ollama: bool) {
+    if managed_ollama {
         body["keep_alive"] = serde_json::json!(KEEP_ALIVE_IDLE);
     }
 }
@@ -1087,7 +1229,32 @@ pub fn parse_media_analysis(
 
 fn vision_request_should_fallback(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    !lower.contains("无法连接")
+    if lower.contains("http 429")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("请求过于频繁")
+        || lower.contains("请求频率受限")
+    {
+        return false;
+    }
+    let structured_compatibility = lower.contains("response_format")
+        || lower.contains("json_schema")
+        || lower.contains("json schema")
+        || lower.contains("structured output")
+        || lower.contains("structured_outputs")
+        || lower.contains("tool_choice")
+        || ((lower.contains("format") || lower.contains("格式"))
+            && (lower.contains("unsupported")
+                || lower.contains("not support")
+                || lower.contains("不支持")
+                || lower.contains("格式")));
+    let extension_field_compatibility = (lower.contains("unknown field")
+        || lower.contains("unrecognized field")
+        || lower.contains("unsupported parameter")
+        || lower.contains("invalid parameter"))
+        && (lower.contains("think") || lower.contains("format"));
+    !is_context_overflow_message(message)
+        && !lower.contains("无法连接")
         && !lower.contains("connect")
         && !lower.contains("timed out")
         && !lower.contains("timeout")
@@ -1097,6 +1264,50 @@ fn vision_request_should_fallback(message: &str) -> bool {
         && !lower.contains("forbidden")
         && !lower.contains("api key")
         && !lower.contains("authentication")
+        && !lower.contains("未返回最终内容")
+        && !lower.contains("returned empty content")
+        && (structured_compatibility || extension_field_compatibility)
+}
+
+fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context length")
+        || lower.contains("context window")
+        || lower.contains("maximum context")
+        || lower.contains("context limit")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("input tokens") && lower.contains("max")
+        || lower.contains("上下文") && (lower.contains("超") || lower.contains("过长"))
+        || lower.contains("令牌") && (lower.contains("超") || lower.contains("过长"))
+}
+
+fn openai_message_content(value: &serde_json::Value, managed_ollama: bool) -> AppResult<String> {
+    let message = &value["choices"][0]["message"];
+    let content = message["content"]
+        .as_str()
+        .ok_or_else(|| AppError::msg("服务未返回可选内容（choices 为空或 content 缺失）"))?;
+    if !content.trim().is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let reasoning_len = message
+        .get("reasoning")
+        .or_else(|| message.get("thinking"))
+        .and_then(|item| item.as_str())
+        .map(|item| item.chars().count())
+        .unwrap_or(0);
+    let finish_reason = value["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap_or("unknown");
+    let action = if managed_ollama {
+        "请检查 Ollama 的思考设置或输出 token 限制"
+    } else {
+        "请检查模型输出设置和 token 限制"
+    };
+    Err(AppError::msg(format!(
+        "服务未返回最终内容（returned empty content；finish_reason={finish_reason}，reasoning_chars={reasoning_len}）。{action}"
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1110,6 +1321,8 @@ fn openai_vision_request(
     max_tokens: i64,
     tier: TextJsonTier,
     schema: &serde_json::Value,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<String> {
     let mut body = serde_json::json!({
         "model": cfg.model,
@@ -1134,7 +1347,9 @@ fn openai_vision_request(
     } else if tier == TextJsonTier::JsonObject {
         body["response_format"] = serde_json::json!({ "type": "json_object" });
     }
-    apply_keep_alive(&mut body, cfg.is_local());
+    let _permit = limiter
+        .map(|rate_limiter| rate_limiter.acquire(cancel))
+        .transpose()?;
     let response = if cfg.api_key.trim().is_empty() {
         client
             .post(format!(
@@ -1156,22 +1371,52 @@ fn openai_vision_request(
     .map_err(|e| vision_transport_error("视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(ai_http_status_error("视觉请求", status.as_u16()));
+        let status_code = status.as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(ai_http_status_error_with_body(
+            "视觉请求",
+            status_code,
+            &body,
+        ));
     }
     let value: serde_json::Value = response
         .json()
         .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
-    value["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| {
-            AppError::msg(format!(
-                "服务未返回可选内容（choices 为空）。原始响应：{}",
-                value.to_string().chars().take(300).collect::<String>()
-            ))
-        })
+    openai_message_content(&value, is_managed_ollama_profile(cfg))
 }
 
+fn ollama_message_content(value: &serde_json::Value) -> AppResult<String> {
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| AppError::msg("Ollama 返回缺少 message"))?;
+    let content = message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::msg("Ollama 返回缺少 message.content"))?;
+    if !content.trim().is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let thinking_len = message
+        .get("thinking")
+        .and_then(serde_json::Value::as_str)
+        .map(|item| item.chars().count())
+        .unwrap_or(0);
+    let done_reason = value
+        .get("done_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let eval_count = value
+        .get("eval_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    Err(AppError::msg(format!(
+        "Ollama 未返回最终内容（done_reason={done_reason}，thinking_chars={thinking_len}，eval_count={eval_count}）。思考输出可能耗尽了生成预算，请升级 Ollama 后重试"
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ollama_native_vision_request(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
@@ -1180,12 +1425,17 @@ fn ollama_native_vision_request(
     b64: &str,
     max_tokens: i64,
     schema: &serde_json::Value,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<String> {
     let base = cfg.base_url.trim_end_matches('/');
     let root = base.strip_suffix("/v1").unwrap_or(base);
     let body = serde_json::json!({
         "model": cfg.model,
         "stream": false,
+        // 打标需要短而确定的 JSON，不消费 token 生成独立思考轨迹。Ollama 对不支持
+        // thinking 的模型会忽略 false；支持 thinking 的模型会直接生成最终 content。
+        "think": false,
         "format": schema,
         "messages": [
             { "role": "system", "content": system },
@@ -1197,6 +1447,9 @@ fn ollama_native_vision_request(
         },
         "keep_alive": KEEP_ALIVE_IDLE
     });
+    let _permit = limiter
+        .map(|rate_limiter| rate_limiter.acquire(cancel))
+        .transpose()?;
     let response = client
         .post(format!("{root}/api/chat"))
         .json(&body)
@@ -1204,7 +1457,13 @@ fn ollama_native_vision_request(
         .map_err(|e| vision_transport_error("Ollama 视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(ai_http_status_error("Ollama 视觉请求", status.as_u16()));
+        let status_code = status.as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(ai_http_status_error_with_body(
+            "Ollama 视觉请求",
+            status_code,
+            &body,
+        ));
     }
     let raw = response
         .text()
@@ -1215,10 +1474,7 @@ fn ollama_native_vision_request(
             raw.chars().take(300).collect::<String>()
         ))
     })?;
-    value["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| AppError::msg("Ollama 返回缺少 message.content"))
+    ollama_message_content(&value)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1232,6 +1488,8 @@ fn anthropic_vision_request(
     max_tokens: i64,
     tier: TextJsonTier,
     schema: &serde_json::Value,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<String> {
     let mut body = serde_json::json!({
         "model": cfg.model,
@@ -1257,6 +1515,9 @@ fn anthropic_vision_request(
             "name": "emit_image_analysis"
         });
     }
+    let _permit = limiter
+        .map(|rate_limiter| rate_limiter.acquire(cancel))
+        .transpose()?;
     let response = client
         .post(format!("{}/messages", cfg.base_url.trim_end_matches('/')))
         .header("x-api-key", &cfg.api_key)
@@ -1266,7 +1527,13 @@ fn anthropic_vision_request(
         .map_err(|e| vision_transport_error("Anthropic 视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(ai_http_status_error("Anthropic 视觉请求", status.as_u16()));
+        let status_code = status.as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(ai_http_status_error_with_body(
+            "Anthropic 视觉请求",
+            status_code,
+            &body,
+        ));
     }
     let value: serde_json::Value = response
         .json()
@@ -1311,21 +1578,26 @@ fn request_analysis(
     min_confidence: f64,
     repair_empty_subject: bool,
     tier_cache: &Cell<TextJsonTier>,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<MediaAnalysis> {
-    let bytes = std::fs::read(image_path)?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    // MIME 按扩展名判定：高清/占位缩略图均为 .webp，误标 jpeg 会被严格的服务商拒绝
-    let mime = match image_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        _ => "image/jpeg",
+    let prepare_image = |max_px: u32| {
+        imaging::encode_ai_image(image_path, max_px).ok_or_else(|| {
+            let extension = image_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unknown");
+            let cause = if image_path.exists() {
+                "格式不受支持、文件损坏或对应解码器不可用"
+            } else {
+                "文件不存在或路径已失效"
+            };
+            AppError::unsupported(format!("无法解码素材图片（扩展名 .{extension}）：{cause}"))
+        })
     };
+    let mut image_payload = prepare_image(imaging::AI_IMAGE_MAX_PX)?;
+    let mime = "image/jpeg";
 
     // system prompt 可由用户完整替换；JSON Schema 始终在请求层附加，不能被提示词关闭。
     let system = if system_override.trim().is_empty() {
@@ -1338,18 +1610,24 @@ fn request_analysis(
     let schema = tagging_schema(facets);
     let initial_tier = tier_cache.get();
 
-    let send = |tier: TextJsonTier, prompt: &str| -> AppResult<String> {
-        if cfg.api_mode == "anthropic" {
+    let transport = vision_transport(cfg);
+    let send = |payload: &AiImagePayload, tier: TextJsonTier, prompt: &str| -> AppResult<String> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload.bytes);
+        if transport == VisionTransport::ExternalAnthropic {
             return anthropic_vision_request(
-                client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema,
+                client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema, limiter,
+                cancel,
             );
         }
-        if cfg.is_local() && tier == TextJsonTier::Structured {
+        if transport == VisionTransport::ManagedWindowsOllama && tier == TextJsonTier::Structured {
             match ollama_native_vision_request(
-                client, cfg, &system, prompt, &b64, max_tokens, &schema,
+                client, cfg, &system, prompt, &b64, max_tokens, &schema, limiter, cancel,
             ) {
                 Ok(content) => return Ok(content),
                 Err(native_error) => {
+                    if !vision_request_should_fallback(&native_error.to_string()) {
+                        return Err(native_error);
+                    }
                     tracing::warn!(
                         operation = "ai_tagging",
                         stage = "native_structured_fallback",
@@ -1358,68 +1636,86 @@ fn request_analysis(
                     );
                     return openai_vision_request(
                         client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema,
+                        limiter, cancel,
                     )
-                    .map_err(|compat_error| {
-                        AppError::msg(format!(
-                            "Ollama 原生结构化请求失败：{native_error}；兼容接口回退失败：{compat_error}"
-                        ))
-                    });
+                    .map_err(|compat_error| AppError::msg(format!(
+                        "Ollama 原生结构化请求失败：{native_error}；兼容接口回退失败：{compat_error}"
+                    )));
                 }
             }
         }
         openai_vision_request(
-            client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema,
+            client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema, limiter, cancel,
         )
     };
 
-    let request_with_fallback =
-        |start: TextJsonTier, prompt: &str| -> AppResult<(TextJsonTier, String)> {
-            let tiers: &[TextJsonTier] = match start {
-                TextJsonTier::Structured => &[
-                    TextJsonTier::Structured,
-                    TextJsonTier::JsonObject,
-                    TextJsonTier::Plain,
-                ],
-                TextJsonTier::JsonObject => &[TextJsonTier::JsonObject, TextJsonTier::Plain],
-                TextJsonTier::Plain => &[TextJsonTier::Plain],
-            };
-            let mut last_error = None;
-            for tier in tiers {
-                match send(*tier, prompt) {
-                    Ok(content) => {
-                        tier_cache.set(*tier);
-                        return Ok((*tier, content));
+    let request_with_fallback = |payload: &AiImagePayload,
+                                 start: TextJsonTier,
+                                 prompt: &str|
+     -> AppResult<(TextJsonTier, String)> {
+        let tiers: &[TextJsonTier] = match start {
+            TextJsonTier::Structured => &[
+                TextJsonTier::Structured,
+                TextJsonTier::JsonObject,
+                TextJsonTier::Plain,
+            ],
+            TextJsonTier::JsonObject => &[TextJsonTier::JsonObject, TextJsonTier::Plain],
+            TextJsonTier::Plain => &[TextJsonTier::Plain],
+        };
+        let mut last_error = None;
+        for tier in tiers {
+            match send(payload, *tier, prompt) {
+                Ok(content) => {
+                    tier_cache.set(*tier);
+                    return Ok((*tier, content));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if !vision_request_should_fallback(&message) {
+                        return Err(error);
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        if !vision_request_should_fallback(&message) {
-                            return Err(error);
-                        }
-                        last_error = Some(message);
-                    }
+                    last_error = Some(message);
                 }
             }
-            Err(AppError::msg(format!(
-                "视觉结构化请求逐级降级后仍失败：{}",
-                last_error.unwrap_or_else(|| "未知错误".to_string())
-            )))
-        };
+        }
+        Err(AppError::msg(format!(
+            "视觉结构化请求逐级降级后仍失败：{}",
+            last_error.unwrap_or_else(|| "未知错误".to_string())
+        )))
+    };
 
-    let (mut used_tier, mut content) = request_with_fallback(initial_tier, &user)?;
+    let (mut used_tier, mut content) =
+        match request_with_fallback(&image_payload, initial_tier, &user) {
+            Ok(result) => result,
+            Err(error) if is_context_overflow_message(&error.to_string()) => {
+                tracing::warn!(
+                    operation = "ai_tagging",
+                    stage = "image_context_fallback",
+                    initial_max_px = image_payload.max_px,
+                    fallback_max_px = imaging::AI_IMAGE_FALLBACK_MAX_PX,
+                    error = %error,
+                    "模型上下文不足，降低 AI 图片尺寸后重试"
+                );
+                image_payload = prepare_image(imaging::AI_IMAGE_FALLBACK_MAX_PX)?;
+                request_with_fallback(&image_payload, initial_tier, &user)?
+            }
+            Err(error) => return Err(error),
+        };
     let enrich =
         |mut a: MediaAnalysis, used_content: String, tier: TextJsonTier| -> MediaAnalysis {
             a.raw_response = used_content;
             a.request_config_json = Some(
-                build_batch_request_config(
+                build_batch_request_config_with_image_max(
                     &system,
                     facets,
                     top_tags,
                     &cfg.model,
                     "image",
                     max_tokens,
-                    cfg.is_local(),
+                    is_managed_ollama_profile(cfg),
                     tier,
                     min_confidence,
+                    image_payload.max_px,
                 )
                 .to_string(),
             );
@@ -1485,7 +1781,7 @@ fn request_analysis(
             "{user}\n\n上一次输出不合格：{problems}\n上一次原始输出：{}\n请重新观察同一张图片，只返回完整的打标 V2 JSON。",
             content.chars().take(1200).collect::<String>()
         );
-        match request_with_fallback(used_tier, &repair_prompt) {
+        match request_with_fallback(&image_payload, used_tier, &repair_prompt) {
             Ok((tier, repaired)) => match parse_media_analysis(&repaired, facets, min_confidence) {
                 Ok(mut repaired_analysis) => {
                     let still_missing = missing_tag_facet_keys(&repaired_analysis, facets);
@@ -1575,7 +1871,7 @@ fn request_analysis(
             .push("subject 为空：未识别明确主体，已保留空值。".to_string());
     }
     if is_degenerate(&content) {
-        if cfg.is_local() {
+        if is_managed_ollama_profile(cfg) {
             unload_ollama_model(cfg);
         }
         let snippet: String = content.chars().take(120).collect();
@@ -1696,9 +1992,30 @@ pub enum TextJsonTier {
     Structured,
 }
 
+/// 读取 JSON 响应，并把非 2xx 状态映射成稳定的 AI 错误码与安全详情。
+fn response_json_or_error(
+    response: reqwest::blocking::Response,
+    service: &str,
+) -> AppResult<serde_json::Value> {
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| AppError::msg(format!("{service}响应读取失败: {error}")))?;
+    if !status.is_success() {
+        return Err(ai_http_status_error_with_body(
+            service,
+            status.as_u16(),
+            &body,
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| AppError::msg(format!("{service}响应解析失败: {error}")))
+}
+
 /// 发起一次纯文本 JSON 请求，返回模型文本回复。
 /// 统一 OpenAI 兼容与 Anthropic 两种协议；不解析语义，由调用方校验。
 /// structured_schema 仅在 Tier::Structured 下使用（OpenAI json_schema 或 Anthropic tool input_schema）。
+#[allow(clippy::too_many_arguments)]
 fn request_text_raw(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
@@ -1706,15 +2023,20 @@ fn request_text_raw(
     user: &str,
     tier: TextJsonTier,
     structured_schema: Option<serde_json::Value>,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<String> {
+    let _permit = limiter
+        .map(|rate_limiter| rate_limiter.acquire(cancel))
+        .transpose()?;
     let conn_err = |e: reqwest::Error| {
-        if cfg.is_local() {
+        if is_managed_ollama_profile(cfg) {
             AppError::msg(format!(
-                "无法连接本地服务 {base}：请确认 Ollama/LM Studio 已启动，或在设置页切回云端档案: {e}",
+                "无法连接应用管理的 Ollama {base}：请确认本地服务已启动: {e}",
                 base = cfg.base_url
             ))
         } else {
-            AppError::msg(format!("云端请求失败: {e}"))
+            AppError::msg(format!("外部 AI 服务请求失败: {e}"))
         }
     };
     let base = cfg.base_url.trim_end_matches('/');
@@ -1744,15 +2066,16 @@ fn request_text_raw(
                     });
                 }
             }
-            let resp: serde_json::Value = client
-                .post(format!("{base}/messages"))
-                .header("x-api-key", &cfg.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .map_err(conn_err)?
-                .json()
-                .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
+            let resp = response_json_or_error(
+                client
+                    .post(format!("{base}/messages"))
+                    .header("x-api-key", &cfg.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .map_err(conn_err)?,
+                "AI 搜索请求",
+            )?;
             // Anthropic tool use：取 tool_use 块的 input 作为结构化结果
             if tier == TextJsonTier::Structured {
                 if let Some(tool_input) = extract_anthropic_tool_input(&resp) {
@@ -1780,25 +2103,25 @@ fn request_text_raw(
             } else if tier == TextJsonTier::JsonObject {
                 body["response_format"] = serde_json::json!({ "type": "json_object" });
             }
-            // §8.4：本地请求显式传 keep_alive（不依赖默认值）
-            apply_keep_alive(&mut body, cfg.is_local());
-            let resp: serde_json::Value = if cfg.api_key.trim().is_empty() {
-                client
-                    .post(format!("{base}/chat/completions"))
-                    .json(&body)
-                    .send()
-                    .map_err(conn_err)?
-                    .json()
-                    .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?
+            let resp = if cfg.api_key.trim().is_empty() {
+                response_json_or_error(
+                    client
+                        .post(format!("{base}/chat/completions"))
+                        .json(&body)
+                        .send()
+                        .map_err(conn_err)?,
+                    "AI 搜索请求",
+                )?
             } else {
-                client
-                    .post(format!("{base}/chat/completions"))
-                    .bearer_auth(&cfg.api_key)
-                    .json(&body)
-                    .send()
-                    .map_err(conn_err)?
-                    .json()
-                    .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?
+                response_json_or_error(
+                    client
+                        .post(format!("{base}/chat/completions"))
+                        .bearer_auth(&cfg.api_key)
+                        .json(&body)
+                        .send()
+                        .map_err(conn_err)?,
+                    "AI 搜索请求",
+                )?
             };
             resp["choices"][0]["message"]["content"]
                 .as_str()
@@ -1841,6 +2164,17 @@ pub fn request_text_json(
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|e| AppError::msg(format!("HTTP 客户端初始化失败: {e}")))?;
+    let rate_limiter = if is_managed_ollama_profile(cfg) {
+        None
+    } else {
+        ai_rate_limit::for_connection(
+            &cfg.id,
+            cfg.max_concurrency,
+            cfg.requests_per_minute,
+            cfg.requests_per_hour,
+        )
+    };
+    let cancel = AtomicBool::new(false);
 
     // 第 3 级失败时带错误重试逻辑单独处理；一级一级降级。
     let mut last_err: Option<String> = None;
@@ -1867,9 +2201,14 @@ pub fn request_text_json(
             user,
             TextJsonTier::Structured,
             structured_schema.clone(),
+            rate_limiter.as_deref(),
+            &cancel,
         ) {
             Ok(t) => return Ok((TextJsonTier::Structured, t)),
             Err(e) => {
+                if is_ai_rate_limited(&e) {
+                    return Err(e);
+                }
                 let message = e.to_string();
                 if !should_fallback(&message) {
                     return Err(e);
@@ -1879,9 +2218,21 @@ pub fn request_text_json(
         }
     }
     if max_structured_tier >= TextJsonTier::JsonObject {
-        match request_text_raw(&client, cfg, system, user, TextJsonTier::JsonObject, None) {
+        match request_text_raw(
+            &client,
+            cfg,
+            system,
+            user,
+            TextJsonTier::JsonObject,
+            None,
+            rate_limiter.as_deref(),
+            &cancel,
+        ) {
             Ok(t) => return Ok((TextJsonTier::JsonObject, t)),
             Err(e) => {
+                if is_ai_rate_limited(&e) {
+                    return Err(e);
+                }
                 let message = e.to_string();
                 if !should_fallback(&message) {
                     return Err(e);
@@ -1890,9 +2241,21 @@ pub fn request_text_json(
             }
         }
     }
-    match request_text_raw(&client, cfg, system, user, TextJsonTier::Plain, None) {
+    match request_text_raw(
+        &client,
+        cfg,
+        system,
+        user,
+        TextJsonTier::Plain,
+        None,
+        rate_limiter.as_deref(),
+        &cancel,
+    ) {
         Ok(t) => Ok((TextJsonTier::Plain, t)),
         Err(e) => {
+            if is_ai_rate_limited(&e) {
+                return Err(e);
+            }
             let detail = last_err.unwrap_or_default();
             Err(AppError::msg(format!(
                 "AI 请求降级仍失败：{detail}；最后尝试：{e}"
@@ -1928,7 +2291,7 @@ pub fn discover_models(
     base_url: &str,
     api_key: &str,
     protocol: &str,
-    is_local: bool,
+    managed_ollama: bool,
 ) -> AppResult<Vec<String>> {
     if base_url.trim().is_empty() {
         return Err(AppError::invalid_arg("请先填写服务地址"));
@@ -1953,8 +2316,8 @@ pub fn discover_models(
             if e.is_timeout() {
                 return Err(AppError::timeout("模型列表请求超时，请检查服务地址或网络"));
             }
-            return Err(AppError::msg(if is_local {
-                format!("无法连接本地服务 {url}：请确认 Ollama/LM Studio 已启动")
+            return Err(AppError::msg(if managed_ollama {
+                format!("无法连接应用管理的 Ollama {url}：请确认服务已启动")
             } else {
                 "无法连接服务，请检查服务地址或网络".to_string()
             }));
@@ -2011,13 +2374,14 @@ fn join_url(base_url: &str, path: &str) -> String {
 }
 
 /// 连接测试主入口（阻塞网络请求，命令层包 spawn_blocking）。
-/// protocol: openai_chat | anthropic_messages；local 部署优先走 openai_chat 的 /models 无鉴权探测。
+/// protocol: openai_chat | anthropic_messages；托管 Ollama 与外部服务都通过 /models 测试，
+/// 但错误文案只对 Windows 默认 Ollama 提示本地服务。
 pub fn test_connection(
     base_url: &str,
     api_key: &str,
     protocol: &str,
     model: &str,
-    is_local: bool,
+    managed_ollama: bool,
 ) -> AiConnectionTestResult {
     let started = std::time::Instant::now();
     let client = match reqwest::blocking::Client::builder()
@@ -2093,7 +2457,7 @@ pub fn test_connection(
                             format!("连接成功（HTTP {code}，共 {} 个模型）", models.len())
                         }
                     } else {
-                        openai_fail_message(code, is_local)
+                        openai_fail_message(code, managed_ollama)
                     };
                     let result_ok = ok && (model.is_empty() || !msg.contains("模型列表中没有"));
                     return finish(result_ok, Some(code), msg, started, protocol, model);
@@ -2145,7 +2509,7 @@ fn network_error_message(e: &reqwest::Error, url: &str) -> String {
     format!("请求失败: {e}")
 }
 
-fn openai_fail_message(code: u16, is_local: bool) -> String {
+fn openai_fail_message(code: u16, managed_ollama: bool) -> String {
     match code {
         401 | 403 => {
             "服务可达，但密钥无效或没有权限（401/403）。请检查 API 密钥是否正确、是否过期。"
@@ -2156,7 +2520,9 @@ fn openai_fail_message(code: u16, is_local: bool) -> String {
                 .to_string()
         }
         429 => "请求频率受限（429）。服务可达，稍后重试即可。".to_string(),
-        _ if is_local => format!("本地服务返回 HTTP {code}。请确认引擎已启动且端口正确。"),
+        _ if managed_ollama => {
+            format!("本地应用管理的 Ollama 返回 HTTP {code}。请确认引擎已启动且端口正确。")
+        }
         _ => format!("服务返回 HTTP {code}。请核对该服务是否为 OpenAI 兼容接口。"),
     }
 }
@@ -2170,18 +2536,28 @@ fn anthropic_fail_message(code: u16) -> String {
     }
 }
 
-/// 取用于打标的图片路径：高清缩略图 > 占位图 > 原图
+/// 取用于打标的素材路径。
+///
+/// 图片优先走原始文件，之后在 request_analysis 内统一解码为 AI JPEG；这样 UI 是否
+/// 打开过高清预览不会改变请求内容。视频仍使用已有封面/高清帧作为视觉输入。
 fn pick_image(asset: &assets::Asset) -> PathBuf {
+    if !asset.mime_type.starts_with("video/") {
+        let original = PathBuf::from(&asset.file_path);
+        if original.exists() {
+            return original;
+        }
+    }
     if let Some(p) = &asset.hd_thumbnail_path {
         let path = PathBuf::from(p);
-        if asset.mime_type.starts_with("video/")
-            || crate::services::thumbnail::is_current_image_hd_cache_path(&path)
-        {
+        if path.exists() {
             return path;
         }
     }
     if let Some(p) = &asset.placeholder_path {
-        return PathBuf::from(p);
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return path;
+        }
     }
     PathBuf::from(&asset.file_path)
 }
@@ -2281,6 +2657,8 @@ fn analyze_video_frames(
     system_override: &str,
     min_confidence: f64,
     tier_cache: &Cell<TextJsonTier>,
+    limiter: Option<&AiRateLimiter>,
+    cancel: &AtomicBool,
 ) -> AppResult<MediaAnalysis> {
     let dir = std::env::temp_dir().join(format!(
         "bagertea_kframes_{}_{}",
@@ -2313,8 +2691,14 @@ fn analyze_video_frames(
             min_confidence,
             false,
             tier_cache,
+            limiter,
+            cancel,
         ) {
             Ok(analysis) => results.push(analysis),
+            Err(error) if is_ai_rate_limited(&error) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(error);
+            }
             Err(error) => frame_failures.push(format!("第 {} 帧识别失败：{error}", index + 1)),
         }
     }
@@ -2408,9 +2792,23 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     if profile.base_url.trim().is_empty() {
         return Err(AppError::msg("当前 API 配置缺少 base_url"));
     }
-    // P3-01a：本地兼容端点（Ollama/LM Studio）通常无需 API Key；云端仍必填
-    if !profile.is_local() && profile.api_key.trim().is_empty() {
-        return Err(AppError::msg("当前 API 配置缺少 API Key"));
+    let managed_ollama = is_managed_ollama_profile(profile);
+    // 限流只保护外部在线服务；Windows 应用托管的默认 Ollama 不受在线额度约束。
+    // 限流器按连接 id 进程内共享，多个同时运行的批次会共同遵守同一组设置。
+    let rate_limiter = if managed_ollama {
+        None
+    } else {
+        ai_rate_limit::for_connection(
+            &profile.id,
+            profile.max_concurrency,
+            profile.requests_per_minute,
+            profile.requests_per_hour,
+        )
+    };
+    // 外部 OpenAI 兼容服务可能是 localhost/局域网部署且不需要密钥；认证要求由服务
+    // 自己返回 401/403。Anthropic 协议仍要求标准 API Key。
+    if profile.api_mode == "anthropic" && profile.api_key.trim().is_empty() {
+        return Err(AppError::msg("当前 Anthropic 配置缺少 API Key"));
     }
     let client = reqwest::blocking::Client::builder()
         // 连接 15s：本地服务没起来能快速报错；总超时 300s：
@@ -2456,7 +2854,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     // 指导书 §8.2/§8.3：逻辑批次完整保留（用户所选全部素材都在批内），执行层本地分块。
     // 在线与本机服务分别使用自己的「每轮处理数量」；本机允许更小的轮次以适配小模型。
     // 并发 1；单项失败重试 1 次（指数退避），仍失败置 rejected。
-    let chunk_size = if profile.is_local() {
+    let chunk_size = if managed_ollama {
         (cfg.local_batch_limit as usize).clamp(1, 20)
     } else {
         (cfg.batch_limit as usize).clamp(10, 50)
@@ -2484,7 +2882,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         operation = "ai_tagging",
         batch_id,
         model = %profile.model,
-        local = profile.is_local(),
+        transport = vision_transport_name(vision_transport(profile)),
+        managed_ollama,
         total,
         chunk_size,
         "AI 打标批次开始"
@@ -2514,6 +2913,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &cfg.system_prompt_tagging,
                     min_confidence,
                     &tier_cache,
+                    rate_limiter.as_deref(),
+                    cancel,
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
                 _ => request_analysis(
@@ -2526,6 +2927,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     min_confidence,
                     true,
                     &tier_cache,
+                    rate_limiter.as_deref(),
+                    cancel,
                 ),
             }
         } else {
@@ -2540,6 +2943,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 min_confidence,
                 true,
                 &tier_cache,
+                rate_limiter.as_deref(),
+                cancel,
             )
         }
     };
@@ -2554,28 +2959,63 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let policy = ai::ConfidencePolicy {
         min_suggest: min_confidence,
     };
+    let mark_cancelled = |asset_id: i64, processed_count: i64| -> AppResult<()> {
+        let conn = lock()?;
+        ai::set_batch_status(&conn, batch_id, "cancelled")?;
+        tracing::info!(
+            operation = "ai_tagging",
+            batch_id,
+            asset_id,
+            stage = "cancelled",
+            processed = processed_count,
+            total,
+            "AI 打标批次已取消"
+        );
+        Ok(())
+    };
     for chunk in todo.chunks(chunk_size) {
         for s in chunk {
             if cancel.load(Ordering::Relaxed) {
-                let conn = lock()?;
-                ai::set_batch_status(&conn, batch_id, "cancelled")?;
-                tracing::info!(
-                    operation = "ai_tagging",
-                    batch_id,
-                    asset_id = s.asset_id,
-                    stage = "cancelled",
-                    processed,
-                    total,
-                    "AI 打标批次已取消"
-                );
+                mark_cancelled(s.asset_id, processed)?;
                 return Ok(());
             }
             let asset = {
                 let conn = lock()?;
                 assets::get(&conn, s.asset_id)?
             };
-            // 单项失败：指数退避后重试 1 次，仍失败置 rejected（不阻塞其他素材）
+            // 429/额度错误不能重试：继续发送只会放大供应商的限流压力。
             let mut tags = compute(&asset);
+            // 限流等待可在网络请求期间收到取消；这条路径必须结束批次而不是把素材误标 rejected。
+            if cancel.load(Ordering::Relaxed)
+                || matches!(tags.as_ref(), Err(error) if error.code() == "CANCELLED")
+            {
+                mark_cancelled(s.asset_id, processed)?;
+                return Ok(());
+            }
+            if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error)) {
+                let error = match tags {
+                    Err(error) => error,
+                    Ok(_) => unreachable!("限流分支必须来自 Err"),
+                };
+                let error_message = error.to_string();
+                let conn = lock()?;
+                // 保留 pending，修正限额后可直接续跑；前端从批次错误和 last_error 都能看到服务商原文。
+                ai::set_suggestion_error(&conn, s.id, &error_message)?;
+                ai::set_batch_status(&conn, batch_id, "interrupted")?;
+                tracing::warn!(
+                    operation = "ai_tagging",
+                    batch_id,
+                    asset_id = s.asset_id,
+                    stage = "rate_limited",
+                    processed,
+                    total,
+                    error_code = error.code(),
+                    http_status = ?http_status_from_message(&error_message),
+                    error = %error_message,
+                    "AI 服务返回限流错误，停止批次且不再重试"
+                );
+                return Err(error);
+            }
             if let Err(error) = &tags {
                 let error_message = error.to_string();
                 tracing::warn!(
@@ -2591,8 +3031,43 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     error = %error_message,
                     "AI 打标首次请求失败，退避后重试"
                 );
+                if cancel.load(Ordering::Relaxed) {
+                    mark_cancelled(s.asset_id, processed)?;
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(RETRY_SECONDS * 1000));
                 tags = compute(&asset);
+                if cancel.load(Ordering::Relaxed)
+                    || matches!(tags.as_ref(), Err(error) if error.code() == "CANCELLED")
+                {
+                    mark_cancelled(s.asset_id, processed)?;
+                    return Ok(());
+                }
+                // 重试本身也可能撞上供应商限流；仍按 429 语义立即停批，不能把它
+                // 当作普通单条失败 reject 后继续消耗配额。
+                if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error)) {
+                    let error = match tags {
+                        Err(error) => error,
+                        Ok(_) => unreachable!("限流分支必须来自 Err"),
+                    };
+                    let error_message = error.to_string();
+                    let conn = lock()?;
+                    ai::set_suggestion_error(&conn, s.id, &error_message)?;
+                    ai::set_batch_status(&conn, batch_id, "interrupted")?;
+                    tracing::warn!(
+                        operation = "ai_tagging",
+                        batch_id,
+                        asset_id = s.asset_id,
+                        stage = "rate_limited_after_retry",
+                        processed,
+                        total,
+                        error_code = error.code(),
+                        http_status = ?http_status_from_message(&error_message),
+                        error = %error_message,
+                        "AI 服务重试后返回限流错误，停止批次且不再继续请求"
+                    );
+                    return Err(error);
+                }
             }
             {
                 let conn = lock()?;
@@ -2740,6 +3215,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
 mod tests {
     use super::{anthropic_fail_message, join_url, models_url, openai_fail_message};
     use super::{apply_keep_alive, extract_anthropic_text, parse_model_ids, KEEP_ALIVE_IDLE};
+    use crate::db::settings::ApiProfile;
     use crate::db::tag_facets::FacetPromptContext;
 
     #[test]
@@ -2777,6 +3253,24 @@ mod tests {
             super::ai_http_status_error("视觉请求", 503).code(),
             "INTERNAL"
         );
+    }
+
+    #[test]
+    fn rate_limit_error_keeps_safe_provider_reason() {
+        let error = super::ai_http_status_error_with_body(
+            "视觉请求",
+            429,
+            r#"{"error":{"type":"rate_limit_exceeded","message":"RPM limit exceeded for free users"}}"#,
+        );
+        assert_eq!(error.code(), "AI_RATE_LIMITED");
+        assert!(error.to_string().contains("RPM limit exceeded"));
+
+        let secret = super::ai_http_status_error_with_body(
+            "视觉请求",
+            429,
+            r#"{"error":{"message":"rate limit","api_key":"sk-secret"}}"#,
+        );
+        assert!(!secret.to_string().contains("sk-secret"));
     }
 
     #[test]
@@ -2838,6 +3332,92 @@ mod tests {
         let mut cloud = serde_json::json!({ "model": "gpt-4o" });
         apply_keep_alive(&mut cloud, false);
         assert!(cloud.get("keep_alive").is_none());
+    }
+
+    #[test]
+    fn fallback_only_accepts_explicit_format_compatibility_errors() {
+        assert!(super::vision_request_should_fallback(
+            "服务返回 HTTP 400：response_format json_schema unsupported"
+        ));
+        assert!(!super::vision_request_should_fallback(
+            "视觉请求请求过于频繁（HTTP 429）：RPM limit exceeded"
+        ));
+        assert!(!super::vision_request_should_fallback(
+            "服务返回 HTTP 400：context length exceeded"
+        ));
+        assert!(!super::vision_request_should_fallback(
+            "服务返回 HTTP 401：unauthorized"
+        ));
+        assert!(super::vision_request_should_fallback(
+            "Ollama unknown field: think"
+        ));
+        assert!(super::vision_request_should_fallback("响应格式不支持"));
+        assert!(!super::vision_request_should_fallback(
+            "model does not support image input"
+        ));
+    }
+
+    #[test]
+    fn context_overflow_is_classified_without_model_name_heuristics() {
+        assert!(super::is_context_overflow_message(
+            "prompt is too long: context length exceeded"
+        ));
+        assert!(super::is_context_overflow_message("输入上下文过长"));
+        assert!(!super::is_context_overflow_message("invalid image format"));
+    }
+
+    #[test]
+    fn safe_http_detail_keeps_context_diagnostics_without_secrets() {
+        let error = super::ai_http_status_error_with_body(
+            "视觉请求",
+            400,
+            r#"{"error":{"message":"prompt is too long; context length 4197 > 4096"}}"#,
+        );
+        assert!(super::is_context_overflow_message(&error.to_string()));
+        let secret = super::ai_http_status_error_with_body(
+            "视觉请求",
+            400,
+            r#"{"error":{"message":"bad api_key sk-secret"}}"#,
+        );
+        assert!(!secret.to_string().contains("sk-secret"));
+    }
+
+    #[test]
+    fn localhost_external_profile_never_becomes_managed_ollama() {
+        let profile = ApiProfile {
+            id: "external-localhost".into(),
+            name: "LM Studio".into(),
+            api_mode: "openai".into(),
+            kind: "local".into(),
+            base_url: "http://127.0.0.1:1234/v1".into(),
+            api_key: String::new(),
+            model: "vision-model".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
+        };
+        assert!(!super::is_managed_ollama_profile(&profile));
+        assert_eq!(
+            super::vision_transport(&profile),
+            super::VisionTransport::ExternalOpenAi
+        );
+    }
+
+    #[test]
+    fn empty_ollama_final_content_reports_thinking_exhaustion() {
+        let response = serde_json::json!({
+            "message": { "content": "", "thinking": "只生成了思考轨迹" },
+            "done": true,
+            "done_reason": "length",
+            "eval_count": 800
+        });
+        let error = super::ollama_message_content(&response).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("未返回最终内容"));
+        assert!(message.contains("done_reason=length"));
+        assert!(message.contains("thinking_chars=8"));
+        assert!(message.contains("eval_count=800"));
+        assert!(!message.contains("只生成了思考轨迹"), "不得回显思考原文");
     }
 
     // §9.3：本地模型视觉能力启发式（含视觉标记 → 支持；已知纯文本 → 不支持；未知 → 支持防误拦）

@@ -92,6 +92,58 @@ function leaf(cond: LeafCond): QueryExpr {
   return { op: "leaf", cond };
 }
 
+/**
+ * Metadata leaf compatibility at the JS/Rust boundary.
+ *
+ * The current contract is `{ type: "metadata", filter: MetadataFilter }`, but
+ * older Rust builds serialized the MetadataFilter fields directly on `cond`
+ * (`{ type: "metadata", key, op, ... }`). Normalize the legacy shape as it
+ * enters any expression utility so persisted plans and in-flight responses do
+ * not crash the display layer.
+ */
+type MetadataCondWire = {
+  type: "metadata";
+  filter?: MetadataFilter;
+  key?: unknown;
+  op?: unknown;
+  value?: unknown;
+  values?: unknown;
+  min?: unknown;
+  max?: unknown;
+  unit?: unknown;
+};
+
+export function normalizeMetadataCond(cond: LeafCond): LeafCond {
+  if (cond.type !== "metadata") return cond;
+  const raw = cond as unknown as MetadataCondWire;
+  if (raw.filter && typeof raw.filter === "object") return cond;
+  if (typeof raw.key !== "string" || typeof raw.op !== "string") return cond;
+
+  const filter: MetadataFilter = {
+    key: raw.key as MetadataFilter["key"],
+    op: raw.op as MetadataFilter["op"],
+  };
+  if (raw.value !== undefined) filter.value = raw.value as MetadataFilter["value"];
+  if (Array.isArray(raw.values)) filter.values = raw.values as MetadataFilter["values"];
+  if (raw.min !== undefined) filter.min = raw.min as MetadataFilter["min"];
+  if (raw.max !== undefined) filter.max = raw.max as MetadataFilter["max"];
+  if (raw.unit === "KB" || raw.unit === "MB" || raw.unit === "GB") filter.unit = raw.unit;
+  return { type: "metadata", filter };
+}
+
+/** Return a metadata filter from either the current or legacy wire shape. */
+export function metadataFilterOf(cond: LeafCond): MetadataFilter | undefined {
+  const normalized = normalizeMetadataCond(cond);
+  return normalized.type === "metadata" ? normalized.filter : undefined;
+}
+
+/** Recursively canonicalize metadata leaves without changing boolean shape or paths. */
+export function normalizeExprMetadata(expr: QueryExpr): QueryExpr {
+  if (expr.op === "leaf") return { ...expr, cond: normalizeMetadataCond(expr.cond) };
+  if (expr.op === "not") return { ...expr, child: normalizeExprMetadata(expr.child) };
+  return { ...expr, children: expr.children.map(normalizeExprMetadata) };
+}
+
 /** QueryExpr → AssetFilter 的扁平字段（用于兼容非 expr 链路或回填）。
  *  只提取 AND 顶层的叶子/简单形态；复杂嵌套仅保留 expr 本身。 */
 export function queryExprToFilterFields(e: QueryExpr): {
@@ -116,7 +168,10 @@ export function queryExprToFilterFields(e: QueryExpr): {
       else if (cond.type === "tag") {
         facetFilters.push({ facetKey: cond.facetKey, tagIds: cond.tagIds, mode: cond.mode ?? "any", includeDescendants: cond.includeDescendants });
       } else if (cond.type === "excludeTag") excludeTagIds.push(...cond.tagIds);
-      else if (cond.type === "metadata") metadataFilters.push(cond.filter);
+      else if (cond.type === "metadata") {
+        const filter = metadataFilterOf(cond);
+        if (filter) metadataFilters.push(filter);
+      }
     }
   }
   if (facetFilters.length) out.facetFilters = facetFilters;
@@ -153,7 +208,7 @@ export function serializeExpr(e: QueryExpr): string {
 
 /** FB5-05（§9.5.6/§9.6.1）：前端归一化——空组删除、单子节点组折叠、连续相同 AND/OR 扁平化、重复 leaf 去重。 */
 export function normalizeExpr(expr: QueryExpr): QueryExpr | undefined {
-  if (expr.op === "leaf") return expr;
+  if (expr.op === "leaf") return { ...expr, cond: normalizeMetadataCond(expr.cond) };
   if (expr.op === "not") {
     const child = normalizeExpr(expr.child);
     return child ? { op: "not", child } : undefined;
@@ -299,7 +354,7 @@ function leafLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string 
     case "untagged":
       return "未打标";
     case "metadata":
-      return metaLabel(cond.filter);
+      return metaLabel(metadataFilterOf(cond));
     default:
       return "条件";
   }
@@ -316,7 +371,8 @@ const LABELS: Record<string, string> = {
 
 const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", contains: "含", between: "", in: "∈" };
 
-function metaLabel(f: MetadataFilter): string {
+function metaLabel(f: MetadataFilter | undefined): string {
+  if (!f || typeof f !== "object" || typeof f.key !== "string" || typeof f.op !== "string") return "元数据条件";
   const name = LABELS[f.key] ?? f.key;
   if (f.op === "between") return `${name} ${String(f.min ?? "")}–${String(f.max ?? "")}`;
   if (f.op === "in") return `${name} ∈ ${(f.values ?? []).map(String).join("|")}`;

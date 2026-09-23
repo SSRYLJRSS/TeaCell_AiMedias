@@ -9,6 +9,7 @@ use crate::db::ai::{AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags};
 use crate::db::{ai, ai_connections, settings};
 use crate::error::{AppError, AppResult};
 use crate::services::ai_cloud::{self, AiProgress};
+use crate::services::ollama_runtime;
 use crate::state::AppState;
 
 fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
@@ -29,7 +30,10 @@ fn require_tagging_binding(
 }
 
 fn mode_for_active_profile(cfg: &settings::AiSettings) -> &'static str {
-    match cfg.active().map(|profile| profile.is_local()) {
+    match cfg
+        .active()
+        .map(crate::services::ai_cloud::is_managed_ollama_profile)
+    {
         Some(true) => "local",
         _ => "cloud",
     }
@@ -84,6 +88,7 @@ pub async fn ai_start_batch(
 ) -> AppResult<AiBatch> {
     let db = std::sync::Arc::clone(&state.db);
     let registry = std::sync::Arc::clone(&state.ai_cancel);
+    let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     let cancel = Arc::new(AtomicBool::new(false));
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -109,7 +114,10 @@ pub async fn ai_start_batch(
             // §4.4：打标按用途绑定读取连接档案（含 keyring 密钥解析）。
             //       绑定修改不写 settings JSON，复用现有 AI HTTP service（run_cloud_batch 只读 cfg）。
             require_tagging_binding(&conn, &mut s.ai)?;
-            let profile_is_local = mode_for_active_profile(&s.ai) == "local";
+            let profile_is_local = s
+                .ai
+                .active()
+                .is_some_and(crate::services::ai_cloud::is_managed_ollama_profile);
             // 建批后允许切换服务；执行时按当前 tagging 绑定修正批次类型。
             ai::set_batch_mode(&conn, batch_id, mode_for_active_profile(&s.ai))?;
             // FB-03 §9.3 视频批次预检（前后端一致；后端为最终校验，service 层兜底保留）：
@@ -163,7 +171,15 @@ pub async fn ai_start_batch(
             }
             s
         };
+        let proxy = all.model_download_proxy.clone();
         let cfg = all.ai;
+        let managed_ollama = cfg
+            .active()
+            .is_some_and(crate::services::ai_cloud::is_managed_ollama_profile);
+        if managed_ollama {
+            // 本机打标真正开始前自动拉起默认 Ollama；慢启动最多等待 90 秒。
+            ollama_runtime::ensure_ready(&runtime, &proxy)?;
+        }
         // W2-1：提示词上下文直接从 tag_facets 读（V20 合表后不再需要 configs 参数；短锁立即释放）
         // F4：按媒体类型各取一份 —— 图片批次只带 all+image 分面，视频批次 only all+video，
         //     「只适用于视频」的分面不再污染图片提示词（mixed 批次两条都传给执行层按条目取）。
@@ -178,9 +194,21 @@ pub async fn ai_start_batch(
             .map_err(|_| AppError::msg("锁中毒"))?
             .insert(batch_id, Arc::clone(&cancel));
 
+        if managed_ollama {
+            runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .begin_request();
+        }
         let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, &facets_video, limit, &cancel, |p: AiProgress| {
             let _ = app.emit("ai://progress", p);
         });
+        if managed_ollama {
+            runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .end_request();
+        }
         // B12：收尾清理 flag——锁中毒不再静默吞
         match registry.lock() {
             Ok(mut m) => {
@@ -190,10 +218,18 @@ pub async fn ai_start_batch(
         }
         if let Err(e) = r {
             // 批次级异常（DB/配置等）收尾：置 cancelled 防卡死在 processing 无法重试
-            // （单条失败已在 run_cloud_batch 内部置 rejected，不进这里）
+            // （普通单条失败已在 run_cloud_batch 内部置 rejected；429/连续失败会保留中断终态）
             tracing::warn!("批次 {} 执行异常，标记 cancelled: {e}", batch_id);
             if let Ok(conn) = db.lock() {
-                let _ = ai::set_batch_status(&conn, batch_id, "cancelled");
+                // run_cloud_batch 对供应商限流/连续失败会先记录 interrupted；保留该终态，
+                // 避免把“服务拒绝请求”误报成用户主动取消。其它仍卡在 processing 的异常
+                // 才回收为 cancelled，保证后续可以续跑。
+                let should_cancel = ai::get_batch(&conn, batch_id)
+                    .map(|batch| batch.status == "processing")
+                    .unwrap_or(true);
+                if should_cancel {
+                    let _ = ai::set_batch_status(&conn, batch_id, "cancelled");
+                }
             }
             return Err(e);
         }
@@ -364,6 +400,9 @@ mod tests {
             base_url: "http://localhost:11434/v1".into(),
             api_key: String::new(),
             model: "qwen3.5:4b".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         cfg.ai.active_profile = "stale-local".into();
 
@@ -374,7 +413,12 @@ mod tests {
         ai_connections::bind_usage(&conn, "tagging", "local-1").unwrap();
         require_tagging_binding(&conn, &mut cfg.ai).unwrap();
         assert_eq!(cfg.ai.active().unwrap().id, "local-1");
-        assert_eq!(mode_for_active_profile(&cfg.ai), "local");
+        let expected_mode = if cfg!(target_os = "windows") {
+            "local"
+        } else {
+            "cloud"
+        };
+        assert_eq!(mode_for_active_profile(&cfg.ai), expected_mode);
     }
 
     #[test]
@@ -389,6 +433,9 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_key: "secret".into(),
             model: "vision-model".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         cfg.ai.active_profile = "legacy".into();
 

@@ -37,7 +37,8 @@ pub struct ApiProfile {
     /// 接口协议模式：openai（/chat/completions）| anthropic（/messages）
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
-    /// 部署类型（P3-01a）：cloud（云端服务商）| local（本机 OpenAI 兼容服务，如 Ollama/LM Studio）；
+    /// 部署类型：cloud（外部 API；即使地址是 localhost/局域网也归此类）|
+    /// local（仅 Windows 应用托管的默认 Ollama）；
     /// serde 默认 cloud，旧数据零感知
     #[serde(default = "default_profile_kind")]
     pub kind: String,
@@ -47,6 +48,13 @@ pub struct ApiProfile {
     pub api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// 在线服务限流：0 表示不限制。仅对外部服务生效，Windows 托管 Ollama 忽略。
+    #[serde(default)]
+    pub max_concurrency: i64,
+    #[serde(default)]
+    pub requests_per_minute: i64,
+    #[serde(default)]
+    pub requests_per_hour: i64,
 }
 
 impl ApiProfile {
@@ -122,6 +130,9 @@ impl AiSettings {
                 base_url: self.base_url.clone(),
                 api_key: self.api_key.clone(),
                 model: self.model.clone(),
+                max_concurrency: 0,
+                requests_per_minute: 0,
+                requests_per_hour: 0,
             });
             self.active_profile = "default".into();
         }
@@ -714,6 +725,9 @@ mod tests {
             base_url: "u".into(),
             api_key: "k".into(),
             model: "m".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         ai.active_profile = "not-exist".into();
         assert_eq!(ai.active().unwrap().id, "p1");

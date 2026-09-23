@@ -16,7 +16,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use super::thumbnail::ThumbnailService;
-use super::{dedup, exif_meta, video};
+use super::{dedup, exif_meta, imaging, thumbnail, video};
 use crate::db::assets::{self, ImportResult};
 use crate::error::{AppError, AppResult};
 use crate::utils::{mime, path};
@@ -960,12 +960,26 @@ fn precheck(conn: &Connection, file: &Path, file_hash: &str) -> AppResult<bool> 
 }
 
 /// 待入库清单项（两段式入库的左侧统计，PRD v2.4）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPreviewStatus {
+    /// 已能生成入库缩略图，普通导入路径。
+    Ready,
+    /// 能生成缩略图，但属于 RAW 等特殊格式，后续高清/元数据/AI 能力可能受限。
+    Limited,
+    /// 连入库缩略图都无法生成，禁止进入正式入库。
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportPlanItem {
     pub path: String,
     pub kind: String, // image|video
     pub size: i64,
+    pub preview_status: ImportPreviewStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -988,29 +1002,59 @@ pub fn inspect_paths(paths: &[String]) -> ImportPlan {
             "待入库扫描警告"
         );
     }
-    let mut plan = ImportPlan {
-        items: Vec::new(),
-        images: 0,
-        videos: 0,
-        total_size: 0,
-    };
-    for f in files {
-        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or_default();
-        let kind = mime::asset_type_from_ext(ext).unwrap_or("image");
-        let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
-        if kind == "video" {
-            plan.videos += 1;
-        } else {
-            plan.images += 1;
-        }
-        plan.total_size += size;
-        plan.items.push(ImportPlanItem {
-            path: f.to_string_lossy().into_owned(),
-            kind: kind.to_string(),
-            size,
-        });
+    let items: Vec<ImportPlanItem> = files
+        .par_iter()
+        .map(|f| {
+            let ext = f.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            let kind = mime::asset_type_from_ext(ext).unwrap_or("image");
+            let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let (preview_status, preview_message) = if kind == "image" {
+                classify_import_preview(f, ext)
+            } else {
+                (ImportPreviewStatus::Ready, None)
+            };
+            ImportPlanItem {
+                path: f.to_string_lossy().into_owned(),
+                kind: kind.to_string(),
+                size,
+                preview_status,
+                preview_message,
+            }
+        })
+        .collect();
+    let images = items.iter().filter(|i| i.kind == "image").count() as i64;
+    let videos = items.iter().filter(|i| i.kind == "video").count() as i64;
+    let total_size = items.iter().map(|i| i.size).sum();
+    ImportPlan {
+        items,
+        images,
+        videos,
+        total_size,
     }
-    plan
+}
+
+/// 入库前只验证“能否生成快速缩略图”，不进入完整 RAW 显影。
+/// 这样导入页可以在正式入库前明确拦截损坏/当前不支持的图片。
+fn classify_import_preview(path: &Path, ext: &str) -> (ImportPreviewStatus, Option<String>) {
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        imaging::decode_thumb(path, thumbnail::PLACEHOLDER_SIZE).is_some()
+    }))
+    .unwrap_or(false);
+    if !ok {
+        return (
+            ImportPreviewStatus::Unsupported,
+            Some("无法解析入库缩略图，当前不支持导入（也可能是文件损坏）".into()),
+        );
+    }
+    if mime::is_raw_ext(ext) {
+        return (
+            ImportPreviewStatus::Limited,
+            Some(
+                "已解析缩略图，可以导入；但该 RAW 格式的高清预览、元数据或 AI 功能可能受限".into(),
+            ),
+        );
+    }
+    (ImportPreviewStatus::Ready, None)
 }
 
 /// 改名模板预览（前端 RenameBuilder 用）：与入库 stage 的 render_name 同源，
@@ -1022,7 +1066,7 @@ pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: us
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, precheck, render_name};
+    use super::{collect_files, inspect_paths, precheck, render_name, ImportPreviewStatus};
 
     // 2026-07-27 12:00:00 UTC
     const MTIME: i64 = 1_785_225_600_000;
@@ -1097,6 +1141,54 @@ mod tests {
         assert!(
             result.is_err(),
             "数据库结构错误必须向上返回，不能伪装为重复"
+        );
+    }
+
+    #[test]
+    fn inspect_classifies_previewable_limited_and_unsupported_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("ok.jpg");
+        let raw = dir.path().join("preview.cr2");
+        let bad = dir.path().join("broken.x3f");
+        image::RgbImage::from_fn(256, 192, |x, y| {
+            image::Rgb([x as u8, y as u8, (x.wrapping_add(y) % 255) as u8])
+        })
+        .save(&jpg)
+        .unwrap();
+        std::fs::copy(&jpg, &raw).unwrap();
+        std::fs::write(&bad, b"not an image").unwrap();
+
+        let paths = [
+            jpg.to_string_lossy().into_owned(),
+            raw.to_string_lossy().into_owned(),
+            bad.to_string_lossy().into_owned(),
+        ];
+        let plan = inspect_paths(&paths);
+
+        assert_eq!(plan.images, 3);
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("ok.jpg"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Ready
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("preview.cr2"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Limited
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("broken.x3f"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Unsupported
         );
     }
 }

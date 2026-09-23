@@ -9,12 +9,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
 import { deleteAiConnection, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
+import { ollamaListLocalModels } from "@/api/ollama";
 
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn(),
   deleteAiConnection: vi.fn(),
   saveAiConnection: vi.fn(),
   testAiConnection: vi.fn(),
+}));
+
+vi.mock("@/api/ollama", () => ({
+  ollamaListLocalModels: vi.fn(),
 }));
 
 import type { AiConnection } from "@/api/connections";
@@ -38,6 +43,33 @@ describe("AiConnectionManager（§6.3）", () => {
     // local 服务被过滤（在线面板不显示本机服务）
     expect(screen.queryByText("本地 Ollama")).not.toBeInTheDocument();
     expect(screen.getByText(/密钥已配置/)).toBeInTheDocument();
+  });
+
+  it("自定义 localhost 连接归在线服务，不混入本机 Ollama", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([
+      ...fakeConns,
+      {
+        id: "c3",
+        name: "LM Studio",
+        deployment: "local",
+        protocol: "openai_chat",
+        baseUrl: "http://127.0.0.1:1234/v1",
+        model: "local-vision",
+        hasKey: false,
+        enabled: true,
+      },
+    ]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("LM Studio")).toBeInTheDocument());
+    expect(screen.getAllByText("在线服务")).toHaveLength(2);
+  });
+
+  it("本机服务会标出连接模型尚未安装", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(ollamaListLocalModels).mockResolvedValue([{ name: "qwen3.5:4b", size: 1 }]);
+    render(<AiConnectionManager deployment="local" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("本地 Ollama")).toBeInTheDocument());
+    expect(screen.getByText("模型未安装")).toBeInTheDocument();
   });
 
   it("标题与按钮使用用户文案「AI 服务 / + 新增服务」而非「连接档案」", async () => {
@@ -85,6 +117,31 @@ describe("AiConnectionManager（§6.3）", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() =>
       expect(saveAiConnection).toHaveBeenCalledWith(expect.objectContaining({ id: "c1", apiKey: null })),
+    );
+  });
+
+  it("保存在线服务请求限制并把空值表示为不限", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([]);
+    vi.mocked(saveAiConnection).mockResolvedValue({ ...fakeConns[0], id: "new-conn-1" });
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "+ 新增服务" })).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
+    fireEvent.change(screen.getByPlaceholderText(/如「通义官方」/), { target: { value: "免费服务" } });
+    fireEvent.change(screen.getByPlaceholderText(/api.example.com/), { target: { value: "https://free/v1" } });
+    fireEvent.change(screen.getByLabelText("最大并发数"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("每分钟请求数"), { target: { value: "10" } });
+    fireEvent.change(screen.getByLabelText("每小时请求数"), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+
+    await waitFor(() =>
+      expect(saveAiConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          maxConcurrency: 2,
+          requestsPerMinute: 10,
+          requestsPerHour: 100,
+        }),
+      ),
     );
   });
 

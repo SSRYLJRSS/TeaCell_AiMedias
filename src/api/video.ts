@@ -3,6 +3,7 @@ import { invoke } from "./client";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
 export type VideoProxyStatus = "queued" | "running" | "ready" | "failed" | "canceled";
+export type ProxyVariant = "h264_mp4" | "vp8_webm";
 
 export interface VideoProxy {
   assetId: number;
@@ -14,15 +15,15 @@ export interface VideoProxy {
 }
 
 /** 确保生成 H.264/AAC MP4 兼容代理（已存在则直接返回；转码在后台线程）。 */
-export function ensureVideoProxy(assetId: number, variant = "h264_mp4"): Promise<VideoProxy> {
+export function ensureVideoProxy(assetId: number, variant?: ProxyVariant): Promise<VideoProxy> {
   return invoke<VideoProxy>("ensure_video_proxy", { assetId, variant });
 }
 
-export function getVideoProxyStatus(assetId: number, variant = "h264_mp4"): Promise<VideoProxy | null> {
+export function getVideoProxyStatus(assetId: number, variant?: ProxyVariant): Promise<VideoProxy | null> {
   return invoke<VideoProxy | null>("get_video_proxy_status", { assetId, variant });
 }
 
-export function cancelVideoProxy(assetId: number, variant = "h264_mp4"): Promise<void> {
+export function cancelVideoProxy(assetId: number, variant?: ProxyVariant): Promise<void> {
   return invoke<void>("cancel_video_proxy", { assetId, variant });
 }
 

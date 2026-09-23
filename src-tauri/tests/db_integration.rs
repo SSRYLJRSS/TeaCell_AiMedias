@@ -371,6 +371,9 @@ fn settings_roundtrip() -> AppResult<()> {
         base_url: "https://api.example.com/v1".into(),
         api_key: "sk-test".into(),
         model: "qwen-vl-plus".into(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+        requests_per_hour: 0,
     });
     s2.ai.active_profile = "p1".into();
     s2.theme = "dark".into();

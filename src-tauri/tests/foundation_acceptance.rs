@@ -1830,12 +1830,17 @@ fn request_config_json_contains_all_inputs() {
         o["topTagsSnapshot"][0]["words"],
         serde_json::json!("海边/森林/室内")
     );
-    // modelParams：模型、token 上限与最终结构化等级；本地档案额外记录 keepAlive
+    // modelParams：模型、token 上限与最终结构化等级；本地档案额外记录运行参数。
     assert_eq!(o["modelParams"]["model"], serde_json::json!("qwen2.5-vl"));
     assert_eq!(o["modelParams"]["maxTokens"], serde_json::json!(1180));
     assert_eq!(
         o["modelParams"]["jsonTier"],
         serde_json::json!("structured")
+    );
+    assert_eq!(o["modelParams"]["keepAlive"], serde_json::json!("2m"));
+    assert_eq!(
+        o["modelParams"]["thinkingDisabled"],
+        serde_json::json!(true)
     );
     // imagePreprocess 三字段
     let pre = &o["imagePreprocess"];

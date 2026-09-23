@@ -1,6 +1,6 @@
 # 运维与交接手册
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-23
 >
 > 本文档覆盖本地运行、数据位置、发布、备份恢复、本地模型和应急处理。性能细节见 [PERFORMANCE.md](PERFORMANCE.md)，故障症状见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
@@ -13,26 +13,27 @@
 - 素材库、标签和索引默认保存在本机。
 - 云端 AI 只在用户触发时发送选中素材的预览。
 
-当前 v1.0.1 的主要发布阻塞是真实素材 UAT 和发布证据，不等于代码未实现。
+当前公测版 1.0（技术版本 1.0.0）的主要发布阻塞是真实素材 UAT 和发布证据，不等于代码未实现。
 
 ## 2. 本地启动
 
 环境：
 
-- Node.js 20+
+- Node.js 22（`>=22 <25`）
 - Rust stable MSVC
 - Visual Studio C++ Build Tools
-- 可选 `ffmpeg` / `ffprobe`
+- 开发时可选 `ffmpeg` / `ffprobe`（PATH 回退）；发布包必须自带经 manifest 校验的 sidecar
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 ```
 
-构建：
+Windows 本地构建（其他目标替换为对应 target triple）：
 
 ```powershell
-npm run tauri build
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
 
 正式交付前：
@@ -113,6 +114,10 @@ pwsh ./scripts/smoke.ps1
 5. 用真实素材验证搜索、导入、查看器、AI、导出、回收站、备份恢复。
 6. 检查数据库从上一版本升级。
 7. 检查安装包和 License。
+8. 从同一提交生成 Windows、macOS 和 Ubuntu 候选包；支持目标与等级见
+   [PLATFORM.md](PLATFORM.md)。
+9. Windows 执行完整 UAT，macOS/Linux 执行 [QA_PLAYBOOK.md](QA_PLAYBOOK.md) 的核心五步闭环。
+10. 任一目标平台核心闭环失败时修复并生成新候选，不在旧候选上替换二进制。
 
 ### 5.2 构建产物
 
@@ -124,7 +129,40 @@ src-tauri/target/release/bundle/
 
 不要提交 `target*/`、`dist/` 或安装包。
 
-### 5.3 回滚
+第一阶段候选产物限定为：Windows 当前 Tauri 安装包、Apple Silicon macOS DMG、Ubuntu 24.04
+x64 的 AppImage 和 DEB。构建 artifact 必须携带版本、提交 SHA 和目标三元组，不能只用
+`latest` 命名。
+
+候选构建统一从仓库入口执行：
+
+```powershell
+node scripts/desktop.mjs check --target x86_64-pc-windows-msvc --strict-release
+node scripts/desktop.mjs build --target x86_64-pc-windows-msvc
+```
+
+macOS 使用 `aarch64-apple-darwin`，Ubuntu 使用 `x86_64-unknown-linux-gnu`。发布前必须先为目标
+准备 `src-tauri/binaries/manifest.json` 所列的固定版本 sidecar；占位 SHA、`latest` URL、缺失
+许可证或缺少 Unix 可执行位都会让严格检查失败。CI 候选工作流为
+`.github/workflows/release-candidate.yml`，只在三个目标安装包和同一提交校验均齐全时报告
+“构建材料齐全”。许可证文本会随安装包资源和候选 artifact 一并收集。
+
+当前固定的 FFmpeg 构建包含 GPL 编码器（例如 `libx264`）。许可证文本本身不等于完整的再分发合规证据：
+在把候选包交给任何测试者前，必须针对实际二进制及其链接组件确认对应源代码、构建脚本/配置和提供方式，
+并由负责人完成许可证审查；若无法提供这些材料，应更换为已核实的许可构建。FFmpeg 对 GPL 组件及其
+许可证检查项的说明见[官方法律说明](https://ffmpeg.org/legal.html)。候选构建通过、安装包齐全或测试者已知情，
+都不能替代这一检查。当前自动工作流会验证许可证文本随包和摘要一致，但不会代替源代码完整性或法律判断。
+
+### 5.3 候选状态与发布
+
+- 自动化构建通过但没有当前版本真机证据：标记为“实验构建”。
+- 具有 GPL FFmpeg sidecar 的候选包还必须完成对应源代码材料和再分发方式审查；在此之前不得发给测试者。
+- 核心五步闭环在目标真机通过：该平台可标记为“预览支持”。
+- Windows 只有在完整 UAT 与发布门禁通过后才标记为“正式支持”。
+- 三端可以不同时间向测试者开放，但同一版本的公开包必须来自同一最终标签。
+- 未签名、未公证的 macOS 包只交给明确知情的测试者；进入更正式的预览分发前完成签名和公证。
+- 第一阶段按需发版，不设置固定周期。
+
+### 5.4 回滚
 
 应用回滚不等于数据库自动回滚。发布前必须明确：
 
@@ -177,7 +215,7 @@ src-tauri/target/release/bundle/
 - 检测 Ollama 是否安装和运行。
 - 应用内下载、安装和启动 Ollama。
 - 探测 NVIDIA 显存并推荐模型。
-- 拉取模型并写回当前本地 AI 档案。
+- 拉取模型并同步当前本机 AI 连接。
 - 查看已安装模型和模型目录。
 - 切换下载源和测速。
 
@@ -197,13 +235,27 @@ src-tauri/target/release/bundle/
 - 已安装未就绪：服务尚未启动，轮询 `/api/version`。
 - 拉取失败：网络、registry 或磁盘空间问题；Ollama 支持断点续传。
 - 打标失败：确认模型支持视觉输入、请求模型名正确、服务可访问。
+- `qwen3.5` 等思考模型用于打标时由应用关闭独立 thinking 输出，避免思考 token 吃满预算后只返回空 `content`；若日志仍显示 `done_reason=length` 和空最终内容，先升级 Ollama，再重试未完成项。
 - 安装被杀毒软件拦截：允许安装器或手动运行保留的安装包。
+
+### 7.4 服务生命周期
+
+- 设置页的“启动服务并复检”只负责发起启动；Windows 首次启动可能较慢，页面会持续检查，最多等待 90 秒。
+- AI 打标、超级搜索和模型拉取开始前都会再次保证默认 `localhost:11434` 就绪，因此服务在页面后台被回收后也能自动恢复。
+- 应用自己启动的 Ollama 连续空闲 2 分钟后自动关闭进程；这与 Ollama 的模型 `keep_alive` 不同，前者回收服务进程，后者只释放模型内存。
+- 应用不会停止外部已运行的服务。本地打标只保留 Windows 默认 Ollama；LM Studio、自定义 Ollama 端口、局域网兼容服务以及任何 `localhost` 地址都应在“在线服务”中配置，并按外部 OpenAI 兼容接口处理。
 
 ## 8. AI 连接与凭据
 
 - 支持 OpenAI 兼容接口和 Anthropic 模式。
+- “在线服务”表示外部 API 链路，不要求服务一定在公网；localhost 和局域网地址也归入此处，OpenAI 兼容服务可不填写 API Key。
 - API Key 存系统凭据库，不写设置 JSON。
 - 连接档案可以绑定到不同用途。
+- 在线服务编辑页可设置最大并发、每分钟请求数和每小时请求数；留空或填 0 表示不限。
+  限制按打标和 AI 搜索的实际请求计数，普通失败重试、结构化降级和校验修复也会计入；达到本地限制时应用会等待，取消批次可中断等待。
+- 服务返回 HTTP 429/额度限流时，应用不会再次自动重试，也不会把当前素材误判为内容失败；会记录脱敏后的服务商错误并中断批次，前端可直接看到原因，调整 RPM/并发后再继续。
+- 该限流只作用于外部在线服务。Windows 应用托管的默认 Ollama 不需要配置；其他 localhost、局域网、LM Studio
+  或自定义 Ollama 地址属于在线服务，应在在线页设置供应商给出的额度。
 - 修改连接后应验证打标和超级搜索都读取同一绑定。
 - 日志和截图中不得暴露完整凭据。
 

@@ -12,7 +12,7 @@
 //! → camRGB→XYZ（cam_to_xyz_normalized）→ XYZ→sRGB 矩阵 → gamma 2.2
 
 use image::{DynamicImage, ImageBuffer};
-use rawler::{RawImage, RawImageData};
+use rawler::{decoders::RawDecodeParams, RawImage, RawImageData};
 
 use super::imaging;
 
@@ -43,6 +43,35 @@ pub fn probe_dimensions(src: &std::path::Path) -> Option<(u32, u32)> {
 /// 调用方负责再 thumbnail()；失败返回 None 由策略链降级
 pub fn decode_raw(src: &std::path::Path) -> Option<DynamicImage> {
     catch_raw_panics(src, || decode_raw_inner(src))
+}
+
+/// 提取 RAW 文件自带的缩略图/预览图。
+///
+/// rawler 已为不同厂商容器实现了各自的预览定位规则（RAF、CRW、MRW、DNG 等），
+/// 比通用 TIFF/JPEG marker 扫描覆盖更完整。该路径只负责取预览，不进入自写的
+/// Bayer 显影，因此适合入库阶段的快速缩略图，也作为高清真解码前的可靠兜底。
+pub fn decode_preview(src: &std::path::Path) -> Option<DynamicImage> {
+    catch_raw_panics(src, || {
+        let params = RawDecodeParams::default();
+        let image = rawler::analyze::extract_thumbnail_pixels(src, &params).ok()?;
+        if image.width() == 0 || image.height() == 0 || is_effectively_black(&image) {
+            return None;
+        }
+        Some(image)
+    })
+}
+
+fn is_effectively_black(image: &DynamicImage) -> bool {
+    let sample = image.thumbnail(64, 64).to_luma8();
+    let mut max = 0u8;
+    let mut sum = 0u64;
+    for pixel in sample.pixels() {
+        let value = pixel.0[0];
+        max = max.max(value);
+        sum += u64::from(value);
+    }
+    let count = sample.width().saturating_mul(sample.height()).max(1) as u64;
+    max <= 8 && sum / count <= 4
 }
 
 fn decode_raw_inner(src: &std::path::Path) -> Option<DynamicImage> {

@@ -1,6 +1,6 @@
 # 开发规范
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-22
 >
 > 本文档定义当前仓库的开发、测试、迁移、提交和 AI 协作规范。根级 [AGENTS.md](../AGENTS.md) 是 AI 的最短强制入口。
 
@@ -11,12 +11,12 @@
 - Windows 10/11。
 - Rust stable MSVC。
 - Visual Studio C++ Build Tools，包含 MSVC linker 和 Windows SDK。
-- Node.js 20 或更高版本。
+- Node.js 22（`package.json` 的 `engines` 约束为 `>=22 <25`）。
 - PowerShell 7 用于本地 smoke；普通 PowerShell 5.1 也可运行基础命令。
 
 辅助依赖：
 
-- `ffmpeg` / `ffprobe`：视频元数据和抽帧，缺失时按降级逻辑运行。
+- `ffmpeg` / `ffprobe`：开发时可由 PATH 提供；发布包必须使用经过 manifest 校验的 sidecar。
 - LLVM/libclang：HEIC 构建链需要。
 - Ollama：仅本地模型功能需要，不是应用编译前置。
 
@@ -26,7 +26,7 @@
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 
 npm run lint
 npm run typecheck
@@ -55,6 +55,22 @@ pwsh ./scripts/smoke.ps1
 cd src-tauri
 cargo test --test perf_probe -- --ignored --nocapture
 ```
+
+### 2.1 桌面构建入口
+
+三目标（Windows x64、macOS Apple Silicon、Linux x64）统一走 `scripts/desktop.mjs`：
+
+```powershell
+npm run desktop:dev            # node scripts/desktop.mjs dev [--target <triple>]
+npm run desktop:build          # node scripts/desktop.mjs build [--target <triple>]
+npm run desktop:check          # node scripts/desktop.mjs check [--target <triple>]
+```
+
+- `.cargo/config.toml` 不再无条件注入 `HEIF_BINARIES_DIR`；由 `desktop.mjs` 按实际 target triple 决定：仅 Windows x64 有本地 `heif-bin/` 覆盖时导出。
+- HEIF 依赖来源（现状，非“系统库”）：未设置 `HEIF_BINARIES_DIR` 时，`heif-rs 26.7.0` 的 `build.rs` 从固定 release 下载对应目标的预编译归档；若要离线/可控构建，先准备 `src-tauri/native/heif/<target>/`。
+- ffmpeg / ffprobe sidecar 放在 `src-tauri/binaries/`，命名为 `<name>-<triple>[.exe]`。用 `npm run prepare-media-tools -- --target <triple>` 按 manifest 下载、校验版本/归档 SHA256/最终二进制 SHA256/编码器/许可证；`build` 与 `desktop:check:strict` 会强校验，缺失或哨兵 SHA256 即失败。
+- 工具链固定：`src-tauri/rust-toolchain.toml`（channel=stable + rustfmt/clippy）与 `package.json` 的 `engines.node`（>=22 <25）记录已验证版本；跨目标由 CI 按 runner 安装。
+- 三目标 CI：`.github/workflows/code-gate.yml`（PR 代码门）与 `release-candidate.yml`（候选包门）。
 
 ## 3. 分层规范
 
@@ -94,6 +110,19 @@ commands -> services -> db
 - 事件名保持域前缀，例如 `ai://progress`、`export://progress`。
 - 取消使用 `AppState` 注册表，命令层不向 service 传 `AppHandle`。
 - 错误返回必须能形成用户可执行的信息。
+
+### 3.4 平台影响分类
+
+涉及平台、路径、进程、凭据、窗口、原生依赖或打包时，先读
+[PLATFORM.md](PLATFORM.md)，并在实现前把改动分类：
+
+1. **数据/业务逻辑**：默认三端一致，不引入路径分隔符、大小写或特定系统 API 假设。
+2. **操作系统资源**：通过所属 service 或统一能力层分派，补目标平台测试。
+3. **平台专属能力**：后端能力接口明确声明；前端从统一 store 消费，未知或加载失败时保守禁用。
+
+前端不得用 `navigator.platform`、UA 或散落的 `isWindows` 判断后端能力。静态能力、运行时健康和
+产品开关分别建模。Rust 的平台依赖写入 `Cargo.toml` target 表；新增条件编译点需说明为何不能
+收敛到现有平台边界。
 
 ## 4. 代码规范
 
@@ -190,6 +219,11 @@ pwsh ./scripts/smoke.ps1
 - 备份恢复：真实库、运行中任务和旧版本迁移。
 - 日志/可观测性：诊断包内容与脱敏、前端异常回传、panic/fatal 兜底、日志级别热切换。
 - UI：1366px、1920px、明暗主题和键盘操作。
+- 操作系统资源：在 Windows、目标 macOS 和目标 Ubuntu runner 编译并运行平台专属测试。
+- 平台专属能力：验证支持端正常、非支持端不发起请求且显示明确说明。
+
+三端 CI 的详细职责、候选包门禁和真机证据要求见 [TEST_STRATEGY.md](TEST_STRATEGY.md)。在
+macOS/Linux 自动门禁接入前，不得把 Windows 本地全绿表述为“三端通过”。
 
 ### 5.4 禁止行为
 
@@ -233,6 +267,8 @@ pwsh ./scripts/smoke.ps1
 
 - 默认分支为 `main`。
 - 新功能分支使用 `codex/` 前缀，除非用户另有要求。
+- 长期只保留 `main`；功能分支按行为目标拆分，不建立长期 Windows/macOS/Linux 分支。
+- 合并前必须等待受支持平台必需检查通过。基础设施故障豁免必须限时并记录恢复条件。
 - 不提交 `dist/`、`node_modules/`、`src-tauri/target*/`、日志、缓存和临时测试产物。
 - 提交前检查 `git diff --check`。
 - 功能、测试和对应文档在同一逻辑提交中。
@@ -249,6 +285,7 @@ pwsh ./scripts/smoke.ps1
 | 产品行为 | [PRD.md](PRD.md) |
 | 阶段状态 | [PROJECT_PLAN.md](PROJECT_PLAN.md) |
 | 架构和机制 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| 平台支持范围和能力差异 | [PLATFORM.md](PLATFORM.md) |
 | 机器协议 | [contracts](contracts/) |
 | UI 规范和令牌 | [UI_DESIGN_SYSTEM.md](UI_DESIGN_SYSTEM.md) |
 | 测试策略 | [TEST_STRATEGY.md](TEST_STRATEGY.md) |
@@ -271,11 +308,12 @@ pwsh ./scripts/smoke.ps1
 1. 读取 `AGENTS.md`、文档中心和任务相关权威文档。
 2. 查看 `git status` 和最近 diff，识别用户已有工作。
 3. 先定位真实实现和测试，不根据旧报告推断。
-4. 写清行为契约、失败路径和验证命令。
-5. 小步修改，避免无关重构。
-6. 运行定向测试，再运行完整门禁。
-7. 检查旧文档路径、测试数量、状态描述和协议是否漂移。
-8. 汇报修改、验证、未执行项和残余风险。
+4. 完成平台影响分类；涉及操作系统资源时读取 `PLATFORM.md` 并列出三端行为。
+5. 写清行为契约、失败路径和验证命令。
+6. 小步修改，避免无关重构。
+7. 运行定向测试，再运行完整门禁。
+8. 检查旧文档路径、测试数量、状态描述和协议是否漂移。
+9. 汇报修改、验证、未执行项和残余风险。
 
 ## 11. 完成定义
 

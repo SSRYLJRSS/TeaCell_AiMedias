@@ -3,11 +3,13 @@
  *  - 排除区（plan.mustNot）组标签「排除」；优先区（plan.should）组标签「优先」；
  *  - 排序 chip 独立 setSort；清除全部走 clearConditions；
  *  - 无 plan（纯手动链路）退回扁平 query 渲染。 */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import FilterChips from "@/components/supersearch/FilterChips";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
+import { useTagStore } from "@/stores/tagStore";
 import type { QueryExpr } from "@/types/queryExpr";
+import type { TagNode } from "@/types/tag";
 
 const tagLeaf = (facetKey: string, tagIds: number[]): QueryExpr => ({
   op: "leaf",
@@ -19,6 +21,27 @@ const searchLeaf = (value: string, scope: "all" | "content" | "fileName" = "all"
   cond: { type: "search", value, scope },
 });
 
+const treeTag = (id: number, name: string, facetKey: string): TagNode => ({
+  tag: {
+    id,
+    name,
+    canonicalName: name,
+    normalizedName: name,
+    facetKey,
+    parentId: null,
+    status: "active",
+    isSystem: false,
+    isPreset: false,
+    sortOrder: 0,
+    assetCount: 0,
+    totalCount: 0,
+    aliases: [],
+    path: name,
+    facetEffective: true,
+  },
+  children: [],
+});
+
 function setExprState(expr: QueryExpr | undefined, resolvedTags: { facetKey: string; text: string; tagId: number; path?: string }[] = []) {
   // §3.7：走真实 store action（setExpr → plan.filter），保证 plan/expr 一致（换源后 expr 是派生视图）
   useSuperSearchStore.getState().setExpr(expr);
@@ -28,6 +51,10 @@ function setExprState(expr: QueryExpr | undefined, resolvedTags: { facetKey: str
     warnings: [],
   });
 }
+
+afterEach(() => {
+  useTagStore.setState({ tree: [], facets: [] });
+});
 
 describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
   it("AND 树显示可读标签 chips：主体：建筑 + 色彩：红色", () => {
@@ -105,6 +132,31 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
     setExprState(tagLeaf("custom", [99]));
     render(<FilterChips />);
     expect(screen.getByText("自定义：标签#99")).toBeInTheDocument();
+  });
+
+  it("手动标签从实时标签树解析名称，覆盖必须/排除/优先三个区域", () => {
+    useTagStore.setState({
+      tree: [treeTag(101, "建筑", "subject"), treeTag(102, "夜景", "lighting"), treeTag(103, "女孩", "subject")],
+    });
+    const expr = tagLeaf("subject", [101]);
+    useSuperSearchStore.getState().setExpr(expr);
+    useSuperSearchStore.setState({
+      plan: {
+        planSchemaVersion: 3,
+        normalizationVersion: 1,
+        compilerVersion: 1,
+        filter: expr,
+        mustNot: tagLeaf("lighting", [102]),
+        should: [{ cond: { type: "tag", facetKey: "subject", tagIds: [103], mode: "any", includeDescendants: true }, weight: 1, label: "" }],
+        minimumShouldMatch: 0,
+        retrievers: { retrievers: [] },
+        ranking: { type: "field", key: "created_at", dir: "desc" },
+      },
+    });
+    render(<FilterChips />);
+    expect(screen.getByText("主体对象：建筑")).toBeInTheDocument();
+    expect(screen.getByText("光线/时间：夜景")).toBeInTheDocument();
+    expect(screen.getByText("标签：女孩")).toBeInTheDocument();
   });
 
   it("排序 chip 独立：调用 setSort（不碰 expr）", () => {

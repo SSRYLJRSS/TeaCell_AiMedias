@@ -1,8 +1,12 @@
 {
   "name": "bagertea_ai_media_v2",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.0",
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22 <25"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -10,7 +14,12 @@
     "lint": "eslint .",
     "test:unit": "vitest run",
     "tauri": "tauri",
-    "test:ignored": "cd src-tauri && cargo test -- --ignored"
+    "test:ignored": "cd src-tauri && cargo test -- --ignored",
+    "desktop:dev": "node scripts/desktop.mjs dev",
+    "desktop:build": "node scripts/desktop.mjs build",
+    "desktop:check": "node scripts/desktop.mjs check",
+    "desktop:check:strict": "node scripts/desktop.mjs check --strict-release",
+    "prepare-media-tools": "node scripts/prepare-media-tools.mjs"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.10.0",

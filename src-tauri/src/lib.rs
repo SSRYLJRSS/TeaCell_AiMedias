@@ -231,6 +231,19 @@ pub fn run() {
                 }
             });
 
+            // 本地 Ollama 生命周期：仅回收应用自己启动且连续空闲的服务；External 永不停止。
+            // 这是轻量的 30 秒巡检，不引入第二套任务系统。
+            let ollama_runtime = std::sync::Arc::clone(&state.ollama_runtime);
+            spawn_maintenance("ollama-idle-stop", move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if let Ok(mut runtime) = ollama_runtime.lock() {
+                    if runtime.should_auto_stop(crate::services::ollama_runtime::AUTO_STOP_IDLE) {
+                        tracing::info!("Ollama 服务空闲超时，由应用自动停止");
+                        runtime.stop_app_owned();
+                    }
+                }
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -376,6 +389,7 @@ pub fn run() {
             commands::ollama_delete_model,
             commands::ollama_model_dir,
             commands::ollama_open_model_dir,
+            commands::get_platform_capabilities,
             // 设置
             commands::get_settings,
             commands::save_settings,
@@ -383,6 +397,8 @@ pub fn run() {
             commands::open_data_dir,
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）
             commands::open_logs_dir,
+            // 设置页「关于」打开使用帮助（系统默认浏览器）
+            commands::open_help_page,
             // 前端异常与关键事件回传统一 tracing 文件
             commands::log_frontend,
             commands::export_diagnostics,

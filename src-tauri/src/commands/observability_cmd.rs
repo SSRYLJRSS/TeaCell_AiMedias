@@ -336,6 +336,9 @@ mod tests {
             base_url: "https://example.invalid/v1".into(),
             api_key: "sk-diagnostics-must-not-leak".into(),
             model: "mock-model".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         settings::save_settings(&conn, &saved).unwrap();
         conn.execute(

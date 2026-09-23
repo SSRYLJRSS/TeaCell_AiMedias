@@ -8,6 +8,7 @@ use crate::db::ai_connections;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::credentials;
+use crate::services::ollama_runtime;
 use crate::state::AppState;
 
 #[derive(Debug, serde::Serialize)]
@@ -19,6 +20,9 @@ pub struct AiConnectionView {
     pub protocol: String,
     pub base_url: String,
     pub model: String,
+    pub max_concurrency: i64,
+    pub requests_per_minute: i64,
+    pub requests_per_hour: i64,
     /// 是否已配置 API 密钥（不回显 plaintext；只暴露已配置/未配置）
     pub has_key: bool,
     pub enabled: bool,
@@ -48,6 +52,9 @@ pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnection
             protocol: c.protocol,
             base_url: c.base_url,
             model: c.model,
+            max_concurrency: c.max_concurrency,
+            requests_per_minute: c.requests_per_minute,
+            requests_per_hour: c.requests_per_hour,
             has_key,
             enabled: c.enabled,
         });
@@ -69,6 +76,9 @@ pub fn save_ai_connection(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    max_concurrency: Option<i64>,
+    requests_per_minute: Option<i64>,
+    requests_per_hour: Option<i64>,
 ) -> AppResult<AiConnectionView> {
     if id.trim().is_empty() || name.trim().is_empty() {
         return Err(AppError::msg("连接名称与内部标识不能为空"));
@@ -85,7 +95,20 @@ pub fn save_ai_connection(
             api_key_ref = Some(id.clone());
         }
     }
-    ai_connections::upsert(
+    let existing = ai_connections::get(&conn, id.trim())?;
+    let limits = (
+        max_concurrency
+            .unwrap_or_else(|| existing.as_ref().map(|c| c.max_concurrency).unwrap_or(0)),
+        requests_per_minute.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|c| c.requests_per_minute)
+                .unwrap_or(0)
+        }),
+        requests_per_hour
+            .unwrap_or_else(|| existing.as_ref().map(|c| c.requests_per_hour).unwrap_or(0)),
+    );
+    ai_connections::upsert_with_limits(
         &conn,
         id.trim(),
         name.trim(),
@@ -94,6 +117,9 @@ pub fn save_ai_connection(
         base_url.trim(),
         model.trim(),
         api_key_ref.as_deref(),
+        limits.0,
+        limits.1,
+        limits.2,
     )?;
     let c =
         ai_connections::get(&conn, id.trim())?.ok_or_else(|| AppError::msg("保存后读取失败"))?;
@@ -110,6 +136,9 @@ pub fn save_ai_connection(
         protocol: c.protocol,
         base_url: c.base_url,
         model: c.model,
+        max_concurrency: c.max_concurrency,
+        requests_per_minute: c.requests_per_minute,
+        requests_per_hour: c.requests_per_hour,
         has_key,
         enabled: c.enabled,
     })
@@ -179,7 +208,7 @@ pub async fn test_ai_connection(
 ) -> AppResult<crate::services::ai_cloud::AiConnectionTestResult> {
     // DB 与 keyring 都是阻塞调用：先在当前任务提取需要的数据（短锁），网络测试放 spawn_blocking。
     // State 不能 move 进 'static 闭包，所以这里克隆 Arc 后释放。
-    let (base_url, protocol, model, api_key, is_local) = {
+    let (base_url, protocol, model, api_key, managed_ollama) = {
         let conn = lock_db(&state)?;
         let c = ai_connections::get(&conn, &connection_id)?
             .ok_or_else(|| AppError::msg("连接档案不存在"))?;
@@ -191,17 +220,19 @@ pub async fn test_ai_connection(
             Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
             None => String::new(),
         };
-        (
-            c.base_url,
-            c.protocol,
-            c.model,
-            api_key,
-            c.deployment == "local",
-        )
+        let managed_ollama = cfg!(target_os = "windows")
+            && c.deployment == "local"
+            && c.protocol == "openai_chat"
+            && ollama_runtime::is_managed_ollama_base(&c.base_url);
+        (c.base_url, c.protocol, c.model, api_key, managed_ollama)
     };
     tauri::async_runtime::spawn_blocking(move || {
         Ok(crate::services::ai_cloud::test_connection(
-            &base_url, &api_key, &protocol, &model, is_local,
+            &base_url,
+            &api_key,
+            &protocol,
+            &model,
+            managed_ollama,
         ))
     })
     .await
@@ -254,13 +285,12 @@ pub async fn discover_ai_models(
             )
         }
     };
+    let managed_ollama = cfg!(target_os = "windows")
+        && deployment == "local"
+        && protocol == "openai_chat"
+        && ollama_runtime::is_managed_ollama_base(&base_url);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::services::ai_cloud::discover_models(
-            &base_url,
-            &key,
-            &protocol,
-            &deployment == "local",
-        )
+        crate::services::ai_cloud::discover_models(&base_url, &key, &protocol, managed_ollama)
     })
     .await
     .map_err(|e| AppError::msg(format!("模型发现任务失败: {e}")))?

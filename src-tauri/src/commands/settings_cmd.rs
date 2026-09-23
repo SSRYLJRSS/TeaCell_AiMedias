@@ -49,6 +49,18 @@ pub fn open_logs_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult
         .map_err(|e| AppError::msg(format!("打开日志目录失败: {e}")))
 }
 
+/// 打开使用帮助（固定飞书文档；通过系统默认浏览器访问）。
+#[tauri::command]
+pub fn open_help_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "https://my.feishu.cn/wiki/RGLmw1ExbiNcVvkk240cXJxjnmf?from=from_copylink",
+            None::<&str>,
+        )
+        .map_err(|e| AppError::msg(format!("打开使用帮助失败: {e}")))
+}
+
 /// 分类重置应用数据（设置页「存储与维护 → 重置数据」勾选传入）。
 /// 原始素材文件选项会先复用删除命令的锁外文件流程；磁盘删除失败的素材记录会保留，
 /// 其它数据库项仍按所选分类在事务内完成。

@@ -18,7 +18,7 @@ import type { LeafCond, QueryExpr } from "@/types/queryExpr";
 import type { PlanDiagnostics, SearchPlanV3, ShouldClause } from "@/types/superSearch";
 import { diagnoseSearchPlan } from "@/api/superSearch";
 import { normalizeExpr, serializeExpr } from "@/utils/queryExprUtils";
-import { reorderShould } from "@/utils/planUtils";
+import { isCompleteLeafCond, reorderShould } from "@/utils/planUtils";
 import type { ExprPath } from "@/utils/queryExprUtils";
 import {
   DATE_SHORTCUT_OPTIONS,
@@ -207,15 +207,15 @@ export default function QueryBuilder() {
       return;
     }
     setRoot(expr ? asRootGroup(exprToNode(expr)) : emptyGroup());
-  }, [exprSignature]);
-  const commitFilter = (next: VGroup) => {
+  }, [expr, exprSignature]);
+  const commitFilter = useCallback((next: VGroup) => {
     const nextExpr = nodeToExpr(next, circularKeys);
     const normalized = nextExpr ? normalizeExpr(nextExpr) : undefined;
     setRoot(next);
     lastLocalSignature.current = normalized ? serializeExpr(normalized) : "";
     setExpr(normalized);
-  };
-  const editFilter = useCallback((fn: (r: VGroup) => VGroup) => commitFilter(fn(root)), [root, circularKeys, setExpr]);
+  }, [circularKeys, setExpr]);
+  const editFilter = useCallback((fn: (r: VGroup) => VGroup) => commitFilter(fn(root)), [root, commitFilter]);
   // ═══ 排除区：平铺条件视图（根组连接词两态：命中任一 / 全部命中）═══
   const mustNotRoot = plan?.mustNot ?? null;
   const mustNotSig = mustNotRoot ? serializeExpr(mustNotRoot) : "";
@@ -227,20 +227,20 @@ export default function QueryBuilder() {
       return;
     }
     setExRoot(mustNotRoot ? asRootGroup(exprToNode(mustNotRoot)) : emptyMustNotGroup());
-  }, [mustNotSig]);
-  const commitMustNot = (next: VGroup) => {
+  }, [mustNotRoot, mustNotSig]);
+  const commitMustNot = useCallback((next: VGroup) => {
     // allowNegated=false：排除区树内禁 NOT（与后端 validate 同规则），遗留取反叶子不回写
     const nextExpr = nodeToExpr(next, circularKeys, false);
     const normalized = nextExpr ? normalizeExpr(nextExpr) : undefined;
     setExRoot(next);
     lastExSignature.current = normalized ? serializeExpr(normalized) : "";
     setPlanMustNot(normalized);
-  };
-  const editMustNot = useCallback((fn: (r: VGroup) => VGroup) => commitMustNot(fn(exRoot)), [exRoot, circularKeys, setPlanMustNot]);
+  }, [circularKeys, setPlanMustNot]);
+  const editMustNot = useCallback((fn: (r: VGroup) => VGroup) => commitMustNot(fn(exRoot)), [exRoot, commitMustNot]);
   // U-6：诊断叶子的 expr 路径（与后端 collect_leaves 对齐：NOT 子树按下标 0 展开）。
   // 视图叶子按 DFS 序与 expr 叶子一一配对；未完成叶子不进 expr，配对时跳过保持对齐。
-  const filterLeafPathById = useMemo(() => leafPathMap(root, collectLeafPaths(expr), circularKeys), [root, exprSignature, circularKeys]);
-  const mustNotLeafPathById = useMemo(() => leafPathMap(exRoot, collectLeafPaths(mustNotRoot ?? undefined), circularKeys), [exRoot, mustNotSig, circularKeys]);
+  const filterLeafPathById = useMemo(() => leafPathMap(root, collectLeafPaths(expr), circularKeys), [root, expr, circularKeys]);
+  const mustNotLeafPathById = useMemo(() => leafPathMap(exRoot, collectLeafPaths(mustNotRoot ?? undefined), circularKeys), [exRoot, mustNotRoot, circularKeys]);
   // U-6/§4.5：四指标诊断（diagnose_search_plan_cmd → PlanDiagnostics）——
   // 叶子带 zone（filter/mustNot），加分项带 index，warnings 与列表同批。
   const [diag, setDiag] = useState<PlanDiagnostics | null>(null);
@@ -265,22 +265,39 @@ export default function QueryBuilder() {
     const revisionAtRequest = planRevision;
     let alive = true;
     setDiag(null);
-    diagnoseSearchPlan(diagPlan, revisionAtRequest)
-      .then((d) => {
-        if (!alive) return;
-        // §3.7 不变式 9：诊断返回时代次过期 → 整批丢弃（旧诊断会指着新条件的位置）
-        if (d.leaves.some((l) => l.planRevision !== revisionAtRequest)) return;
-        if (d.should.some((s) => s.planRevision !== revisionAtRequest)) return;
-        setDiag(d);
-      })
-      .catch(() => { if (alive) setDiag(null); }); // 诊断只读且可失败：失败静默，不影响条件编辑
-    return () => { alive = false; };
+    const timer = window.setTimeout(() => {
+      diagnoseSearchPlan(diagPlan, revisionAtRequest)
+        .then((d) => {
+          if (!alive) return;
+          // §3.7 不变式 9：诊断返回时代次过期 → 整批丢弃（旧诊断会指着新条件的位置）
+          if (d.leaves.some((l) => l.planRevision !== revisionAtRequest)) return;
+          if (d.should.some((s) => s.planRevision !== revisionAtRequest)) return;
+          setDiag(d);
+        })
+        .catch(() => { if (alive) setDiag(null); }); // 诊断只读且可失败：失败静默，不影响条件编辑
+    }, 320);
+    return () => { alive = false; window.clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exprKey, plan ? `${plan.minimumShouldMatch}#${plan.should.length}#${plan.mustNot ? serializeExpr(plan.mustNot) : ""}` : "manual", planRevision, mustNotSig]);
   // U-5：优先（should）= 软排序，plan.should 为 store 单源，是非嵌套叶子（ShouldClause.cond）。
   // P1：minimumShouldMatch 恒 0（一条不中也全部保留，只调先后）；权重不外露，由位置统一生成。
   const shouldList = plan?.should ?? [];
   const setShould = (next: typeof shouldList) => setPlanShould(next, 0);
+  // 加分区的新增行先留在本地草稿中。只有条件完整后才写入 SearchPlan，
+  // 避免「标签：未选择」这种半成品触发后端诊断/查询。
+  const [shouldDraft, setShouldDraft] = useState<ShouldClause | null>(null);
+  const startShouldDraft = () => {
+    if (shouldDraft) return;
+    setShouldDraft({ cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" });
+  };
+  const updateShouldDraft = (next: ShouldClause) => {
+    if (isCompleteLeafCond(next.cond, circularKeys)) {
+      setShould([...shouldList, next]);
+      setShouldDraft(null);
+    } else {
+      setShouldDraft(next);
+    }
+  };
   const moveShould = (index: number, delta: -1 | 1) => {
     const nextIndex = index + delta;
     if (nextIndex < 0 || nextIndex >= shouldList.length) return;
@@ -362,8 +379,8 @@ export default function QueryBuilder() {
             <span className="text-[10px] text-[var(--color-text-tertiary)]">只调整顺序</span>
           </div>
           <div className="mt-3 flex flex-1 flex-col gap-1.5">
-            {shouldList.length === 0 ? (
-              <FirstConditionButton ariaLabel="+ 添加第一个优先条件" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" }])} />
+            {shouldList.length === 0 && !shouldDraft ? (
+              <FirstConditionButton ariaLabel="+ 添加第一个优先条件" onClick={startShouldDraft} />
             ) : (
               <>
                 {shouldList.map((sc, i) => (
@@ -390,10 +407,22 @@ export default function QueryBuilder() {
                     ) : null}
                   </div>
                 ))}
+                {shouldDraft && (
+                  <ConditionRow
+                    row={{ kind: "leaf", id: "should-draft", negated: false, cond: shouldDraft.cond }}
+                    allTagOptions={allTagOptions}
+                    zone="should"
+                    autoFocus
+                    rank={shouldList.length + 1}
+                    onMove={() => undefined}
+                    onChange={(patch) => { if (patch.cond) updateShouldDraft({ ...shouldDraft, cond: patch.cond }); }}
+                    onRemove={() => setShouldDraft(null)}
+                  />
+                )}
               </>
             )}
           </div>
-          {shouldList.length > 0 && <button type="button" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" }])} className="mt-1.5 h-7 px-1 text-left text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
+          {shouldList.length > 0 && !shouldDraft && <button type="button" onClick={startShouldDraft} className="mt-1.5 h-7 px-1 text-left text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
         </section>
         {/* ═══ 框三：排除（plan.mustNot）：根组连接词两态（命中任一 / 全部命中），行内禁取反 ═══ */}
         <section id="qb-zone-mustnot" role="tabpanel" aria-labelledby="qb-tab-mustNot" data-zone="mustNot" className={`${zonePanelClass} ${activeZone !== "mustNot" ? "max-[1179px]:hidden" : ""}`}>
@@ -464,7 +493,7 @@ function defaultMinFor(itemCount: number): number {
 /** 视图节点 → expr。未完成叶子和空节点剔除；嵌套历史/AI 节点保持原有结构。 */
 function nodeToExpr(n: VNode, circularKeys: ReadonlySet<string>, allowNegated = true): QueryExpr | undefined {
   if (n.kind === "leaf") {
-    if (!isComplete(n.cond, circularKeys)) return undefined;
+    if (!isCompleteLeafCond(n.cond, circularKeys)) return undefined;
     const leaf: QueryExpr = { op: "leaf", cond: n.cond };
     if (!n.negated) return leaf;
     return allowNegated ? { op: "not", child: leaf } : undefined;
@@ -541,7 +570,7 @@ function leafPathMap(viewRoot: VGroup, exprPaths: ExprPath[], circularKeys: Read
   let i = 0;
   const walk = (n: VNode) => {
     if (n.kind === "leaf") {
-      if (!isComplete(n.cond, circularKeys)) return;
+      if (!isCompleteLeafCond(n.cond, circularKeys)) return;
       if (i < exprPaths.length) m.set(n.id, exprPaths[i]);
       i += 1;
       return;
@@ -1726,30 +1755,6 @@ function changeFacetNumberOp(cond: Extract<LeafCond, { type: "facetNumber" }>, o
 }
 type FacetNumberOp = Extract<LeafCond, { type: "facetNumber" }>["op"];
 function changeMetadataOp(filter: MetadataFilter, op: MetadataOp): MetadataFilter { if (op === "between") return { key: filter.key, op, min: filter.min ?? filter.value, max: filter.max ?? filter.value }; if (op === "in") return { key: filter.key, op, values: filter.values ?? (filter.value === undefined ? [] : [filter.value]) }; return { key: filter.key, op, value: filter.value ?? filter.min }; }
-/** Phase 4（§4-3）：between 只有 circular（色相跨 0°）允许 min > max；其余倒置视为未完成，不写进条件。
- *  circular 集合来自 NumericDomain（单一事实源）；未加载时保守按非环形处理（不含倒置）。 */
-function isComplete(cond: LeafCond, circularKeys: ReadonlySet<string> = new Set()): boolean {
-  if (cond.type === "tag" || cond.type === "excludeTag") return cond.tagIds.length > 0;
-  if (cond.type === "search") return cond.value.trim().length > 0;
-  if (cond.type === "facetNumber") {
-    if (!Number.isFinite(cond.value)) return false;
-    if (cond.op === "between") {
-      if (cond.maxValue == null || !Number.isFinite(cond.maxValue)) return false;
-      return cond.value <= cond.maxValue; // 数值分面无环形量（色相是内置字段），倒置视为未完成
-    }
-    return true;
-  }
-  if (cond.type !== "metadata") return true;
-  if (cond.filter.op === "between") {
-    if (cond.filter.min === undefined || cond.filter.max === undefined) return false;
-    const lo = typeof cond.filter.min === "number" ? cond.filter.min : Number(cond.filter.min);
-    const hi = typeof cond.filter.max === "number" ? cond.filter.max : Number(cond.filter.max);
-    if (Number.isFinite(lo) && Number.isFinite(hi) && lo > hi && !circularKeys.has(cond.filter.key)) return false;
-    return true;
-  }
-  if (cond.filter.op === "in") return Boolean(cond.filter.values?.length);
-  return cond.filter.value !== undefined && cond.filter.value !== "";
-}
 /** P0（日期线格式）：DateValue 的显示层归一 —— YYYY-MM-DD 字符串原样返回；
  *  历史持久化里的 epoch 数字（旧格式）转本地日期；其余返回空串。提交侧只写字符串。 */
 function toDateInputValue(value: string | number | undefined): string {

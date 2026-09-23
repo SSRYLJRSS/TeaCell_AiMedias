@@ -211,14 +211,268 @@ pub struct SearchIntentV3 {
 /// 注意故意**不含**「可有可无」——那是弱表达，原句只含它时记 info（见指南真值表）。
 pub const CORE_PREF_HINTS: &[&str] = &["最好", "优先", "尽量", "更好", "倾向", "接近", "偏"];
 
-/// S3：preferred 的 evidence 一致性守卫（纯函数；只降级，绝不反向升级）。
+/// 用于判断“偏好短语覆盖范围”的弱表达。它不能单独触发缺失偏好告警，
+/// 但如果模型把相应概念放进了 concepts，仍应阻止它被当成硬条件。
+const PREFERENCE_SCOPE_HINTS: &[&str] = &[
+    "最好",
+    "优先",
+    "尽量",
+    "更好",
+    "倾向",
+    "接近",
+    "偏",
+    "可有可无",
+];
+
+#[derive(Debug, Clone)]
+struct PreferenceSpan {
+    start: usize,
+    end: usize,
+    evidence: String,
+}
+
+fn fold_match_char(c: char) -> char {
+    match c {
+        'Ａ'..='Ｚ' => ((c as u32 - 'Ａ' as u32) as u8 + b'a') as char,
+        'ａ'..='ｚ' => ((c as u32 - 'ａ' as u32) as u8 + b'a') as char,
+        _ => c.to_ascii_lowercase(),
+    }
+}
+
+fn folded_chars(text: &str) -> Vec<char> {
+    text.chars().map(fold_match_char).collect()
+}
+
+fn clause_delimiter(c: char) -> bool {
+    matches!(
+        c,
+        '，' | ',' | '。' | '.' | '；' | ';' | '！' | '!' | '？' | '?' | '\n'
+    )
+}
+
+fn contains_at(haystack: &[char], start: usize, needle: &[char]) -> bool {
+    !needle.is_empty()
+        && start.saturating_add(needle.len()) <= haystack.len()
+        && haystack[start..start + needle.len()] == *needle
+}
+
+fn preference_spans(input: &str) -> Vec<PreferenceSpan> {
+    let chars: Vec<char> = input.chars().collect();
+    let folded = folded_chars(input);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    for hint in PREFERENCE_SCOPE_HINTS {
+        let needle = folded_chars(hint);
+        if needle.is_empty() || needle.len() > folded.len() {
+            continue;
+        }
+        for i in 0..=folded.len() - needle.len() {
+            if !contains_at(&folded, i, &needle) {
+                continue;
+            }
+            let mut start = i;
+            while start > 0 && !clause_delimiter(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i + needle.len();
+            while end < chars.len() && !clause_delimiter(chars[end]) {
+                end += 1;
+            }
+            if start < end {
+                ranges.push((start, end));
+            }
+        }
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let evidence: String = chars[start..end].iter().collect();
+            let evidence = evidence.trim().to_string();
+            (!evidence.is_empty()).then_some(PreferenceSpan {
+                start,
+                end,
+                evidence,
+            })
+        })
+        .collect()
+}
+
+fn dictionary_surface_terms(dictionary: &[String], concept: &str) -> Vec<String> {
+    let concept_key: String = folded_chars(concept).into_iter().collect();
+    let mut out = vec![concept.trim().to_string()];
+
+    for line in dictionary {
+        let mut term: Option<String> = None;
+        let mut aliases: Vec<String> = Vec::new();
+        for part in line.split('|').map(str::trim) {
+            if let Some(value) = part.strip_prefix("term:") {
+                term = Some(value.trim().to_string());
+            } else if let Some(value) = part.strip_prefix("aliases:") {
+                aliases.extend(
+                    value
+                        .split('、')
+                        .flat_map(|v| v.split(','))
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+            }
+        }
+        let Some(canonical) = term else { continue };
+        let matches = folded_chars(&canonical).into_iter().collect::<String>() == concept_key
+            || aliases
+                .iter()
+                .any(|alias| folded_chars(alias).into_iter().collect::<String>() == concept_key);
+        if matches {
+            out.push(canonical);
+            out.extend(aliases);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    out.into_iter()
+        .filter(|term| {
+            let key: String = folded_chars(term).into_iter().collect();
+            !key.is_empty() && seen.insert(key)
+        })
+        .collect()
+}
+
+fn term_occurrences(haystack: &[char], term: &[char]) -> Vec<(usize, usize)> {
+    if term.is_empty() || term.len() > haystack.len() {
+        return Vec::new();
+    }
+    (0..=haystack.len() - term.len())
+        .filter(|&i| contains_at(haystack, i, term))
+        .map(|i| (i, i + term.len()))
+        .collect()
+}
+
+/// 修正模型把“最好/优先”概念放入 concepts 的情况。
+///
+/// 这一步使用当前发送给模型的标签词典，因此既支持原文直接出现规范名，
+/// 也支持“年轻”→“青年”这类别名归一化。只移动能在偏好短语中找到、且没有
+/// 在偏好短语外再次出现的概念；后者保留为硬条件，避免误伤“要女性，最好年轻”。
+pub fn repair_misplaced_preferred(
+    input: &str,
+    dictionary: &[String],
+    intent: &mut SearchIntentV3,
+) -> Vec<String> {
+    let spans = preference_spans(input);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let input_folded = folded_chars(input);
+    let mut warnings = Vec::new();
+
+    for group in &mut intent.groups {
+        let mut kept = Vec::with_capacity(group.concepts.len());
+        let mut moved = Vec::new();
+        for concept in group.concepts.drain(..) {
+            let terms = dictionary_surface_terms(dictionary, &concept.text);
+            // 单字概念（如“人”）容易成为其他词的子串，宁可交给模型的
+            // preferred 槽位处理，也不在这里猜测其语义范围。
+            let terms: Vec<Vec<char>> = terms
+                .iter()
+                .filter_map(|term| {
+                    let folded = folded_chars(term);
+                    (folded.len() >= 2).then_some(folded)
+                })
+                .collect();
+            let mut soft_evidence: Option<String> = None;
+            let mut hard_occurrence = false;
+
+            'terms: for term in terms {
+                for (start, end) in term_occurrences(&input_folded, &term) {
+                    if spans
+                        .iter()
+                        .any(|span| start >= span.start && end <= span.end)
+                    {
+                        if soft_evidence.is_none() {
+                            soft_evidence = spans
+                                .iter()
+                                .find(|span| start >= span.start && end <= span.end)
+                                .map(|span| span.evidence.clone());
+                        }
+                    } else {
+                        hard_occurrence = true;
+                        break 'terms;
+                    }
+                }
+            }
+
+            if let Some(evidence) = soft_evidence.filter(|_| !hard_occurrence) {
+                let mut preferred = concept;
+                preferred.necessity = Necessity::Preferred;
+                preferred.weight = Some(preferred.weight.unwrap_or(1.0));
+                preferred.evidence = Some(evidence);
+                moved.push(preferred);
+            } else {
+                kept.push(concept);
+            }
+        }
+        if !moved.is_empty() {
+            let labels = moved
+                .iter()
+                .map(|c| c.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("、");
+            warnings.push(format!(
+                "检测到偏好条件被放入必须区，已将「{labels}」纠正为优先条件。"
+            ));
+            group.concepts = kept;
+            group.preferred.extend(moved);
+        } else {
+            group.concepts = kept;
+        }
+    }
+
+    // 同一概念同时出现在两个区时，只有在它没有被纠正为 preferred 的情况下才
+    // 保留硬条件；硬条件优先，避免重复 should 造成解释和排序混乱。
+    for group in &mut intent.groups {
+        let required: std::collections::HashSet<String> = group
+            .concepts
+            .iter()
+            .map(|c| folded_chars(&c.text).into_iter().collect())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        group.preferred.retain(|concept| {
+            let key: String = folded_chars(&concept.text).into_iter().collect();
+            if required.contains(&key) {
+                warnings.push(format!(
+                    "「{}」同时出现在必须和优先区，已按必须条件执行。",
+                    concept.text
+                ));
+                false
+            } else {
+                seen.insert(key)
+            }
+        });
+    }
+    warnings
+}
+
+/// S3：preferred 的 evidence 一致性守卫（纯函数；只保留或丢弃，绝不反向升级）。
 /// ① evidence 必须是原句的**真子串**（trim + 全角/半角 + 大小写归一后比较）——
-///    模型编造依据 → 降级 required + warning（这条最强：要求依据落回原文）。
-/// ② evidence 必须覆盖该 concept 的 text 或其邻域（±8 字窗口，字节安全）——
-///    防止摘一段无关的话当依据。
+///    模型编造依据 → 丢弃该 preferred + warning（软条件绝不能被强化成 required）。
+/// ② 规范标签可能是原文同义词的归一名（如「年轻」→「青年」），因此概念与 evidence
+///    的关联在数据库解析阶段用规范名+可搜索别名复核，不能在这里做规范名逐字比较。
 /// ③ 兜底信号（只提示不降级）：原句含任一强偏好词则静默；不含 → info warning
 ///    「原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）」。
-/// 降级：把条目从 preferred 移到 concepts 且 necessity=Required（依据保留可诊断）。
+/// 不满足证据要求时从 preferred 移除并保留 warning；required 条件只来自模型的 required 槽位。
 pub fn guard_preferred(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
     let mut warnings = Vec::new();
     let norm = |s: &str| crate::db::tags::normalize_name(s);
@@ -227,75 +481,57 @@ pub fn guard_preferred(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
         return warnings;
     }
     let core_hint = CORE_PREF_HINTS.iter().any(|h| input_n.contains(h));
-    // 需要降级回 concepts 的 preferred 下标（倒序移回保序）
-    let mut demote: Vec<usize> = Vec::new();
+    // 证据不可信的 preferred 下标（倒序移除保序）
+    let mut drop: Vec<usize> = Vec::new();
     for (i, c) in group.preferred.iter().enumerate() {
-        let text_n = norm(&c.text);
-        if text_n.is_empty() {
-            demote.push(i);
+        if norm(&c.text).is_empty() {
+            drop.push(i);
             continue;
         }
         let Some(ev) = c.evidence.as_deref() else {
             warnings.push(format!(
-                "「{}」被标为加分项但没给出依据，已按必须处理（加分项必须说明依据）。",
+                "「{}」被标为加分项但没给出依据，已忽略该加分项。",
                 c.text
             ));
-            demote.push(i);
+            drop.push(i);
             continue;
         };
         let ev_n = norm(ev);
         // ① 依据必须是原句真子串
         if ev_n.is_empty() || !input_n.contains(&ev_n) {
             warnings.push(format!(
-                "「{}」的加分依据未落在原句（不可编造），已按必须处理。",
+                "「{}」的加分依据未落在原句（不可编造），已忽略该加分项。",
                 c.text
             ));
-            demote.push(i);
+            drop.push(i);
             continue;
         }
-        // ② 依据覆盖 concept 或其 ±8 字邻域
-        let ev_start = input_n.find(&ev_n).unwrap_or(0);
-        let ev_end = ev_start + ev_n.len();
-        let covered = input_n
-            .find(&text_n)
-            .map(|p| {
-                let win_start = p.saturating_sub(24); // ±8 字（中文 3B ≈ 24B）
-                let win_end = (p + text_n.len() + 24).min(input_n.len());
-                ev_start < win_end && ev_end > win_start
-            })
-            .unwrap_or(false);
-        if !covered {
-            warnings.push(format!(
-                "「{}」的加分依据与概念本身无关（应摘原文里围绕该词的片段），已按必须处理。",
-                c.text
-            ));
-            demote.push(i);
-            continue;
-        }
+        // ② 概念与 evidence 的关联在 build_plan_from_v3 中用数据库词典复核。
+        // 这里不能拿规范名做字面窗口匹配，否则「年轻女性」→「青年+女性」会被误删。
         // ③ 原句没有强偏好词 → info（保留 preferred）
         if !core_hint {
             warnings
                 .push("原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）。".to_string());
         }
     }
-    // 倒序移回 concepts（保序）
-    let mut moved: Vec<SearchConceptV3> = Vec::new();
-    for &i in demote.iter().rev() {
-        if let Some(c) = group.preferred.get(i) {
-            let mut c = c.clone();
-            c.necessity = Necessity::Required;
-            moved.push(c);
-        }
-    }
     group.preferred = group
         .preferred
         .iter()
         .enumerate()
-        .filter(|(i, _)| !demote.contains(i))
+        .filter(|(i, _)| !drop.contains(i))
         .map(|(_, c)| c.clone())
         .collect();
-    group.concepts.extend(moved);
     warnings
+}
+
+fn warn_missing_preferred(input: &str, groups: &[SearchGroupV3]) -> Vec<String> {
+    if !CORE_PREF_HINTS.iter().any(|hint| input.contains(hint)) {
+        return Vec::new();
+    }
+    if groups.iter().any(|group| !group.preferred.is_empty()) {
+        return Vec::new();
+    }
+    vec!["原文包含偏好表达，但未能生成可选加分条件；未自动改写，请检查解析结果。".into()]
 }
 
 /// 已解析标签（前端展示）
@@ -533,6 +769,47 @@ pub fn guard_intent(input: &str, intent: &mut SearchIntentV2) -> Vec<String> {
     warnings
 }
 
+/// 对用户明确写出的单位/构图约束做轻量覆盖检查。
+/// 这不是替模型补条件，而是防止「条件被悄悄吃掉」：保留已解析结果，同时给出可理解 warning。
+pub fn warn_missing_explicit_metadata(input: &str, intent: &SearchIntentV2) -> Vec<String> {
+    let lower = input.to_ascii_lowercase();
+    let has_key = |key: &str| {
+        intent
+            .groups
+            .iter()
+            .any(|g| g.metadata.iter().any(|m| m.key == key))
+    };
+    let mut warnings = Vec::new();
+    if (lower.contains("kb")
+        || lower.contains("mb")
+        || lower.contains("gb")
+        || input.contains("兆"))
+        && !has_key("file_size")
+    {
+        warnings.push("原文包含文件大小条件，但未生成 file_size 条件，已保留其他条件。".into());
+    }
+    if (input.contains("秒") || input.contains("分钟")) && !has_key("duration_ms") {
+        warnings.push("原文包含视频时长条件，但未生成 duration_ms 条件，已保留其他条件。".into());
+    }
+    if [
+        "横图",
+        "横版",
+        "横屏",
+        "竖图",
+        "竖版",
+        "竖屏",
+        "方图",
+        "正方形",
+    ]
+    .iter()
+    .any(|word| input.contains(word))
+        && !has_key("aspect_ratio")
+    {
+        warnings.push("原文包含横竖构图条件，但未生成 aspect_ratio 条件，已保留其他条件。".into());
+    }
+    warnings
+}
+
 fn clean_concepts(
     concepts: &mut Vec<SearchConceptV2>,
     warnings: &mut Vec<String>,
@@ -661,6 +938,47 @@ fn resolve_concept(
         Ok(ConceptOutcome::Dropped(format!(
             "未采用概念「{text}」（置信度过低，无法可靠映射）"
         )))
+    }
+}
+
+/// 在规范化解析后复核 preferred 的 evidence 是否确实指向该概念。
+///
+/// AI 输出的是规范叶子名，而用户原文可能只出现别名或自然语言变体；因此这里
+/// 同时检查标签名、模型使用的表面词和当前事实源中的可搜索别名。这样既保留
+/// 「年轻女性」→「青年」这种合法归一化，也继续拦截「蓝天」配「最好清新」这类
+/// 原文中没有概念依据的加分项。
+fn preferred_evidence_matches(
+    conn: &Connection,
+    c: &SearchConceptV3,
+    outcome: &ConceptOutcome,
+) -> AppResult<bool> {
+    let Some(evidence) = c.evidence.as_deref() else {
+        return Ok(false);
+    };
+    let evidence = tags::normalize_name(evidence);
+    if evidence.is_empty() {
+        return Ok(false);
+    }
+    let contains_term = |term: &str| {
+        let normalized = tags::normalize_name(term);
+        !normalized.is_empty() && evidence.contains(&normalized)
+    };
+    match outcome {
+        ConceptOutcome::Tag(resolved) => {
+            let display_name = resolved
+                .path
+                .rsplit(" / ")
+                .next()
+                .unwrap_or(resolved.text.as_str());
+            if contains_term(display_name) || contains_term(&resolved.text) {
+                return Ok(true);
+            }
+            Ok(tags::searchable_aliases(conn, resolved.tag_id)?
+                .iter()
+                .any(|alias| contains_term(alias)))
+        }
+        ConceptOutcome::Content(term) => Ok(contains_term(term)),
+        ConceptOutcome::Dropped(_) => Ok(false),
     }
 }
 
@@ -834,7 +1152,9 @@ pub fn build_plan_from_v3(
     Vec<ResolvedTag>,
     Vec<String>,
 )> {
-    use crate::db::search_plan::{Ranking, RetrieverPlan, SearchPlanV3, ShouldClause};
+    use crate::db::search_plan::{
+        Ranking, RetrieverPlan, SearchPlanV3, ShouldClause, MAX_SHOULD_CLAUSES,
+    };
     let mut warnings = Vec::new();
     let mut resolved_tags: Vec<ResolvedTag> = Vec::new();
 
@@ -1007,6 +1327,19 @@ pub fn build_plan_from_v3(
     let mut should: Vec<ShouldClause> = Vec::new();
     for g in &intent.groups {
         for c in &g.preferred {
+            // 规范名与用户原文可能是同义词；先按数据库词典复核 evidence，
+            // 再进入 should，避免在解析阶段用规范名字面比较造成误删。
+            let preferred_outcome = resolve_concept(conn, &as_v2(c), false)?;
+            if c.evidence.is_some()
+                && !matches!(&preferred_outcome, ConceptOutcome::Dropped(_))
+                && !preferred_evidence_matches(conn, c, &preferred_outcome)?
+            {
+                warnings.push(format!(
+                    "「{}」的加分依据与概念本身无关（应摘原文里围绕该词的片段），已忽略该加分项。",
+                    c.text
+                ));
+                continue;
+            }
             if let Some(leaf) = collect(&mut warnings, &mut resolved_tags, concept_leaf(c)?) {
                 let label = format!("{}（加分项）", c.text.trim());
                 // §4.3：权重收拢到三档 0.5/1.0/2.0（后端校验只认这三档）
@@ -1024,6 +1357,13 @@ pub fn build_plan_from_v3(
                 });
             }
         }
+    }
+
+    if should.len() > MAX_SHOULD_CLAUSES {
+        warnings.push(format!(
+            "加分项超过 {MAX_SHOULD_CLAUSES} 条，已按当前优先顺序保留前 {MAX_SHOULD_CLAUSES} 条。"
+        ));
+        should.truncate(MAX_SHOULD_CLAUSES);
     }
 
     // ranking：有 preferred → 相关度（should 加权）；否则按意图 sort（命令层给默认）。
@@ -1135,33 +1475,28 @@ pub fn collect_tag_dictionary(
     let mut per_facet: Vec<Vec<String>> = Vec::new();
     for f in facets {
         let mut stmt = conn.prepare(
-            "SELECT t.name, p.name,
-                    (SELECT GROUP_CONCAT(ta.normalized_alias, ',') FROM (
-                        SELECT ta.normalized_alias FROM tag_aliases ta
-                         WHERE ta.tag_id = t.id AND ta.is_searchable = 1
-                         ORDER BY ta.id LIMIT ?2) ta)
+            "SELECT t.id, t.name, p.name
                FROM tags t
-               LEFT JOIN tags p ON p.id = t.parent_id
+              LEFT JOIN tags p ON p.id = t.parent_id
               WHERE t.facet_key = ?1 AND COALESCE(t.status,'active') = 'active'
-              ORDER BY t.sort_order, t.id LIMIT ?3",
+              ORDER BY t.sort_order, t.id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![
-                f.key.as_str(),
-                DICT_MAX_ALIASES as i64,
-                DICT_MAX_PER_FACET as i64
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )?;
+        // 先收集行再读取别名，避免在同一个 SQLite statement 仍借用连接时
+        // 重新查询 tag_terms/tag_aliases。
+        let rows = stmt
+            .query_map(
+                rusqlite::params![f.key.as_str(), DICT_MAX_PER_FACET as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         let mut lines = Vec::new();
-        for row in rows {
-            let (name, parent, aliases) = row?;
+        for (tag_id, name, parent) in rows {
             let name = sanitize_dict_text(&name);
             if name.is_empty() {
                 continue;
@@ -1173,20 +1508,17 @@ pub fn collect_tag_dictionary(
                 Some(parent) => format!("{parent} / {name}"),
                 None => name.clone(),
             };
-            let line = match aliases {
-                Some(a) => {
-                    let list: Vec<String> = a
-                        .split(',')
-                        .map(|s| sanitize_dict_text(s.trim()))
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if list.is_empty() {
-                        format!("{path} | term: {name}")
-                    } else {
-                        format!("{path} | term: {name} | aliases: {}", list.join(", "))
-                    }
-                }
-                None => format!("{path} | term: {name}"),
+            let aliases = tags::searchable_aliases(conn, tag_id)?;
+            let list: Vec<String> = aliases
+                .into_iter()
+                .take(DICT_MAX_ALIASES)
+                .map(|s| sanitize_dict_text(s.trim()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            let line = if list.is_empty() {
+                format!("{path} | term: {name}")
+            } else {
+                format!("{path} | term: {name} | aliases: {}", list.join(", "))
             };
             lines.push(line);
         }
@@ -1263,8 +1595,8 @@ pub fn parse_intent_v3(content: &str) -> AppResult<SearchIntentV3> {
         .map_err(|e| AppError::msg(format!("AI JSON 校验失败：{e}")))
 }
 
-/// V3 → V2 视图：concepts 降为 V2（丢弃 preferred —— 调用方先跑 guard_preferred，
-/// 不合法 preferred 已并入 concepts）。清洗/守卫复用 V2 全套函数。
+/// V3 → V2 视图：concepts 降为 V2（暂时丢弃 preferred；调用方在回写 V3 时保留它）。
+/// 清洗/守卫复用 V2 全套函数。
 pub fn v3_to_v2_view(intent: &SearchIntentV3) -> SearchIntentV2 {
     SearchIntentV2 {
         groups: intent
@@ -1606,7 +1938,15 @@ pub fn request_intent(
         return Ok(keyword_fallback_v3(text));
     }
     // ②/③/④：V3 解析（含 preferred evidence 守卫）+ lenient + 结构校验，全部失败落第 3 层
-    let (intent, warnings) = degrade_parse_v3(&raw, text, facets);
+    let (mut intent, mut warnings) = degrade_parse_v3(&raw, text, facets);
+    // 模型偶尔会把“最好/优先”短语里的规范标签放进 concepts。
+    // 解析阶段拿不到数据库连接，但这里的 dictionary 正是同一轮请求读取的当前标签词典，
+    // 可用于把“年轻”→“青年”这类别名安全地归回 preferred。
+    warnings.retain(|warning| {
+        warning != "原文包含偏好表达，但未能生成可选加分条件；未自动改写，请检查解析结果。"
+    });
+    warnings.extend(repair_misplaced_preferred(text, dict, &mut intent));
+    warnings.extend(warn_missing_preferred(text, &intent.groups));
     tracing::info!(
         operation = "super_search_ai",
         stage = "request_done",
@@ -1637,7 +1977,10 @@ pub fn degrade_parse(
     };
     // lenient：部分剔除规则（W6-3），原则「能救一条算一条」
     let mut warnings = sanitize_all(&mut intent, facets);
-    if intent.groups.is_empty() && intent.exclusions.is_empty() {
+    warnings.extend(warn_missing_explicit_metadata(text, &intent));
+    // 只有排除项没有正向主体时，无法形成用户期望的搜索集合；按整句关键词兜底，
+    // 避免「乱码 + 不要 X」退化成几乎全库的纯 mustNot 查询。
+    if intent.groups.is_empty() {
         warnings.push("未能理解搜索条件，已按关键词搜索。".into());
         return (keyword_intent(text), warnings);
     }
@@ -1650,8 +1993,10 @@ pub fn degrade_parse(
 
 /// S3：V3 解析层（V3→V2→关键词 三层降级）。
 /// ① strict V3：parse SearchIntentV3（含 preferred）→ 每组跑 guard_preferred（evidence 守卫）
-///    → V3 侧清洗（concepts/preferred 都过 clean_concepts_v3）→ 转 V2 视图跑 sanitize_all +
-///    guard_intent + validate_intent（复用既有确定性守卫）→ 通过则保留 preferred 返回 V3。
+///    → V3 侧清洗（concepts/preferred 都过 clean_concepts_v3）→ 转 V2 视图跑
+///    sanitize_all_preserving_preferred + guard_intent + validate_intent（复用既有确定性守卫）
+///    → 通过则保留 preferred 返回 V3。模型把偏好放进 concepts 的纠偏在 request_intent
+///    中结合本轮标签词典执行，避免把规范名/别名误判为硬条件。
 /// ② V3 解析失败 → 试 V2（把 preferred 当 concepts 的语义 = V2 JSON 无 preferred 字段）→ v2_to_v3。
 /// ③ 都失败 → 关键词兜底（V3 形态）。永不 Err。
 pub fn degrade_parse_v3(
@@ -1669,7 +2014,7 @@ pub fn degrade_parse_v3(
     };
     // ① strict V3 路径
     let mut warnings: Vec<String> = Vec::new();
-    // evidence 守卫（只降级 preferred → concepts；绝不反向升级）
+    // evidence 守卫（无效 preferred 只丢弃；绝不反向升级为 required）
     for g in &mut intent.groups {
         warnings.extend(guard_preferred(text, g));
     }
@@ -1680,19 +2025,32 @@ pub fn degrade_parse_v3(
         clean_concepts_v3(&mut g.preferred, &mut warnings, &mut total);
     }
     clean_concepts_v3(&mut intent.exclusions, &mut warnings, &mut total);
+    warnings.extend(warn_missing_preferred(text, &intent.groups));
     if total > 20 {
         warnings.push(format!(
             "条件概念较多（{total} 个），已按置信度优先截取 20 个。"
         ));
     }
-    if intent.groups.is_empty() && intent.exclusions.is_empty() {
+    if intent.groups.is_empty() {
         warnings.push("未能理解搜索条件，已按关键词搜索。".into());
         return (keyword_intent_v3(text), warnings);
     }
     // V2 视图确定性守卫（assetType / OR 合并 / 组去重 / metadata 白名单编译）
     let mut v2_view = v3_to_v2_view(&intent);
-    warnings.extend(sanitize_all(&mut v2_view, facets));
+    // V2 视图看不到 preferred；纯“最好有 X”查询虽然 filter 为空，仍必须保留
+    // 这个占位 group，才能把 preferred 继续带到 SearchPlanV3.should。没有任何
+    // preferred 时仍使用普通空组清理，避免畸形空 JSON 退化成全库查询。
+    if intent.groups.iter().any(|g| !g.preferred.is_empty()) {
+        warnings.extend(sanitize_all_preserving_preferred(&mut v2_view, facets));
+    } else {
+        warnings.extend(sanitize_all(&mut v2_view, facets));
+    }
     warnings.extend(guard_intent(text, &mut v2_view));
+    warnings.extend(warn_missing_explicit_metadata(text, &v2_view));
+    if v2_view.groups.is_empty() {
+        warnings.push("未能理解搜索条件，已按关键词搜索。".into());
+        return (keyword_intent_v3(text), warnings);
+    }
     if let Err(e) = validate_intent(&v2_view, facets) {
         warnings.push(format!("解析结果不合规（{e}），已按关键词搜索。"));
         return (keyword_intent_v3(text), warnings);
@@ -1881,6 +2239,23 @@ pub fn is_keyword_fallback_v3(intent: &SearchIntentV3, text: &str) -> bool {
 /// 覆盖：sortBy / sortDir / assetType 非法→默认；单条 metadata 非法→剔除（复用 sanitize_metadata）；
 /// concept.facetHint 未知→降级全分面搜索；空概念剔除；全空 group 剔除。
 pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) -> Vec<String> {
+    sanitize_all_with_options(intent, facets, false)
+}
+
+/// V3 解析专用清洗：V2 视图可能只有一个由 preferred 支撑的空 group，不能在
+/// 丢失 preferred 的视图阶段把它删掉。普通 V2 调用仍使用 `sanitize_all` 的旧语义。
+fn sanitize_all_preserving_preferred(
+    intent: &mut SearchIntentV2,
+    facets: &[FacetPromptContext],
+) -> Vec<String> {
+    sanitize_all_with_options(intent, facets, true)
+}
+
+fn sanitize_all_with_options(
+    intent: &mut SearchIntentV2,
+    facets: &[FacetPromptContext],
+    preserve_empty_groups: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     // sortBy 非法 → 默认（由命令层 sort_by unwrap_or created_at 兜底）
     if let Some(sb) = &intent.sort_by {
@@ -1929,6 +2304,9 @@ pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) 
         let has_type = g.asset_type != "all";
         let has_untagged = g.untagged_only;
         if !has_concept && !has_term && !has_meta && !has_type && !has_untagged {
+            if preserve_empty_groups {
+                return true;
+            }
             warnings.push("一组条件为空，已忽略。".into());
         }
         has_concept || has_term || has_meta || has_type || has_untagged
@@ -1966,7 +2344,7 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str(&format!("硬规则：\n1. 每个 concept 是原子化规范名词或短名词短语（中文 1-6 字），禁止「晚上拍的树」「画面中有很多人」这类句子片段。\n2. 连接/方位/语法词不作 concept。共享停用词：{stop}。\n"));
     p.push_str("3. 同义概念只输出一次：如「多人、人群」按词典二选一，不同时输出。\n");
     p.push_str("3.1 人物统一走 people：男子/女子/老人/年轻人/男孩/女孩等人物词必须映射到 people 的原子属性；多人/单人/双人/人群/无人也属于 people。禁止把人物、人数、性别、年龄或穿着写成 subject。\n");
-    p.push_str("3.2 subject 中的人只写「人」；具体性别、年龄、穿着、人数和动作必须拆成 people 的多个 concept。例如「年轻女性」→ people:[青年,女性]，查询执行时二者同时命中。\n");
+    p.push_str("3.2 subject 中的人只写「人」；具体性别、年龄、穿着、人数和动作必须拆成 people 的多个 concept。拆词只改变标签名称，不改变原句的必须/优先性质：例如「年轻女性」→ people:[青年,女性]；「最好要年轻女性」→ concepts:[]、preferred:[青年,女性]；「要女性，最好年轻」→ concepts:[女性]、preferred:[青年]；「必须是年轻女性」→ concepts:[青年,女性]、preferred:[]。\n");
     p.push_str("3.3 有树、看到建筑等视觉对象走 subject；在树林里、在城市街道等空间地点走 scene。不得把同一个物体词同时写入 subject 和 scene。\n");
     p.push_str("4. assetType 只有用户明确说 图片/照片/相片/图像（image）或 视频/录像/片段/短片（video）时才填；「拍的」不算。\n");
     p.push_str("5. 「晚上拍的」解析为「夜间」或「夜景」概念，不保留整句。\n");
@@ -1976,15 +2354,18 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("9. 「不要/排除/除了」对应的原子概念放入全局 exclusions，不混入正向 group。\n");
     p.push_str("10. 不输出 tagId、SQL、分页、空字符串条件或 schema 之外字段。\n");
     p.push_str("11. confidence 0-1：能从词典精确命中给 0.9+；只能猜测给 0.6 左右；完全不确认给 0.5 以下。\n");
-    // S3：必须 vs 加分的判断（§S3）—— 加分项必须带 evidence（原文摘句），否则归必须。
+    // S3：必须 vs 加分的判断（§S3）—— 加分项必须带 evidence（原文摘句），
+    // 证据不足时忽略加分项，绝不把软条件升级为硬条件。
     p.push_str("必须 vs 加分的判断：\n");
     p.push_str("- 「一定要有 / 只要 / 必须」→ concepts（必须）；「不要 / 排除 / 除了」→ 全局 exclusions（排除）。\n");
     p.push_str("- 「最好有 / 优先 / 尽量 / 更好 / 可有可无 / 倾向 / 接近 / 偏」→ 该 group 的 preferred（加分，不淘汰结果）。\n");
     p.push_str("- 互斥铁律：一个概念进了 preferred，就绝不能再出现在同一 group 的 concepts 里。preferred 是「可有可无、只影响排序」，concepts 是「必须有、不满足就不出现」；把同一个词两边都放等于把软偏好变成硬门槛，是错误。\n");
     p.push_str("- 同组铁律：一句话里的必须项和它的优先项必须放在**同一个 group**（必须项进 concepts、优先项进该组 preferred），绝不能为「优先/尽量」的词单独再建一个 group——没有「或」的句子永远只输出一个 group。例「草地，优先近景，尽量自然光」→ 只有一个 group：concepts=[草地]、preferred=[近景,自然光]。\n");
-    p.push_str("- 加分项必须填 evidence：从原句中**逐字摘出**让你判断为「加分」的片段（如 evidence: \"有蓝天更好\"）。摘不出原文片段就归必须。\n");
+    p.push_str("- 组合偏好要按短语范围判断：偏好词后面的多个原子概念都属于 preferred，除非同一概念还在偏好短语外被明确要求必须。例如「最好要年轻女性」的「青年、女性」都只能加分；不要因为「青年」是规范名或因为拆成两个 concept，就把它放回 concepts。\n");
+    p.push_str("- 加分项必须填 evidence：从原句中**逐字摘出**让你判断为「加分」的片段（如 evidence: \"有蓝天更好\"）。摘不出原文片段就忽略该加分项，绝不改成必须。\n");
+    p.push_str("- concept 必须输出词典规范名；evidence 始终保留用户原词，即使它是规范名的可搜索别名（例如「年轻」对应规范名「青年」），不要把 evidence 改写成规范名。\n");
     p.push_str("- 权重只给三档：0.5（略微偏好）/ 1.0（一般偏好）/ 2.0（强偏好）。\n");
-    p.push_str("- 不确定时归必须 —— 宁可少给结果，也不要让用户以为条件生效了但其实没生效。\n");
+    p.push_str("- 不确定时只能保留为加分项或忽略，绝不能把可选条件升级为必须条件。\n");
     p.push_str("词匹配方式（termMatch，默认 alias = 精确匹配规范名或别名）：\n");
     p.push_str("- 用户给出完整词（「海边」「人像」）→ 不填，用默认 alias。\n");
     p.push_str("- 用户说「带…的」「关于…的」「跟…有关」→ contains。\n");
@@ -2898,6 +3279,11 @@ mod tests {
         // 分辨率档位 → 像素；横竖图 → aspect_ratio；优先互斥；禁止编造 tags_count
         assert!(p.contains("3840"), "4K 应教学为 width gte 3840");
         assert!(p.contains("互斥铁律"), "preferred/concepts 互斥必须强调");
+        assert!(p.contains("最好要年轻女性"), "必须覆盖组合偏好的回归示例");
+        assert!(
+            p.contains("要女性，最好年轻"),
+            "必须覆盖硬条件+偏好的回归示例"
+        );
         assert!(p.contains("tags_count"), "必须明令禁止编造 tags_count");
         // 相对日期：注入真实当前年份，且不再出现「当年」占位字样
         let year = chrono::Local::now().format("%Y").to_string();
@@ -3144,6 +3530,16 @@ mod tests {
             is_keyword_fallback(&i, text),
             "空 groups 应兜底；warnings={w:?}"
         );
+        // 空主体 + 非空排除也必须关键词兜底，不能执行成纯 mustNot（近似全库）。
+        let (i, w) = degrade_parse(
+            r#"{"groups":[],"exclusions":[{"text":"夜景","role":"scene","facetHint":null,"confidence":0.9}],"sortBy":null,"sortDir":null}"#,
+            text,
+            &facets,
+        );
+        assert!(
+            is_keyword_fallback(&i, text),
+            "只有排除项时也应关键词兜底；warnings={w:?}"
+        );
         // 7. 超长概念 → 结构校验失败 → 兜底
         let long = "很".repeat(200);
         let (i, w) = degrade_parse(
@@ -3209,6 +3605,18 @@ mod tests {
         );
         assert!(intent.groups[0].concepts[0].facet_hint.is_none());
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_when_explicit_units_are_missing_from_metadata() {
+        let intent = SearchIntentV2 {
+            groups: vec![SearchGroupV2::default()],
+            ..Default::default()
+        };
+        let warnings = warn_missing_explicit_metadata("横图，大于 5MB，时长 10 秒", &intent);
+        assert!(warnings.iter().any(|w| w.contains("file_size")));
+        assert!(warnings.iter().any(|w| w.contains("duration_ms")));
+        assert!(warnings.iter().any(|w| w.contains("aspect_ratio")));
     }
 
     /// W6-3：全非法 group → 剔除；全部 group 被剔 → 落第 3 层
@@ -3332,7 +3740,142 @@ mod tests {
         );
     }
 
-    // ═══════════════ S3：preferred evidence 守卫（纯函数真值表） ═══════════════
+    #[test]
+    fn repair_moves_alias_concepts_from_preferred_clause() {
+        let mut intent = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![
+                    SearchConceptV3 {
+                        text: "青年".into(),
+                        role: "people".into(),
+                        facet_hint: Some("people".into()),
+                        confidence: Some(0.95),
+                        necessity: Necessity::Required,
+                        weight: None,
+                        evidence: None,
+                        term_match: crate::db::tags::TermMatch::Alias,
+                    },
+                    SearchConceptV3 {
+                        text: "女性".into(),
+                        role: "people".into(),
+                        facet_hint: Some("people".into()),
+                        confidence: Some(0.95),
+                        necessity: Necessity::Required,
+                        weight: None,
+                        evidence: None,
+                        term_match: crate::db::tags::TermMatch::Alias,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let warnings = repair_misplaced_preferred(
+            "最好要年轻女性",
+            &[
+                "性别 / 女性 | term: 女性".into(),
+                "年龄 / 青年 | term: 青年 | aliases: 年轻".into(),
+            ],
+            &mut intent,
+        );
+        let group = &intent.groups[0];
+        assert!(group.concepts.is_empty(), "整段偏好不能留在必须区");
+        assert_eq!(
+            group
+                .preferred
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["青年", "女性"]
+        );
+        assert!(group
+            .preferred
+            .iter()
+            .all(|c| c.evidence.as_deref() == Some("最好要年轻女性")));
+        assert!(warnings.iter().any(|w| w.contains("纠正为优先")));
+    }
+
+    #[test]
+    fn repair_keeps_explicit_required_concept_outside_preference_clause() {
+        let mut intent = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![
+                    SearchConceptV3 {
+                        text: "女性".into(),
+                        role: "people".into(),
+                        facet_hint: Some("people".into()),
+                        confidence: Some(0.95),
+                        necessity: Necessity::Required,
+                        weight: None,
+                        evidence: None,
+                        term_match: crate::db::tags::TermMatch::Alias,
+                    },
+                    SearchConceptV3 {
+                        text: "青年".into(),
+                        role: "people".into(),
+                        facet_hint: Some("people".into()),
+                        confidence: Some(0.95),
+                        necessity: Necessity::Required,
+                        weight: None,
+                        evidence: None,
+                        term_match: crate::db::tags::TermMatch::Alias,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        repair_misplaced_preferred(
+            "要女性，最好年轻",
+            &[
+                "性别 / 女性 | term: 女性".into(),
+                "年龄 / 青年 | term: 青年 | aliases: 年轻".into(),
+            ],
+            &mut intent,
+        );
+        let group = &intent.groups[0];
+        assert_eq!(
+            group
+                .concepts
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["女性"]
+        );
+        assert_eq!(
+            group
+                .preferred
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["青年"]
+        );
+    }
+
+    #[test]
+    fn v3_parse_preserves_pure_preferred_group() {
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[],"preferred":[{"text":"蓝天","role":"scene","facetHint":null,"confidence":0.8,"evidence":"最好有蓝天","weight":1.0,"termMatch":null}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, warnings) = degrade_parse_v3(raw, "最好有蓝天", &[]);
+        assert_eq!(intent.groups.len(), 1, "纯偏好仍需保留占位 group");
+        assert!(intent.groups[0].concepts.is_empty());
+        assert_eq!(intent.groups[0].preferred.len(), 1);
+        assert!(!is_keyword_fallback_v3(&intent, "最好有蓝天"));
+        assert!(warnings.is_empty(), "合法纯偏好不应告警：{warnings:?}");
+    }
+
+    #[test]
+    fn v3_empty_group_without_preferred_still_falls_back() {
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[],"preferred":[],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, warnings) = degrade_parse_v3(raw, "海边", &[]);
+        assert!(
+            is_keyword_fallback_v3(&intent, "海边"),
+            "没有 preferred 的空 group 不得变成全库查询：{warnings:?}"
+        );
+    }
+
+    // ═══════════════ S3：preferred evidence 守卫与词典关联 ═══════════════
 
     fn v3_group(input: &str, pref_text: &str, evidence: &str) -> (SearchGroupV3, Vec<String>) {
         let mut g = SearchGroupV3 {
@@ -3353,7 +3896,7 @@ mod tests {
         (g, warns)
     }
 
-    /// S3 真值表六行（指南表）：四行合法加分保留、两行编造/无关依据正确降级。
+    /// S3 真值表：原句引用由纯解析守卫校验，规范名/别名关联在 plan 构建时校验。
     #[test]
     fn guard_preferred_accepts_six_chinese_expressions() {
         // ① ② 都过 + 强偏好词命中 → 静默（保留 preferred）
@@ -3372,7 +3915,7 @@ mod tests {
                 g.concepts.iter().map(|c| &c.text).collect::<Vec<_>>()
             );
             assert!(
-                !warns.iter().any(|w| w.contains("已按必须")),
+                !warns.iter().any(|w| w.contains("已忽略该加分项")),
                 "{input} warns={warns:?}"
             );
         }
@@ -3388,23 +3931,26 @@ mod tests {
         );
     }
 
-    /// S3：evidence 编造（不是原句子串）→ 降级 required。
+    /// S3：evidence 编造（不是原句子串）→ 丢弃该 preferred，不能升级 required。
     #[test]
     fn guard_rejects_fabricated_evidence() {
-        // 原句「必须有蓝天」没有「最好」；模型编造 evidence「最好有蓝天」→ ① 降级
+        // 原句「必须有蓝天」没有「最好」；模型编造 evidence「最好有蓝天」→ 忽略加分项
         let (g, warns) = v3_group("必须有蓝天", "蓝天", "最好有蓝天");
-        assert!(g.preferred.is_empty(), "编造依据必须降级：{warns:?}");
-        assert!(g
-            .concepts
-            .iter()
-            .any(|c| c.text == "蓝天" && c.necessity == Necessity::Required));
-        assert!(warns.iter().any(|w| w.contains("已按必须")), "{warns:?}");
+        assert!(g.preferred.is_empty(), "编造依据必须忽略：{warns:?}");
+        assert!(!g.concepts.iter().any(|c| c.text == "蓝天"));
+        assert!(
+            warns.iter().any(|w| w.contains("已忽略该加分项")),
+            "{warns:?}"
+        );
     }
 
-    /// S3：evidence 是原句子串但与 concept 无关（窗口外）→ 降级 required。
+    /// S3：evidence 是原句子串但与 concept 无关 → plan 构建时丢弃该 preferred。
     #[test]
-    fn guard_rejects_unrelated_evidence() {
+    fn plan_rejects_unrelated_evidence_after_term_resolution() {
         // 原句「横图，最好清新」；concept=蓝天 evidence=最好清新（在原文，但离蓝天很远）
+        let conn = init_memory().unwrap();
+        setup_facets_and_tags(&conn);
+        tags::create_in_facet(&conn, "蓝天", None, Some("scene")).unwrap();
         let input = "横图，最好清新";
         let mut g = SearchGroupV3 {
             asset_type: "all".into(),
@@ -3421,12 +3967,98 @@ mod tests {
             ..Default::default()
         };
         let warns = guard_preferred(input, &mut g);
-        assert!(g.preferred.is_empty(), "无关依据必须降级：{warns:?}");
-        assert!(g.concepts.iter().any(|c| c.text == "蓝天"));
-        assert!(warns.iter().any(|w| w.contains("已按必须")), "{warns:?}");
+        assert_eq!(
+            g.preferred.len(),
+            1,
+            "原句引用本身有效，应留到词典复核：{warns:?}"
+        );
+        let intent = SearchIntentV3 {
+            groups: vec![g],
+            ..Default::default()
+        };
+        let (plan, _resolved, plan_warnings) = build_plan_from_v3(&conn, &intent).unwrap();
+        assert!(
+            plan.should.is_empty(),
+            "无关依据不得进入 should: {plan_warnings:?}"
+        );
+        assert!(
+            plan_warnings.iter().any(|w| w.contains("已忽略该加分项")),
+            "{plan_warnings:?}"
+        );
     }
 
-    /// S3：只做 preferred → required 降级；required 概念绝不反向升级为 preferred。
+    #[test]
+    fn preferred_canonical_term_accepts_surface_alias_in_evidence() {
+        let conn = init_memory().unwrap();
+        setup_facets_and_tags(&conn);
+        let youth = tags::create_in_facet(&conn, "青年", None, Some("people"))
+            .unwrap()
+            .id;
+        tags::add_alias(&conn, youth, "年轻", None, "synonym").unwrap();
+        let mut group = SearchGroupV3 {
+            asset_type: "all".into(),
+            preferred: vec![SearchConceptV3 {
+                text: "青年".into(),
+                role: "people".into(),
+                facet_hint: Some("people".into()),
+                confidence: Some(0.95),
+                necessity: Necessity::Preferred,
+                weight: Some(1.0),
+                evidence: Some("最好是年轻女性".into()),
+                term_match: crate::db::tags::TermMatch::Alias,
+            }],
+            ..Default::default()
+        };
+        let parse_warnings = guard_preferred("要女生人像，在室内，最好是年轻女性", &mut group);
+        assert!(
+            parse_warnings.is_empty(),
+            "原句证据合法: {parse_warnings:?}"
+        );
+        let intent = SearchIntentV3 {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let (plan, resolved, warnings) = build_plan_from_v3(&conn, &intent).unwrap();
+        assert_eq!(plan.should.len(), 1, "青年应进入 should: {warnings:?}");
+        assert!(resolved.iter().any(|r| r.tag_id == youth));
+        assert!(
+            warnings.is_empty(),
+            "规范名/别名 evidence 不应告警: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn dictionary_and_candidates_follow_tag_terms_when_feature_enabled() {
+        let conn = init_memory().unwrap();
+        setup_facets_and_tags(&conn);
+        crate::db::migrations::create_tag_terms_table_for_test(&conn).unwrap();
+        crate::db::schema_features::set_feature(&conn, "tag_unique_terms", true, None).unwrap();
+        let youth = tags::create_in_facet(&conn, "青年", None, Some("people"))
+            .unwrap()
+            .id;
+        tags::add_alias(&conn, youth, "年轻", None, "synonym").unwrap();
+        let facets = vec![FacetPromptContext {
+            key: "people".into(),
+            display_name: "人物".into(),
+            description: String::new(),
+            selection_mode: "multi".into(),
+            max_items: Some(5),
+            ..Default::default()
+        }];
+        let dict = collect_tag_dictionary(&conn, &facets).unwrap();
+        let youth_line = dict.iter().find(|line| line.contains("term: 青年"));
+        assert!(
+            youth_line.is_some_and(|line| line.contains("年轻")),
+            "tag_terms 别名必须进入 AI 词典: {dict:?}"
+        );
+        let candidates = tags::search_candidates(&conn, Some("people"), "年轻").unwrap();
+        assert!(
+            candidates.iter().any(|tag| tag.id == youth),
+            "tag_terms 别名必须参与候选解析: {candidates:?}"
+        );
+    }
+
+    /// S3：required 概念绝不反向升级为 preferred；invalid preferred 也绝不升级为 required。
     #[test]
     fn preferred_never_upgraded_to_required() {
         let mut g = SearchGroupV3 {
@@ -3878,6 +4510,44 @@ mod tests {
         assert!(ids.contains(&b), "无蓝天的草地不得被淘汰：{ids:?}");
         assert!(!ids.contains(&e), "草地+夜景必须排除");
         assert_eq!(ids[0], a, "有蓝天应排最前：{ids:?}");
+    }
+
+    #[test]
+    fn build_plan_from_v3_caps_preferred_clauses_with_warning() {
+        use crate::db::search_plan::MAX_SHOULD_CLAUSES;
+        use crate::db::tags;
+        let conn = init_memory().unwrap();
+        let mut preferred = Vec::new();
+        for i in 0..(MAX_SHOULD_CLAUSES + 1) {
+            let name = format!("偏好{i}");
+            tags::create_in_facet(&conn, &name, None, Some("scene")).unwrap();
+            preferred.push(SearchConceptV3 {
+                text: name,
+                role: "scene".into(),
+                facet_hint: Some("scene".into()),
+                confidence: Some(0.95),
+                necessity: Necessity::Preferred,
+                weight: Some(1.0),
+                evidence: None,
+                term_match: crate::db::tags::TermMatch::Alias,
+            });
+        }
+        let intent = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![],
+                preferred,
+                text_terms: vec![],
+                metadata: vec![],
+                untagged_only: false,
+            }],
+            exclusions: vec![],
+            sort_by: None,
+            sort_dir: None,
+        };
+        let (plan, _, warnings) = build_plan_from_v3(&conn, &intent).unwrap();
+        assert_eq!(plan.should.len(), MAX_SHOULD_CLAUSES);
+        assert!(warnings.iter().any(|w| w.contains("加分项超过")));
     }
 
     /// S3：keyword 兜底形态转 plan 后 filter 含整句 content 搜索（可执行、不 panic）。

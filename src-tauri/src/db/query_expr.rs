@@ -76,7 +76,9 @@ pub enum LeafCond {
     /// 元数据比较：复用 search_query::MetadataFilter
     #[serde(rename_all = "camelCase")]
     Metadata {
-        #[serde(flatten)]
+        // Wire contract: `{ type: "metadata", filter: { key, op, ... } }`.
+        // Keep the filter nested so the Rust response matches the TypeScript
+        // LeafCond shape and the SearchPlanV3 contract.
         filter: super::search_query::MetadataFilter,
     },
     /// 关键词（FTS/LIKE）。scope 缺省 = all（旧表达式兼容）。
@@ -159,8 +161,16 @@ fn validate_node(expr: &QueryExpr, depth: usize, count: &mut usize) -> AppResult
 
 fn validate_leaf(cond: &LeafCond) -> AppResult<()> {
     match cond {
-        LeafCond::Tag { tag_ids, mode, .. } => {
-            if tag_ids.is_empty() {
+        LeafCond::Tag {
+            tag_ids,
+            term_query,
+            mode,
+            ..
+        } => {
+            let has_term = term_query
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty());
+            if tag_ids.is_empty() && !has_term {
                 return Err(AppError::msg("标签条件不能为空"));
             }
             if let Some(m) = mode {
@@ -753,6 +763,58 @@ mod tests {
             },
         };
         assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn accepts_term_only_tag_condition() {
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "scene".into(),
+                tag_ids: vec![],
+                mode: Some("any".into()),
+                include_descendants: true,
+                term_query: Some("海边".into()),
+                term_match: Default::default(),
+            },
+        };
+        assert!(validate_expr(&expr).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_tag_condition_without_term() {
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "scene".into(),
+                tag_ids: vec![],
+                mode: Some("any".into()),
+                include_descendants: true,
+                term_query: Some("  ".into()),
+                term_match: Default::default(),
+            },
+        };
+        assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn metadata_wire_shape_is_nested_and_round_trips() {
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Metadata {
+                filter: crate::db::search_query::MetadataFilter {
+                    key: "file_size".into(),
+                    op: "gte".into(),
+                    value: Some(serde_json::json!(5 * 1024 * 1024)),
+                    values: None,
+                    min: None,
+                    max: None,
+                },
+            },
+        };
+        let wire = serde_json::to_value(&expr).unwrap();
+        assert_eq!(wire["cond"]["type"], "metadata");
+        assert_eq!(wire["cond"]["filter"]["key"], "file_size");
+        assert!(wire["cond"].get("key").is_none());
+        let decoded: QueryExpr = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
     }
 
     #[test]

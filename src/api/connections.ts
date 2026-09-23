@@ -1,6 +1,7 @@
 /** AI 连接档案命令封装（对应 commands/ai_connections_cmd.rs，指导书 §6.3） */
 import { invoke } from "./client";
 
+/** cloud = 外部 API（包含 localhost/局域网兼容服务）；local = Windows 托管 Ollama。 */
 export type AiDeployment = "cloud" | "local";
 /** §6.4 协议：apiMode → protocol 迁移后的取值 */
 export type AiProtocol = "openai_chat" | "anthropic_messages";
@@ -12,6 +13,10 @@ export interface AiConnection {
   protocol: AiProtocol;
   baseUrl: string;
   model: string;
+  /** 0/undefined = unlimited; limits are enforced only for external online services. */
+  maxConcurrency?: number;
+  requestsPerMinute?: number;
+  requestsPerHour?: number;
   hasKey: boolean;
   enabled: boolean;
 }
@@ -31,6 +36,9 @@ export function saveAiConnection(input: {
   baseUrl: string;
   model: string;
   apiKey?: string | null;
+  maxConcurrency?: number | null;
+  requestsPerMinute?: number | null;
+  requestsPerHour?: number | null;
 }): Promise<AiConnection> {
   return invoke<AiConnection>("save_ai_connection", {
     id: input.id,
@@ -40,6 +48,9 @@ export function saveAiConnection(input: {
     baseUrl: input.baseUrl,
     model: input.model,
     apiKey: input.apiKey,
+    maxConcurrency: input.maxConcurrency ?? null,
+    requestsPerMinute: input.requestsPerMinute ?? null,
+    requestsPerHour: input.requestsPerHour ?? null,
   });
 }
 

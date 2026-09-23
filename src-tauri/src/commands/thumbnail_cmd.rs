@@ -21,7 +21,7 @@ pub async fn get_thumbnail(
         let thumbs = ThumbnailService::new(&data_dir)?;
         match kind.as_str() {
             "placeholder" => Ok(thumbs
-                .placeholder_path(asset_id)
+                .get_or_create_placeholder(&db, asset_id)?
                 .to_string_lossy()
                 .into_owned()),
             "hd" => {

@@ -481,6 +481,7 @@ const CORE_TAXONOMY_ALIASES: &[(&str, &str, &str)] = &[
     ("people", "儿童", "孩子"),
     ("people", "青少年", "少年"),
     ("people", "青年", "年轻人"),
+    ("people", "青年", "年轻"),
     ("people", "老年", "老人"),
     ("people", "老年", "年老"),
     ("people", "现代装", "现代服装"),
@@ -572,6 +573,31 @@ fn seed_core_taxonomy_inner(conn: &Connection) -> AppResult<()> {
         add_alias(conn, tag_id, alias, None, "synonym")?;
     }
     Ok(())
+}
+
+/// 幂等补齐核心词表别名，覆盖已存在的非空用户库。
+///
+/// 核心标签只在空库时播种，但别名属于搜索协议的一部分，后续版本新增的
+/// 同义词仍需安全地补进存量库。`add_alias` 已按 feature gate 选择唯一事实源。
+pub fn ensure_core_taxonomy_aliases(conn: &Connection) -> AppResult<()> {
+    transactional(conn, |c| {
+        for (facet_key, canonical, alias) in CORE_TAXONOMY_ALIASES {
+            let tag_id: Option<i64> = c
+                .query_row(
+                    "SELECT id FROM tags
+                      WHERE facet_key = ?1 AND name = ?2
+                      ORDER BY parent_id IS NULL, id
+                      LIMIT 1",
+                    rusqlite::params![facet_key, canonical],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(tag_id) = tag_id {
+                add_alias(c, tag_id, alias, None, "synonym")?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// 幂等播种三个核心分面的默认层级词表。
@@ -886,6 +912,29 @@ pub fn aliases(conn: &Connection, tag_id: i64) -> AppResult<Vec<String>> {
     Ok(aliases)
 }
 
+/// 只返回可用于搜索和 AI 词典的别名。
+///
+/// `tag_unique_terms` 开启后，`tag_terms` 是唯一事实源；关闭时兼容旧的
+/// `tag_aliases`。调用方不应自行选择表，避免新旧库出现不同解析结果。
+pub fn searchable_aliases(conn: &Connection, tag_id: i64) -> AppResult<Vec<String>> {
+    if crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false) {
+        let mut stmt = conn.prepare(
+            "SELECT term FROM tag_terms
+              WHERE tag_id = ?1 AND term_kind != 'canonical' AND is_searchable = 1
+              ORDER BY created_at, term",
+        )?;
+        let rows = stmt.query_map([tag_id], |r| r.get(0))?;
+        return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT alias FROM tag_aliases
+          WHERE tag_id = ?1 AND is_searchable = 1
+          ORDER BY id",
+    )?;
+    let rows = stmt.query_map([tag_id], |r| r.get(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub fn hydrate_metadata(conn: &Connection, tag: &mut Tag) -> AppResult<()> {
     tag.aliases = aliases(conn, tag.id)?;
     // F1-d：chain 递归加 d < 12 上限（防环死循环；path 仅展示用）
@@ -998,6 +1047,20 @@ pub fn search_candidates(
     query: &str,
 ) -> AppResult<Vec<Tag>> {
     let normalized = normalize_name(query);
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
+    let (alias_join, alias_column) = if terms_enabled {
+        (
+            "LEFT JOIN tag_terms tt ON tt.tag_id = t.id
+              AND tt.term_kind != 'canonical' AND tt.is_searchable = 1",
+            "tt.normalized_term",
+        )
+    } else {
+        (
+            "LEFT JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1",
+            "ta.normalized_alias",
+        )
+    };
     // F4：可搜性收口 SEARCHABLE_TAG（不再内联判 f.status='active'）
     let mut sql = format!(
         "SELECT DISTINCT t.id, t.name, COALESCE(t.canonical_name,t.name),
@@ -1006,10 +1069,10 @@ pub fn search_candidates(
                 t.is_preset, t.sort_order,
                 (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id=t.id),
                 {FACET_EFFECTIVE}
-           FROM tags t LEFT JOIN tag_aliases ta ON ta.tag_id=t.id
+           FROM tags t {alias_join}
           WHERE {SEARCHABLE_TAG}
             AND (COALESCE(t.normalized_name,lower(trim(t.name))) LIKE ?1
-              OR ta.normalized_alias LIKE ?1)"
+              OR {alias_column} LIKE ?1)"
     );
     if facet_key.is_some() {
         sql.push_str(" AND COALESCE(t.facet_key,'custom') = ?2");
@@ -2299,5 +2362,29 @@ mod tests {
             }
             let _ = hi;
         }
+    }
+
+    #[test]
+    fn core_alias_backfill_repairs_nonempty_terms_db_idempotently() {
+        let c = terms_db();
+        let youth = create_in_facet(&c, "青年", None, Some("people")).unwrap();
+
+        // 存量库不会重新播种整套核心词表，但新版本别名必须能补进唯一事实源。
+        ensure_core_taxonomy_aliases(&c).unwrap();
+        let aliases = searchable_aliases(&c, youth.id).unwrap();
+        assert!(aliases.iter().any(|alias| alias == "年轻"));
+        assert!(aliases.iter().any(|alias| alias == "年轻人"));
+
+        // 启动时会重复调用；重复补齐不能产生第二份词条。
+        ensure_core_taxonomy_aliases(&c).unwrap();
+        let alias_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tag_terms
+                  WHERE tag_id = ?1 AND term_kind != 'canonical'",
+                [youth.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_count, 2);
     }
 }

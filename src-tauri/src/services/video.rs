@@ -24,16 +24,47 @@ const BINARY_CACHE_TTL: Duration = Duration::from_secs(60);
 /// ffmpeg/ffprobe 可用性结果缓存（短 TTL）。静态全局，进程内共享。
 static BINARY_CACHE: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
 
+/// 兼容代理的有限变体集合。未知字符串不会静默落到某个编码器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyVariant {
+    H264Mp4,
+    Vp8Webm,
+}
+
+impl ProxyVariant {
+    pub fn parse(value: &str) -> crate::error::AppResult<Self> {
+        match value {
+            "h264_mp4" => Ok(Self::H264Mp4),
+            "vp8_webm" => Ok(Self::Vp8Webm),
+            other => Err(crate::error::AppError::invalid_arg(format!(
+                "非法代理变体：{other}（仅支持 h264_mp4 | vp8_webm）"
+            ))),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "h264_mp4",
+            Self::Vp8Webm => "vp8_webm",
+        }
+    }
+
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "mp4",
+            Self::Vp8Webm => "webm",
+        }
+    }
+}
+
 /// 解析二进制路径：PATH → （预留）应用资源目录
-fn resolve_binary(name: &str) -> Option<String> {
-    Command::new(name)
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| name.to_string())
+fn resolve_binary(name: &str) -> Option<std::path::PathBuf> {
+    let tool = match name {
+        "ffmpeg" => crate::services::media_tools::MediaTool::Ffmpeg,
+        "ffprobe" => crate::services::media_tools::MediaTool::Ffprobe,
+        _ => return None,
+    };
+    crate::services::media_tools::resolve(tool)
 }
 
 /// 带短 TTL 缓存的 ffprobe 可用性探测：避免每次素材请求都 spawn `ffprobe -version`。
@@ -590,6 +621,87 @@ pub fn transcode_to_h264(
         )));
     }
     Ok(())
+}
+
+/// 按严格变体选择兼容编码器。编码策略集中在服务层，命令层不拼 ffmpeg 参数。
+pub fn transcode_variant(
+    src: &Path,
+    out: &Path,
+    variant: ProxyVariant,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::error::AppResult<()> {
+    match variant {
+        ProxyVariant::H264Mp4 => transcode_to_h264(src, out, cancel),
+        ProxyVariant::Vp8Webm => {
+            let Some(ffmpeg) = resolve_binary("ffmpeg") else {
+                return Err(crate::error::AppError::msg("ffmpeg 不可用"));
+            };
+            let mut child = Command::new(ffmpeg)
+                .args(["-y", "-i"])
+                .arg(src)
+                .args([
+                    "-c:v",
+                    "libvpx",
+                    "-b:v",
+                    "2M",
+                    "-crf",
+                    "10",
+                    "-deadline",
+                    "good",
+                    "-cpu-used",
+                    "4",
+                    "-c:a",
+                    "libvorbis",
+                    "-b:a",
+                    "128k",
+                ])
+                .arg(out)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| crate::error::AppError::msg(format!("启动 ffmpeg 失败: {e}")))?;
+            let mut stderr_pipe = child.stderr.take();
+            let stderr_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut stderr) = stderr_pipe.take() {
+                    let _ = stderr.read_to_end(&mut buf);
+                }
+                buf
+            });
+            let deadline = Instant::now() + FFMPEG_TIMEOUT;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {
+                        if Instant::now() >= deadline
+                            || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                        {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stderr_reader.join();
+                            return Err(crate::error::AppError::msg("转码超时或已取消"));
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default())
+                .trim()
+                .to_string();
+            let Some(status) = status else {
+                return Err(crate::error::AppError::msg("转码进程异常"));
+            };
+            if !status.success() {
+                return Err(crate::error::AppError::msg(format!(
+                    "转码失败（退出码 {:?}）：{}",
+                    status.code(),
+                    stderr
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// P3-02：视频 AI 打标抽帧——取每段中点帧（1280px webp）到指定目录；

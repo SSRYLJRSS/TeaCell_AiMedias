@@ -16,6 +16,10 @@ pub struct AiConnection {
     pub base_url: String,
     pub model: String,
     pub api_key_ref: Option<String>,
+    /// 在线服务限流；0 表示不限。仅外部服务使用，托管 Ollama 由运行时忽略。
+    pub max_concurrency: i64,
+    pub requests_per_minute: i64,
+    pub requests_per_hour: i64,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -24,7 +28,9 @@ pub struct AiConnection {
 /// 按 id 读取连接档案。
 pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+                max_concurrency, requests_per_minute, requests_per_hour,
+                enabled, created_at, updated_at
          FROM ai_connections WHERE id = ?1",
     )?;
     let mut rows = stmt.query(params![id])?;
@@ -36,7 +42,9 @@ pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
 
 pub fn list(conn: &Connection) -> AppResult<Vec<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+                max_concurrency, requests_per_minute, requests_per_hour,
+                enabled, created_at, updated_at
          FROM ai_connections ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], map_connection)?;
@@ -56,9 +64,12 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
         base_url: row.get(4)?,
         model: row.get(5)?,
         api_key_ref: row.get(6)?,
-        enabled: row.get::<_, i64>(7)? != 0,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        max_concurrency: row.get(7)?,
+        requests_per_minute: row.get(8)?,
+        requests_per_hour: row.get(9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -66,6 +77,7 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
 pub fn binding_for(conn: &Connection, usage: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, c.deployment, c.protocol, c.base_url, c.model, c.api_key_ref,
+                c.max_concurrency, c.requests_per_minute, c.requests_per_hour,
                 c.enabled, c.created_at, c.updated_at
          FROM ai_usage_bindings b JOIN ai_connections c ON c.id = b.connection_id
          WHERE b.usage = ?1 AND c.enabled = 1",
@@ -108,6 +120,9 @@ pub fn usage_profile(
         base_url: c.base_url.clone(),
         api_key,
         model: c.model.clone(),
+        max_concurrency: c.max_concurrency,
+        requests_per_minute: c.requests_per_minute,
+        requests_per_hour: c.requests_per_hour,
     }))
 }
 
@@ -146,23 +161,82 @@ pub fn upsert(
     model: &str,
     api_key_ref: Option<&str>,
 ) -> AppResult<()> {
+    upsert_with_limits(
+        conn,
+        id,
+        name,
+        deployment,
+        protocol,
+        base_url,
+        model,
+        api_key_ref,
+        0,
+        0,
+        0,
+    )
+}
+
+/// 写入连接档案及在线服务限流配置。0 表示不限；负数和过大值拒绝保存，避免
+/// 配置错误导致永远等待或无法自洽地转换为运行时计数。
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_with_limits(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    deployment: &str,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key_ref: Option<&str>,
+    max_concurrency: i64,
+    requests_per_minute: i64,
+    requests_per_hour: i64,
+) -> AppResult<()> {
     if !matches!(deployment, "cloud" | "local") {
         return Err(AppError::msg("非法部署类型（cloud|local）"));
     }
     if !matches!(protocol, "openai_chat" | "anthropic_messages") {
         return Err(AppError::msg("非法协议（openai_chat|anthropic_messages）"));
     }
+    for (label, value, max) in [
+        ("最大并发数", max_concurrency, 128),
+        ("每分钟请求数", requests_per_minute, 1_000_000),
+        ("每小时请求数", requests_per_hour, 10_000_000),
+    ] {
+        if !(0..=max).contains(&value) {
+            return Err(AppError::invalid_arg(format!(
+                "{label}必须是 0–{max} 的整数（0 表示不限）"
+            )));
+        }
+    }
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO ai_connections
-           (id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+           (id, name, deployment, protocol, base_url, model, api_key_ref,
+            max_concurrency, requests_per_minute, requests_per_hour,
+            enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, deployment = excluded.deployment, protocol = excluded.protocol,
            base_url = excluded.base_url, model = excluded.model,
            api_key_ref = COALESCE(excluded.api_key_ref, ai_connections.api_key_ref),
+           max_concurrency = excluded.max_concurrency,
+           requests_per_minute = excluded.requests_per_minute,
+           requests_per_hour = excluded.requests_per_hour,
            updated_at = excluded.updated_at",
-        params![id, name, deployment, protocol, base_url, model, api_key_ref, now],
+        params![
+            id,
+            name,
+            deployment,
+            protocol,
+            base_url,
+            model,
+            api_key_ref,
+            max_concurrency,
+            requests_per_minute,
+            requests_per_hour,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -276,6 +350,64 @@ mod tests {
         delete(&conn, "c1").unwrap();
         assert!(get(&conn, "c1").unwrap().is_none());
         assert!(binding_for(&conn, "super_search").unwrap().is_none());
+    }
+
+    #[test]
+    fn limits_roundtrip_and_map_to_profile() {
+        let conn = init_memory().unwrap();
+        upsert_with_limits(
+            &conn,
+            "limited",
+            "受限服务",
+            "cloud",
+            "openai_chat",
+            "https://a/v1",
+            "vision",
+            None,
+            2,
+            30,
+            600,
+        )
+        .unwrap();
+        let c = get(&conn, "limited").unwrap().unwrap();
+        assert_eq!(
+            (
+                c.max_concurrency,
+                c.requests_per_minute,
+                c.requests_per_hour
+            ),
+            (2, 30, 600)
+        );
+        bind_usage(&conn, "tagging", "limited").unwrap();
+        let profile = usage_profile(&conn, "tagging").unwrap().unwrap();
+        assert_eq!(
+            (
+                profile.max_concurrency,
+                profile.requests_per_minute,
+                profile.requests_per_hour
+            ),
+            (2, 30, 600)
+        );
+    }
+
+    #[test]
+    fn limits_reject_negative_values() {
+        let conn = init_memory().unwrap();
+        let err = upsert_with_limits(
+            &conn,
+            "limited",
+            "受限服务",
+            "cloud",
+            "openai_chat",
+            "https://a/v1",
+            "vision",
+            None,
+            -1,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARG");
     }
 
     #[test]

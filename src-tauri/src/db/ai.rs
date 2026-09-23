@@ -1253,7 +1253,9 @@ pub fn apply_tags(conn: &Connection, asset_ids: &[i64], tags: &CategorizedTags) 
 /// 撤销拒绝（v2.11）：已拒绝建议恢复为待确认，防误触
 pub fn restore_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute(
-        "UPDATE ai_suggestions SET status = 'pending' WHERE id = ?1 AND status = 'rejected'",
+        "UPDATE ai_suggestions
+         SET status = 'pending', last_error = NULL
+         WHERE id = ?1 AND status = 'rejected'",
         rusqlite::params![id],
     )?;
     conn.execute(

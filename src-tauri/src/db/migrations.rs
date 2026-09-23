@@ -1836,6 +1836,8 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     // + ai_suggestion_items 数值两列。无条件幂等段（逐列容错 ALTER + IF NOT EXISTS），
     // 不推进 user_version（与 V23 同理；存量库每次启动自愈补齐）。
     migrate_v24(conn)?;
+    // V25：在线连接限流字段。无版本幂等段，旧库启动时自动补齐。
+    migrate_v25(conn)?;
     // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
@@ -1904,6 +1906,31 @@ CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value,
     }
     if !item_cols.iter().any(|c| c == "num_value") {
         conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN num_value REAL")?;
+    }
+    Ok(())
+}
+
+/// V25（在线服务限流）：连接档案追加三个独立限额字段。
+/// 0 表示不限；采用无版本幂等段，兼容已经发布的 V22 user_version 以及 V23/V24
+/// 的存量自愈迁移约定。只追加列，不改变既有连接的行为。
+fn migrate_v25(conn: &Connection) -> AppResult<()> {
+    for (column, sql) in [
+        (
+            "max_concurrency",
+            "ALTER TABLE ai_connections ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "requests_per_minute",
+            "ALTER TABLE ai_connections ADD COLUMN requests_per_minute INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "requests_per_hour",
+            "ALTER TABLE ai_connections ADD COLUMN requests_per_hour INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !has_column(conn, "ai_connections", column)? {
+            conn.execute(sql, [])?;
+        }
     }
     Ok(())
 }
@@ -2155,6 +2182,46 @@ mod tests {
             assert!(kept.contains("sk-a"), "keyring 写失败时旧明文 key 必须保留");
             assert!(kept.contains("sk-b"));
         }
+    }
+
+    #[test]
+    fn v25_adds_connection_rate_limit_columns_idempotently() {
+        let c = mem();
+        c.execute_batch(
+            "CREATE TABLE ai_connections (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL,
+               deployment TEXT NOT NULL, protocol TEXT NOT NULL,
+               base_url TEXT NOT NULL, model TEXT NOT NULL,
+               api_key_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        migrate_v25(&c).unwrap();
+        migrate_v25(&c).unwrap();
+        for column in [
+            "max_concurrency",
+            "requests_per_minute",
+            "requests_per_hour",
+        ] {
+            assert!(has_column(&c, "ai_connections", column).unwrap());
+        }
+        c.execute(
+            "INSERT INTO ai_connections
+             (id, name, deployment, protocol, base_url, model, created_at, updated_at)
+             VALUES ('c', 'C', 'cloud', 'openai_chat', 'u', 'm', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let limits: (i64, i64, i64) = c
+            .query_row(
+                "SELECT max_concurrency, requests_per_minute, requests_per_hour
+                 FROM ai_connections WHERE id='c'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(limits, (0, 0, 0));
     }
 
     /// 幂等：重复执行无副作用（连接表非空即跳过）。

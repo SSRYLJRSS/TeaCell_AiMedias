@@ -199,6 +199,11 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
       {isVideo && (
         <span className="absolute top-1 left-1 rounded bg-black/55 px-1 py-0.5 text-[9px] text-white">视频</span>
       )}
+      {item.previewStatus === "limited" && !isVideo && (
+        <span className="absolute top-1 left-1 rounded bg-black/60 px-1 py-0.5 text-[9px] text-[var(--color-status)]" title={item.previewMessage}>
+          可能受限
+        </span>
+      )}
       {/* 文件名/错误原因 */}
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-3 pb-1">
         <span className="min-w-0 flex-1 truncate text-[11px] text-white" title={item.path}>
@@ -414,6 +419,9 @@ export default function PendingList({
                   {fileName(i.path)}
                 </span>
                 <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">{formatSize(i.size)}</span>
+                {i.previewStatus === "limited" && (
+                  <span className="shrink-0 text-[10px] text-[var(--color-status)]" title={i.previewMessage}>可能受限</span>
+                )}
                 {!running && (
                   <button
                     aria-label="移除"

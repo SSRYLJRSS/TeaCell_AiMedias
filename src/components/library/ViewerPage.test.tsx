@@ -7,6 +7,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";import ViewerPage from "@/components/library/ViewerPage";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { ensureVideoProxy } from "@/api/video";
+import { usePlatformStore } from "@/stores/platformStore";
 import type { Asset } from "@/types/asset";
 
 vi.mock("@/api/thumbnail", () => ({
@@ -56,6 +57,12 @@ function mkAsset(over: Partial<Asset> = {}): Asset {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  usePlatformStore.setState({
+    status: "ready",
+    capabilities: { schemaVersion: 1, os: "windows", arch: "x86_64", managedOllama: true, preferredVideoProxy: "h264_mp4" },
+    error: null,
+    loadGeneration: 0,
+  });
   useLibraryStore.setState({
     items: [mkAsset()],
     total: 1,

@@ -26,6 +26,7 @@ import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import { removeTags } from "@/api/tags";
 import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { selectPreferredVideoProxy, usePlatformStore } from "@/stores/platformStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAppearance } from "@/hooks/useAppearance";
 import { isEditableTarget, isInsidePlayer, isViewerNativeFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
@@ -78,6 +79,8 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
   const [proxyError, setProxyError] = useState<string | null>(null);
   const [proxying, setProxying] = useState(false);
   const proxyAttempted = useRef(false);
+  const proxyVariant = usePlatformStore(selectPreferredVideoProxy);
+  const platformReady = usePlatformStore((state) => state.status === "ready");
 
   // 详情开关：左属性栏显隐（§2.3 工具栏「信息开关」；FB3-04 改名，职责不变）
   const [detailsOpen, setDetailsOpen] = useState(true);
@@ -202,17 +205,17 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
     setProxyError(null);
     setProxying(false);
     setVideoSrc(convertFileSrc(current.filePath));
-  }, [current.id, current.filePath]);
+  }, [current.id, current.filePath, proxyVariant]);
 
   // §8.1：原文件播放失败 → 按需生成兼容代理；代理失败给出可解释原因与操作建议
   const handleVideoError = useCallback(async () => {
-    if (proxyAttempted.current) return;
+    if (!platformReady || proxyAttempted.current) return;
     proxyAttempted.current = true;
     const id = current.id;
     setProxying(true);
     setProxyError(null);
     try {
-      const proxy = await ensureVideoProxy(id, "h264_mp4");
+      const proxy = await ensureVideoProxy(id, proxyVariant);
       if (proxy.status === "ready" && proxy.path) {
         setVideoSrc(toProxyFileUrl(proxy.path));
         setProxyError(null);
@@ -224,10 +227,10 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
     } finally {
       setProxying(false);
     }
-  }, [current.id]);
+  }, [current.id, platformReady, proxyVariant]);
 
   const handleCancelProxy = () => {
-    void cancelVideoProxy(current.id, "h264_mp4").catch(() => undefined);
+    void cancelVideoProxy(current.id, proxyVariant).catch(() => undefined);
     setProxyError("已取消生成代理");
   };
 

@@ -10,6 +10,7 @@ import SettingsPage from "@/pages/SettingsPage";
 import PageErrorBoundary from "@/components/common/PageErrorBoundary";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { markStartup } from "@/utils/startupMarks";
@@ -69,7 +70,7 @@ export default function App() {
     setPage(next);
   };
 
-  // 全局任务条：订阅入库/导出/AI 进度事件（幂等，M3-04）
+  // 任务状态订阅：入库页消费入库进度，底栏全局任务层只展示导出进度（幂等）
   useEffect(() => {
     void startGlobalTaskWatch();
   }, []);
@@ -77,10 +78,17 @@ export default function App() {
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const loadSettings = useSettingsStore((s) => s.load);
+  const platformStatus = usePlatformStore((s) => s.status);
+  const loadPlatform = usePlatformStore((s) => s.load);
   useEffect(() => {
     markStartup("react_first_render"); // §4.1：React 首帧打点（首次挂载即首帧）
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
+
+  // 平台能力与设置并行加载；失败只进入保守降级，不阻塞核心五步闭环。
+  useEffect(() => {
+    if (platformStatus === "idle") void loadPlatform();
+  }, [platformStatus, loadPlatform]);
 
   // 骨架超时兜底：设置 IPC 异常挂起时不可无限停留在过渡态（§3.2）
   useEffect(() => {

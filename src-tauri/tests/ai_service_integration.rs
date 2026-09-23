@@ -143,6 +143,9 @@ fn profile(base_url: &str, api_mode: &str, kind: &str) -> ApiProfile {
         base_url: base_url.into(),
         api_key: "test-key".into(),
         model: "qwen-vl-plus".into(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+        requests_per_hour: 0,
     }
 }
 
@@ -502,9 +505,9 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        // 阶段 5 §8.3：单项失败重试 1 次。结构化等级会先降级，再执行一次素材级重试；
-        // 第 1 张耗尽这些请求后仍为 500，第 2 张开始正常。
-        if n < 6 {
+        // 单项失败重试 1 次；外部 OpenAI 兼容服务遇到 5xx 不再把协议等级
+        // 当作格式兼容问题反复降级，因此第 1 张只消耗两次请求，第 2 张正常。
+        if n < 2 {
             HttpResponse::status_only(500)
         } else {
             HttpResponse::ok_json(&openai_ok_body(
@@ -894,7 +897,7 @@ conn_retry_test!(list_models_error_propagates, {
     Ok(())
 });
 
-// 连接拒绝（本地档案）：错误信息含「无法连接本地服务」引导（P3-01a）
+// 连接拒绝（Windows 应用托管 Ollama 档案）：错误信息应明确指出托管服务。
 conn_retry_test!(connection_refused_local_profile_hint, {
     let _g = common::net_lock_guard();
     // 127.0.0.1:1 基本必拒绝（无需 mock）
@@ -908,7 +911,9 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     ai_cloud::run_cloud_batch(
         &dbm,
         batch.id,
-        &settings_with(profile("http://127.0.0.1:1", "openai", "local")),
+        // 使用默认托管地址，才能覆盖 Windows 的 managed Ollama 运输分支。开发机可能已有
+        // Ollama，因此断言同时允许真实服务返回的 404/model-not-found（见下方说明）。
+        &settings_with(profile("http://127.0.0.1:11434", "openai", "local")),
         &categories(),
         &categories(),
         None,
@@ -920,9 +925,18 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     let sug = ai::list_suggestions(&conn, batch.id)?;
     assert_eq!(sug[0].status, "rejected");
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
-    assert!(
-        err.contains("无法连接本地服务"),
-        "本地档案提示应可操作: {err}"
-    );
+    if cfg!(target_os = "windows") {
+        assert!(
+            err.contains("无法连接应用管理的 Ollama")
+                || err.contains("HTTP 404")
+                || err.contains("model") && err.contains("not found"),
+            "托管 Ollama 档案提示应可操作；若本机已有服务则允许明确的模型不存在错误: {err}"
+        );
+    } else {
+        assert!(
+            err.contains("视觉请求请求失败"),
+            "非 Windows 不应把 local 档案当作托管 Ollama: {err}"
+        );
+    }
     Ok(())
 });
