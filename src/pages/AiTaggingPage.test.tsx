@@ -89,6 +89,16 @@ const mkSuggestion = (id: number, assetId: number): AiSuggestion => ({
   createdAt: id,
 });
 
+const mkRunProgress = (over: Partial<NonNullable<ReturnType<typeof useAiStore.getState>["runProgress"]>> = {}) => ({
+  batchId: 1,
+  processed: 0,
+  total: 120,
+  currentAssetId: null,
+  batchProcessedAtStart: 0,
+  requestedLimit: null,
+  ...over,
+});
+
 const mkSettings = (): Settings => ({
   ai: {
     profiles: [],
@@ -141,6 +151,7 @@ beforeEach(() => {
     cancelling: false,
     error: null,
     lastProgressAssetId: null,
+    runProgress: null,
     pendingAssetIds: [],
   });
 });
@@ -171,11 +182,11 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
     mocks.listAiConnections.mockResolvedValue([
       {
         id: "cloud-1",
-        name: "agenes",
+        name: "Agnes AI",
         deployment: "cloud",
         protocol: "openai_chat",
-        baseUrl: "https://api.agnes-ai.cn/v1",
-        model: "agnes-3.0-flash",
+        baseUrl: "https://apihub.agnes-ai.com/v1",
+        model: "agnes-2.5-flash",
         hasKey: true,
         credentialStatus: "configured",
         enabled: true,
@@ -187,7 +198,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
     render(<AiTaggingPage />);
 
     expect(await screen.findByRole("combobox", { name: "AI 打标服务" })).toHaveValue("cloud-1");
-    expect(screen.getByText("模型：agnes-3.0-flash")).toBeInTheDocument();
+    expect(screen.getByText("模型：agnes-2.5-flash")).toBeInTheDocument();
     expect(screen.queryByText("默认配置")).not.toBeInTheDocument();
     expect(screen.queryByText("mimo-v2.5")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "AI 打标" })).not.toBeInTheDocument();
@@ -214,13 +225,13 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
   });
 
   it("running 即立即出现页内进度条（starting 相位），不等后端事件", () => {
-    useAiStore.setState({ batches: [mkBatch()], currentBatchId: 1, suggestions: [mkSuggestion(1, 101)], running: true });
+    useAiStore.setState({ batches: [mkBatch()], currentBatchId: 1, suggestions: [mkSuggestion(1, 101)], running: true, runProgress: mkRunProgress({ total: 0 }) });
     render(<AiTaggingPage />);
     const bars = screen.getAllByRole("progressbar");
     expect(bars).toHaveLength(1);
     expect(bars[0]).not.toHaveAttribute("aria-valuenow"); // starting 不确定条
     expect(screen.getAllByText("正在连接 AI 服务，请稍候 · 不会卡住").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("正在生成建议 0/120")).toBeInTheDocument();
+    expect(screen.getByText("正在准备本次任务 · 批次范围 120 张")).toBeInTheDocument();
   });
 
   it("进度事件驱动百分比与当前素材名；全页只有当前批次这一条进度条", () => {
@@ -229,6 +240,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
       currentBatchId: 1,
       suggestions: [mkSuggestion(1, 101), mkSuggestion(2, 142)],
       running: true,
+      runProgress: mkRunProgress(),
     });
     render(
       <>
@@ -237,19 +249,20 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
       </>,
     );
     act(() => {
-      progressHandler?.({ batchId: 1, processed: 3, total: 120, currentAssetId: 142 });
+      progressHandler?.({ batchId: 1, processed: 3, total: 10, currentAssetId: 142 });
     });
     expect(screen.getAllByRole("progressbar")).toHaveLength(1);
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "3");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
     expect(screen.getAllByText(/「photo142\.jpg」/).length).toBeGreaterThanOrEqual(1);
     // 底部居中不出现「AI 打标中」胶囊：taskStore 已无 AI 订阅，进度事件不产生任务
     expect(screen.queryByText("AI 打标中")).not.toBeInTheDocument();
     expect(useTaskStore.getState().tasks).toHaveLength(0);
     expect(useAiStore.getState().lastProgressAssetId).toBe(142);
+    expect(screen.getByText("本次执行 3/10 · 批次已处理 3/120")).toBeInTheDocument();
   });
 
   it("取消中显示取消文案；完成后显示静态最终状态", () => {
-    useAiStore.setState({ batches: [mkBatch({ processed: 5 })], currentBatchId: 1, running: true, cancelling: true });
+    useAiStore.setState({ batches: [mkBatch({ processed: 5 })], currentBatchId: 1, running: true, cancelling: true, runProgress: mkRunProgress({ processed: 5 }) });
     const { rerender } = render(<AiTaggingPage />);
     // 页面状态行与 LED 提示各有一份取消文案；进度条仍唯一
     expect(screen.getAllByText("取消已受理，当前图片完成后停止").length).toBeGreaterThanOrEqual(1);
@@ -261,15 +274,16 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
         running: false,
         cancelling: false,
         batches: [mkBatch({ status: "done", processed: 120 })],
+        runProgress: mkRunProgress({ processed: 10, total: 10 }),
       });
     });
     rerender(<AiTaggingPage />);
-    expect(screen.getByText("打标结束 · 已处理 120 / 120")).toBeInTheDocument();
+    expect(screen.getByText("打标结束 · 已处理 10 / 10")).toBeInTheDocument();
     expect(document.querySelector(".ai-marquee-track")).toBeNull(); // 滚动动画停止
   });
 
   it("失败显示错误文案（带原因）", () => {
-    useAiStore.setState({ batches: [mkBatch({ processed: 3 })], currentBatchId: 1, running: true });
+    useAiStore.setState({ batches: [mkBatch({ processed: 3 })], currentBatchId: 1, running: true, runProgress: mkRunProgress({ processed: 1 }) });
     const { rerender } = render(<AiTaggingPage />);
     act(() => {
       useAiStore.setState({ running: false, error: "网络超时" });
@@ -279,7 +293,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
   });
 
   it("切批次后旧批次的终态不残留（回到 idle 不渲染进度块）", () => {
-    useAiStore.setState({ batches: [mkBatch({ status: "done", processed: 120 })], currentBatchId: 1, running: true });
+    useAiStore.setState({ batches: [mkBatch({ status: "done", processed: 120 })], currentBatchId: 1, running: true, runProgress: mkRunProgress({ processed: 120 }) });
     const { rerender } = render(<AiTaggingPage />);
     act(() => {
       useAiStore.setState({ running: false });

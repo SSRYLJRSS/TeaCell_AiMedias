@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "茶包素材 BagerTea V2",
+  "productName": "茶馆",
   "version": "1.0.1",
   "identifier": "com.bagertea.aimdeias",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "茶包素材 BagerTea V2",
+        "title": "茶馆",
         "width": 1280,
         "height": 800,
         "minWidth": 960,

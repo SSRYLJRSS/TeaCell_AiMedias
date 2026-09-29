@@ -217,4 +217,30 @@ describe("U-5 加分 chips", () => {
     expect(st.plan?.should).toHaveLength(0);
     expect(st.expr).toEqual(expr);
   });
+
+  it("软元数据加分条件用原文 evidence 展示，避免把内部 key 暴露给用户", () => {
+    const expr = searchLeaf("单人");
+    useSuperSearchStore.getState().setExpr(expr);
+    useSuperSearchStore.setState({
+      plan: {
+        planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
+        filter: expr, mustNot: null,
+        should: [{
+          cond: {
+            type: "metadata",
+            filter: { key: "dominant_hue", op: "between", min: 70, max: 155 },
+          },
+          weight: 1,
+          label: "dominant_hue（加分项）",
+          evidence: "最好主要是绿色",
+        }],
+        minimumShouldMatch: 0,
+        retrievers: { retrievers: [] },
+        ranking: { type: "relevance" },
+      },
+    });
+    render(<FilterChips />);
+    expect(screen.getByText("最好主要是绿色")).toBeInTheDocument();
+    expect(screen.queryByText("dominant_hue 70–155")).not.toBeInTheDocument();
+  });
 });

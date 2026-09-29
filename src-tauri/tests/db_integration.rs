@@ -16,7 +16,7 @@ fn add_asset(conn: &rusqlite::Connection, path: &str, name: &str, ext: &str, mim
 }
 
 #[test]
-fn core_taxonomy_seed_is_idempotent_and_uses_other_for_new_words() -> AppResult<()> {
+fn core_taxonomy_seed_is_idempotent_and_new_words_stay_at_facet_root() -> AppResult<()> {
     let conn = setup();
     db::ensure_default_taxonomy(&conn)?;
     let first_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
@@ -36,12 +36,13 @@ fn core_taxonomy_seed_is_idempotent_and_uses_other_for_new_words() -> AppResult<
         .any(|tag| tag.name == "人"));
 
     let new_tag_id = tags::find_or_create_canonical(&conn, "people", "赛博朋克少女")?;
-    let new_parent: String = conn.query_row(
-        "SELECT p.name FROM tags t JOIN tags p ON p.id = t.parent_id WHERE t.id = ?1",
+    let (new_facet, new_parent): (String, Option<i64>) = conn.query_row(
+        "SELECT facet_key, parent_id FROM tags WHERE id = ?1",
         [new_tag_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    assert_eq!(new_parent, "其他");
+    assert_eq!(new_facet, "people");
+    assert_eq!(new_parent, None, "新词默认保留在所选分面的根级");
 
     assert_eq!(tag_facets::get(&conn, "subject")?.max_items, Some(3));
     assert_eq!(tag_facets::get(&conn, "people")?.max_items, Some(8));

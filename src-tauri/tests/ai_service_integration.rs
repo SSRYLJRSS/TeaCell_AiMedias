@@ -110,7 +110,13 @@ fn make_image(dir: &Path, name: &str, salt: u32) {
 }
 
 /// 入库 N 张真实小图，返回 asset ids（file_path 均指向真实文件，request_tags 可读）
-fn import_images(dbm: &Arc<Database>, thumbs: &ThumbnailService, n: usize) -> AppResult<Vec<i64>> {
+fn import_images(
+    dbm: &Arc<Database>,
+    thumbs: &ThumbnailService,
+    library_root: &Path,
+    n: usize,
+) -> AppResult<Vec<i64>> {
+    std::fs::create_dir_all(library_root)?;
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
@@ -118,11 +124,15 @@ fn import_images(dbm: &Arc<Database>, thumbs: &ThumbnailService, n: usize) -> Ap
         // salt 保证每张内容不同：否则相同像素内容会被哈希去重成 1 张
         make_image(&src, &format!("a{i:03}.jpg"), i as u32 + 1);
     }
+    let options = importer::ImportOptions {
+        library_root: Some(library_root.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
     let r = importer::import_paths(
         dbm,
         thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &options,
         &AtomicBool::new(false),
         |_| {},
     )?;
@@ -241,7 +251,7 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
 
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     assert_eq!(batch.status, "pending");
@@ -310,7 +320,7 @@ conn_retry_test!(all_low_confidence_is_not_reprocessed_on_resume, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
 
@@ -353,24 +363,20 @@ conn_retry_test!(all_low_confidence_is_not_reprocessed_on_resume, {
     Ok(())
 });
 
-// 主体为空不是错误：修复一次；description 有明确锚点时必须补 subject。
-conn_retry_test!(empty_subject_is_repaired_once, {
+// 分类说明表达的是用户意图，不应被后台隐式强制成“必须产出标签”；空数组是有效模型结果。
+conn_retry_test!(empty_category_result_does_not_trigger_hidden_retry, {
     let _g = common::net_lock_guard();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
-        let n = calls2.fetch_add(1, Ordering::SeqCst);
-        let content = if n == 0 {
-            r#"{"description":"城市建筑与树林交接的远景","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"subject":[]},"numbers":{}}"#
-        } else {
-            r#"{"description":"城市建筑与树林交接的远景","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"subject":[{"name":"城市建筑","confidence":0.9}]},"numbers":{}}"#
-        };
+        calls2.fetch_add(1, Ordering::SeqCst);
+        let content = r#"{"description":"城市建筑与树林交接的远景","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"subject":[]},"numbers":{}}"#;
         HttpResponse::ok_json(&openai_ok_body(content))
     });
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let (_, progress) = progress_sink();
@@ -386,18 +392,13 @@ conn_retry_test!(empty_subject_is_repaired_once, {
     )?;
 
     let sug = ai::list_suggestions(&dbm.lock().unwrap(), batch.id)?;
+    assert!(sug[0].suggested_tags.is_empty());
+    assert_eq!(sug[0].suggested_description, "城市建筑与树林交接的远景");
     assert_eq!(
-        sug[0].suggested_tags.get("subject"),
-        Some(&vec!["城市建筑".to_string()]),
-        "status={} error={:?} calls={} accepts={} io_failures={} requests={}",
-        sug[0].status,
-        sug[0].last_error,
         calls.load(Ordering::SeqCst),
-        srv.accepts(),
-        srv.io_failures(),
-        srv.requests().len(),
+        1,
+        "空分类结果不应触发隐式补调"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "主体为空应只补调一次");
     Ok(())
 });
 
@@ -414,7 +415,7 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let (_, progress) = progress_sink();
@@ -469,7 +470,7 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 2)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 2)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let (_, progress) = progress_sink();
@@ -532,7 +533,7 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 2)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 2)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let (_, progress) = progress_sink();
@@ -581,7 +582,7 @@ conn_retry_test!(cancel_mid_batch_keeps_remaining_pending, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 3)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 3)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -637,7 +638,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 5)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 5)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
 
@@ -740,7 +741,7 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
 
@@ -812,7 +813,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 3)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 3)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
 
@@ -925,7 +926,7 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 1)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 1)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
 
     let (_, progress) = progress_sink();
@@ -945,7 +946,7 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     assert_eq!(sug[0].status, "rejected");
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
     assert!(
-        err.contains("视觉请求请求失败"),
+        err.contains("视觉请求连接失败，请检查服务地址或网络"),
         "自定义端口不得误报为应用托管 Ollama: {err}"
     );
     Ok(())

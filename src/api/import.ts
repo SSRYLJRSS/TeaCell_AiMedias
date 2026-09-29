@@ -4,7 +4,7 @@ import type { ImportResult } from "@/types/asset";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 /** 入库阶段（阶段 1 契约，见指导书 §4.4）：后端只发阶段进度，前端按权重计算整体进度。 */
-export type ImportPhase = "queued" | "scanning" | "hashing" | "processing" | "previewing" | "done";
+export type ImportPhase = "queued" | "scanning" | "checking" | "hashing" | "processing" | "previewing" | "review" | "failed" | "cancelled" | "done";
 
 export interface ImportProgress {
   taskId: string;
@@ -26,9 +26,14 @@ export interface ImportOptions {
   renamePattern?: string;
 }
 
-export function importFiles(paths: string[], opts: ImportOptions = {}): Promise<ImportResult> {
+export function newImportTaskId(): string {
+  return `import-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function importFiles(paths: string[], taskId: string, opts: ImportOptions = {}): Promise<ImportResult> {
   return invoke<ImportResult>("import_files", {
     paths,
+    taskId,
     collection: opts.collection,
     renamePattern: opts.renamePattern,
   });
@@ -60,8 +65,8 @@ export interface ImportPlan {
 }
 
 /** 扫描路径生成待入库清单（不落库，两段式入库用） */
-export function inspectImport(paths: string[]): Promise<ImportPlan> {
-  return invoke<ImportPlan>("inspect_import", { paths });
+export function inspectImport(paths: string[], taskId: string): Promise<ImportPlan> {
+  return invoke<ImportPlan>("inspect_import", { paths, taskId });
 }
 
 export function onImportProgress(handler: (p: ImportProgress) => void): Promise<UnlistenFn> {

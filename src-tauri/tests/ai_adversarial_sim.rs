@@ -88,18 +88,28 @@ fn make_image(dir: &Path, name: &str, salt: u32) {
         .expect("生成测试图失败");
 }
 
-fn import_images(dbm: &Arc<Database>, thumbs: &ThumbnailService, n: usize) -> AppResult<Vec<i64>> {
+fn import_images(
+    dbm: &Arc<Database>,
+    thumbs: &ThumbnailService,
+    library_root: &Path,
+    n: usize,
+) -> AppResult<Vec<i64>> {
+    std::fs::create_dir_all(library_root)?;
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
     for i in 0..n {
         make_image(&src, &format!("a{i:03}.jpg"), i as u32 + 1);
     }
+    let opts = importer::ImportOptions {
+        library_root: Some(library_root.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
     let r = importer::import_paths(
         dbm,
         thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &opts,
         &AtomicBool::new(false),
         |_| {},
     )?;
@@ -186,7 +196,12 @@ fn run_one(
     thumbs_dir: &Path,
     srv: &MockServer,
 ) -> AppResult<(i64, Vec<ai::AiSuggestion>)> {
-    let ids = import_images(dbm, &thumbs_dir_service(thumbs_dir)?, 1)?;
+    let ids = import_images(
+        dbm,
+        &thumbs_dir_service(thumbs_dir)?,
+        &thumbs_dir.join("library"),
+        1,
+    )?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let (_, progress) = progress_sink();
     ai_cloud::run_cloud_batch(
@@ -321,7 +336,7 @@ conn_retry_test!(http_429_stops_batch_and_preserves_pending, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 2)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 2)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let (_, progress) = progress_sink();
     let error = ai_cloud::run_cloud_batch(
@@ -364,7 +379,7 @@ conn_retry_test!(consecutive_failures_trip_circuit_breaker, {
     let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
-    let ids = import_images(&dbm, &thumbs, 5)?;
+    let ids = import_images(&dbm, &thumbs, &tmp.path().join("library"), 5)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let (_, progress) = progress_sink();
     let r = ai_cloud::run_cloud_batch(
@@ -796,7 +811,12 @@ fn run_one_local(
     thumbs_dir: &Path,
     srv: &MockServer,
 ) -> AppResult<(i64, Vec<ai::AiSuggestion>)> {
-    let ids = import_images(dbm, &thumbs_dir_service(thumbs_dir)?, 1)?;
+    let ids = import_images(
+        dbm,
+        &thumbs_dir_service(thumbs_dir)?,
+        &thumbs_dir.join("library"),
+        1,
+    )?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let (_, progress) = progress_sink();
     ai_cloud::run_cloud_batch(

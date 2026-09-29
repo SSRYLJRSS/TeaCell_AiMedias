@@ -12,7 +12,7 @@ import StartupSkeleton from "@/components/common/StartupSkeleton";
 describe("StartupSkeleton（§3.2）", () => {
   it("非 Tauri 环境渲染不抛异常，显示核心文案", () => {
     expect(() => render(<StartupSkeleton />)).not.toThrow();
-    expect(screen.getByText("茶包素材")).toBeInTheDocument();
+    expect(screen.getByText("茶馆")).toBeInTheDocument();
     expect(screen.getByText("正在准备素材库")).toBeInTheDocument();
   });
 

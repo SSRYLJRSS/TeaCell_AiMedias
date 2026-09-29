@@ -51,6 +51,25 @@ export function updateTagFacet(input: {
   });
 }
 
+/** 原子创建/编辑分面，避免字段与数值配置通过多次 IPC 部分提交。 */
+export function saveTagFacet(input: {
+  key: string;
+  displayName: string;
+  description: string;
+  inputMode: "ai_and_manual" | "manual_only";
+  selectionMode: "single" | "multi";
+  maxItems: number | null;
+  appliesTo: "all" | "image" | "video";
+  facetKind: "tag" | "number";
+  numMin: number | null;
+  numMax: number | null;
+  numUnit: string;
+  numDecimals: number;
+  numStep: number;
+}): Promise<TagFacet> {
+  return invoke<TagFacet>("save_tag_facet", { input });
+}
+
 /** W2-3/W4：删除报告（与确认弹窗的数字对账） */
 export interface FacetDeleteReport {
   tagsDeleted: number;

@@ -22,9 +22,13 @@ interface ModelComboboxProps {
   /** 未获取过列表时刷新按钮的 aria-label 前缀（如「读取模型列表」）；已有列表时「刷新模型列表」 */
   label?: string;
   disabled?: boolean;
+  /** 禁用远端发现时仍允许用户手动输入模型名称。 */
+  discoverDisabled?: boolean;
+  /** 服务协议、地址或密钥变化时递增，旧模型列表和在途请求随之失效。 */
+  sourceRevision?: number | string;
 }
 
-export default function ModelCombobox({ value, onChange, onDiscover, placeholder = "qwen-vl-plus", label = "模型", disabled }: ModelComboboxProps) {
+export default function ModelCombobox({ value, onChange, onDiscover, placeholder = "例如 gpt-4.1-mini", label = "模型", disabled, discoverDisabled = false, sourceRevision }: ModelComboboxProps) {
   const [models, setModels] = useState<string[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -34,6 +38,22 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const loadSeq = useRef(0);
+  const sourceRevisionRef = useRef(sourceRevision);
+
+  if (sourceRevisionRef.current !== sourceRevision) {
+    sourceRevisionRef.current = sourceRevision;
+    // 同步使当前在途请求立即过期，不等 effect 执行后才作废。
+    loadSeq.current += 1;
+  }
+
+  useEffect(() => {
+    setModels([]);
+    setLoaded(false);
+    setLoading(false);
+    setError(null);
+    setOpen(false);
+    setHighlight(-1);
+  }, [sourceRevision]);
 
   // 列表项 = 去重后的模型；手填值不在列表中时附加「自定义：xxx」
   const list = useCallback((): string[] => {
@@ -52,7 +72,7 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
   const items = isCustom ? [...list(), `自定义：${trimmed}`] : list();
 
   const load = useCallback(async () => {
-    if (disabled) return;
+    if (disabled || discoverDisabled) return;
     setError(null);
     setLoading(true);
     const seq = ++loadSeq.current;
@@ -70,7 +90,7 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [onDiscover, disabled, trimmed]);
+  }, [onDiscover, disabled, discoverDisabled, trimmed]);
 
   // 点击外部关闭
   useEffect(() => {
@@ -139,7 +159,7 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
         <button
           type="button"
           onClick={() => void load()}
-          disabled={disabled}
+          disabled={disabled || discoverDisabled}
           aria-label={loaded ? "刷新模型列表" : "读取模型列表"}
           title={loaded ? "刷新模型列表" : "读取模型列表"}
           className={clsx(

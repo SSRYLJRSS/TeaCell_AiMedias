@@ -3,8 +3,8 @@
 <WixLocalization Culture="en-us" Codepage="936" xmlns="http://schemas.microsoft.com/wix/2006/localization">
   <String Id="TauriLanguage">1033</String>
   <String Id="TauriCodepage">936</String>
-  <String Id="LaunchApp">Launch 茶包素材 BagerTea V2</String>
-  <String Id="DowngradeErrorMessage">A newer version of 茶包素材 BagerTea V2 is already installed.</String>
-  <String Id="PathEnvVarFeature">Add the install location of the 茶包素材 BagerTea V2 executable to the PATH system environment variable. This allows the 茶包素材 BagerTea V2 executable to be called from any location.</String>
-  <String Id="InstallAppFeature">Installs 茶包素材 BagerTea V2.</String>
+  <String Id="LaunchApp">Launch 茶馆</String>
+  <String Id="DowngradeErrorMessage">A newer version of 茶馆 is already installed.</String>
+  <String Id="PathEnvVarFeature">Add the install location of the 茶馆 executable to the PATH system environment variable. This allows the 茶馆 executable to be called from any location.</String>
+  <String Id="InstallAppFeature">Installs 茶馆.</String>
 </WixLocalization>

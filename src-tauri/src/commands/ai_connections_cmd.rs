@@ -32,6 +32,19 @@ pub struct AiConnectionView {
     pub enabled: bool,
 }
 
+/// 超级搜索当前真正会使用的连接状态；不包含服务地址或凭据。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuperSearchServiceResolutionView {
+    pub ready: bool,
+    pub source: String,
+    pub connection_id: Option<String>,
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub deployment: Option<String>,
+    pub message: Option<String>,
+}
+
 impl AiConnectionView {
     fn from_row(c: ai_connections::AiConnection, status: credentials::CredentialStatus) -> Self {
         Self {
@@ -231,11 +244,58 @@ pub fn set_ai_usage_binding(
         ai_connections::unbind_usage(&conn, &usage)?;
         return Ok(());
     };
-    // 校验连接存在
-    if ai_connections::get(&conn, &cid)?.is_none() {
-        return Err(AppError::msg("连接档案不存在"));
+    // 禁用连接不能成为新的功能绑定；当前已有的失效绑定仍可通过解绑恢复。
+    let connection =
+        ai_connections::get(&conn, &cid)?.ok_or_else(|| AppError::not_found("连接档案不存在"))?;
+    if !connection.enabled {
+        return Err(AppError::conflict("该 AI 服务已停用，请先启用后再选择"));
     }
     ai_connections::bind_usage(&conn, &usage, &cid)
+}
+
+/// 返回超级搜索实际解析出的服务。未绑定时只按在线连接自动选择，不能读取旧版 activeProfile。
+#[tauri::command]
+pub async fn get_super_search_service_resolution(
+    state: State<'_, AppState>,
+) -> AppResult<SuperSearchServiceResolutionView> {
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let binding_id = {
+            let conn = db.lock()?;
+            ai_connections::binding_id(&conn, "super_search")?
+        };
+        match credentials::resolve_super_search_profile_with_system_credential(&db) {
+            Ok(resolved) => Ok(SuperSearchServiceResolutionView {
+                ready: true,
+                source: match resolved.source {
+                    credentials::SuperSearchProfileSource::ExplicitBinding => "explicitBinding",
+                    credentials::SuperSearchProfileSource::AutomaticOnline => "automaticOnline",
+                }
+                .to_string(),
+                connection_id: Some(resolved.connection_id),
+                name: Some(resolved.name),
+                model: Some(resolved.model),
+                deployment: Some(resolved.deployment),
+                message: None,
+            }),
+            Err(error) => Ok(SuperSearchServiceResolutionView {
+                ready: false,
+                source: if binding_id.is_some() {
+                    "explicitBinding"
+                } else {
+                    "automaticOnline"
+                }
+                .to_string(),
+                connection_id: binding_id,
+                name: None,
+                model: None,
+                deployment: None,
+                message: Some(error.to_string()),
+            }),
+        }
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("超级搜索服务状态读取任务失败: {e}")))?
 }
 
 /// 读取两个用途的当前绑定（connection_id，无绑定为 null）。

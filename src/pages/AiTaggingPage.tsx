@@ -29,7 +29,7 @@ import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
   const {
-    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, lastProgressAssetId,
+    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, lastProgressAssetId, runProgress,
   } = useAiStore(
     useShallow((s) => ({
       batches: s.batches,
@@ -40,6 +40,7 @@ export default function AiTaggingPage() {
       error: s.error,
       pendingAssetIds: s.pendingAssetIds,
       lastProgressAssetId: s.lastProgressAssetId,
+      runProgress: s.runProgress,
     })),
   );
   const {
@@ -140,14 +141,11 @@ export default function AiTaggingPage() {
     void refreshBatches();
   }, [refreshBatches]);
 
-  // FB6 需求一：进度事件唯一订阅入口（页面内），同时更新 aiStore 与「已收到进度」标记。
-  // startBatch 即置 running（starting 相位立即有视觉反馈），首条事件到达后进入 running 相位。
-  const [sawProgress, setSawProgress] = useState(false);
+  // 进度事件只有一个订阅入口；按 batchId 归属本次运行，运行计数不覆盖批次累计值。
   useTauriEvent(
     () =>
       onAiProgress((p) => {
-        patchProgress(p.processed, p.currentAssetId);
-        setSawProgress(true);
+        patchProgress(p);
       }),
     [],
   );
@@ -158,27 +156,33 @@ export default function AiTaggingPage() {
   const [aiFinal, setAiFinal] = useState<{ status: string | null; error: string | null; processed: number; total: number } | null>(null);
   const prevRunning = useRef(false);
   useEffect(() => {
-    if (prevRunning.current && !running && current) {
-      setAiFinal({ status: current.status, error, processed: current.processed, total: current.total });
+    const completedRun = runProgress?.batchId === currentBatchId ? runProgress : null;
+    if (prevRunning.current && !running && current && completedRun) {
+      setAiFinal({
+        status: current.status,
+        error,
+        processed: completedRun.processed,
+        total: completedRun.total,
+      });
     }
     prevRunning.current = running;
-    // 收尾快照只取 running 翻转那次渲染的 current/error（已是最新值）
+    // 收尾快照取本次执行计数；批次总量另行展示。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
-  // 切批次：清空上一次的收尾快照与进度标记，避免旧批次的终态/素材名串台
+  // 切批次：清空上一次的收尾快照，避免旧批次的终态串台。
   useEffect(() => {
     setAiFinal(null);
-    setSawProgress(false);
   }, [currentBatchId]);
 
-  const batchProcessed = current?.processed ?? 0;
-  const batchTotal = current?.total ?? 0;
+  const selectedRun = runProgress?.batchId === currentBatchId ? runProgress : null;
+  const runProcessed = selectedRun?.processed ?? 0;
+  const runTotal = selectedRun?.total ?? 0;
   const aiState: AiTaggingUiState = running
     ? cancelling
-      ? { phase: "cancelling", processed: batchProcessed, total: batchTotal }
-      : sawProgress
-        ? { phase: "running", processed: batchProcessed, total: batchTotal, currentAssetId: lastProgressAssetId ?? undefined }
-        : { phase: "starting", total: batchTotal }
+      ? { phase: "cancelling", processed: runProcessed, total: runTotal }
+      : runTotal > 0
+        ? { phase: "running", processed: runProcessed, total: runTotal, currentAssetId: lastProgressAssetId ?? undefined }
+        : { phase: "starting", total: 0 }
     : aiFinal?.error
       ? { phase: "error", message: aiFinal.error, processed: aiFinal.processed, total: aiFinal.total }
       : aiFinal && (aiFinal.status === "done" || aiFinal.status === "cancelled")
@@ -557,9 +561,13 @@ export default function AiTaggingPage() {
             {aiState.phase !== "idle" && (
               <div className="mt-2">
                 <AiTaggingProgress state={aiState} currentAssetName={aiCurrentName} />
-                <p className="mt-1 text-[10px] text-[var(--color-text-secondary)]">
-                  {`正在生成建议 ${current.processed}/${current.total}`}
-                </p>
+                {current && selectedRun && (
+                  <p className="mt-1 text-[10px] text-[var(--color-text-secondary)]">
+                    {runTotal > 0
+                      ? `本次执行 ${runProcessed}/${runTotal} · 批次已处理 ${Math.min(selectedRun.batchProcessedAtStart + runProcessed, current.total)}/${current.total}`
+                      : `正在准备本次任务${selectedRun.requestedLimit == null ? "" : `（最多 ${selectedRun.requestedLimit} 张）`} · 批次范围 ${current.total} 张`}
+                  </p>
+                )}
               </div>
             )}
             {stats.awaitingConfirmation > 0 && !running && (

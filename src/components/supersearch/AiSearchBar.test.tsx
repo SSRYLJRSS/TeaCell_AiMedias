@@ -4,6 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import AiSearchBar from "@/components/supersearch/AiSearchBar";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 
+vi.mock("@/api/superSearch", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/superSearch")>();
+  return { ...actual, onAiSearchProgress: vi.fn().mockResolvedValue(() => undefined) };
+});
+
 const renderBar = () =>
   render(<AiSearchBar onSubmit={vi.fn()} />);
 
@@ -15,6 +20,11 @@ describe("AiSearchBar 三态", () => {
       warnings: [],
       parseStatus: null,
       aiError: null,
+      aiRequestId: null,
+      aiPhase: null,
+      aiStartedAt: null,
+      aiElapsedMs: 0,
+      aiCancelPending: false,
     });
   });
 
@@ -50,10 +60,28 @@ describe("AiSearchBar 三态", () => {
     expect(screen.getByText(/已按关键词搜索：海边/)).toBeTruthy();
   });
 
-  it("aiError：配置错误仍显示红字 + 按原文搜索按钮", () => {
+  it("aiError：请求失败显示红字、保留条件提示和按原文搜索按钮", () => {
     useSuperSearchStore.setState({ aiError: "云端请求失败: 401" });
     renderBar();
-    expect(screen.getByText(/AI 解析失败/)).toBeTruthy();
+    expect(screen.getByText(/本次未应用；当前条件与结果保持不变/)).toBeTruthy();
     expect(screen.getByText("按原文搜索")).toBeTruthy();
+  });
+
+  it("等待模型时显示阶段、耗时和可操作的取消控件", () => {
+    useSuperSearchStore.setState({ aiLoading: true, aiRequestId: "req-1", aiPhase: "requesting", aiStartedAt: Date.now() - 5200, aiElapsedMs: 5200 });
+    const cancel = vi.fn();
+    useSuperSearchStore.setState({ cancelAiSearch: cancel });
+    renderBar();
+    expect(screen.getByRole("status").textContent).toContain("正在请求并等待模型响应");
+    expect(screen.getByRole("status").textContent).toContain("5 秒");
+    screen.getByRole("button", { name: "取消解析" }).click();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("取消等待期间说明当前请求正在结束", () => {
+    useSuperSearchStore.setState({ aiRequestId: "req-2", aiPhase: "cancelling", aiCancelPending: true, aiElapsedMs: 8000 });
+    renderBar();
+    expect(screen.getByRole("status").textContent).toContain("已停止接收结果，正在结束当前请求");
+    expect(screen.getByRole("button", { name: "正在停止" })).toBeTruthy();
   });
 });

@@ -196,7 +196,9 @@ export default function FilterChips() {
     plan.should.forEach((sc, i) => {
       chips.push({
         key: `bonus:${i}:${JSON.stringify(sc.cond)}:${sc.weight}`,
-        label: bonusLabel(sc.cond, tagName),
+        label: sc.cond.type === "metadata" && sc.evidence?.trim()
+          ? sc.evidence.trim()
+          : bonusLabel(sc.cond, tagName),
         group: "优先",
         onRemove: () => removePlanShould(i),
       });

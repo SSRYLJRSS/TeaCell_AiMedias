@@ -30,6 +30,48 @@ export function openHelpPage(): Promise<void> {
   return invoke<void>("open_help_page");
 }
 
+/** 读取帮助地址；与后端系统浏览器动作共用来源，供打开失败时复制。 */
+export function getHelpPageUrl(): Promise<string> {
+  return invoke<string>("get_help_page_url");
+}
+
+export function openProjectPage(): Promise<void> {
+  return invoke<void>("open_project_page");
+}
+
+export function getProjectPageUrl(): Promise<string> {
+  return invoke<string>("get_project_page_url");
+}
+
+export function openLicensePage(): Promise<void> {
+  return invoke<void>("open_license_page");
+}
+
+export function getLicensePageUrl(): Promise<string> {
+  return invoke<string>("get_license_page_url");
+}
+
+export function openAuthorPage(): Promise<void> {
+  return invoke<void>("open_author_page");
+}
+
+export function getAuthorPageUrl(): Promise<string> {
+  return invoke<string>("get_author_page_url");
+}
+
+export function openFeedbackPage(): Promise<void> {
+  return invoke<void>("open_feedback_page");
+}
+
+export function getFeedbackPageUrl(): Promise<string> {
+  return invoke<string>("get_feedback_page_url");
+}
+
+/** 使用系统默认浏览器打开 Agnes 官方 API Key 申请说明。 */
+export function openAgnesApiKeyDocs(): Promise<void> {
+  return invoke<void>("open_agnes_api_key_docs");
+}
+
 export interface DiagnosticsReport {
   path: string;
   logFiles: number;

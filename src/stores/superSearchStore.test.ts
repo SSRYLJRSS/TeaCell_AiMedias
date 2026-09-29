@@ -15,6 +15,8 @@ vi.mock("@/api/superSearch", async (importOriginal) => {
   return {
     ...actual,
     aiParseSearchQuery: vi.fn(),
+    cancelAiSearch: vi.fn().mockResolvedValue(undefined),
+    onAiSearchProgress: vi.fn().mockResolvedValue(() => undefined),
     listSuperAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false, warnings: [] }),
     listSuperAssetIdsByPlan: vi.fn(),
   };
@@ -145,7 +147,7 @@ describe("superSearchStore", () => {
     vi.mocked(aiParseSearchQuery).mockResolvedValue({
       intent: {
         groups: [
-          { assetType: "all", concepts: [{ text: "海边", role: "scene", facetHint: "scene", confidence: 0.95 }], textTerms: [], metadata: [], preferred: [] },
+          { assetType: "all", concepts: [{ text: "海边", role: "scene", facetHint: "scene", confidence: 0.95 }], textTerms: [], metadata: [], preferredMetadata: [], preferred: [] },
         ],
         exclusions: [],
         sortBy: null,
@@ -196,20 +198,30 @@ describe("superSearchStore", () => {
     expect(st.resolvedTags.map((t) => t.tagId).sort()).toEqual([1, 2]);
   });
 
-  it("AI 解析失败：只设 aiError，保留当前 expr/items，不触发 refresh", async () => {
+  it("AI 请求失败：保留输入、当前计划和结果，只显示 aiError", async () => {
     const { aiParseSearchQuery } = await import("@/api/superSearch");
-    vi.mocked(listSuperAssets).mockResolvedValue({ items: [mkAsset(1)], total: 1, hasMore: false, warnings: [] });
-    vi.mocked(aiParseSearchQuery).mockRejectedValue(new Error("模型未返回可解析的 JSON"));
+    vi.mocked(aiParseSearchQuery).mockRejectedValue(new Error("AI 服务请求过于频繁（HTTP 429）"));
     const base = tagLeaf(1);
     useSuperSearchStore.getState().setExpr(base);
-    useSuperSearchStore.setState({ resolvedTags: [{ facetKey: "subject", text: "建筑", tagId: 1, path: "" }] });
+    const originalItems = [mkAsset(1)];
+    useSuperSearchStore.setState({
+      items: originalItems,
+      total: 1,
+      aiInput: "找建筑素材",
+      resolvedTags: [{ facetKey: "subject", text: "建筑", tagId: 1, path: "" }],
+    });
+    const originalPlan = useSuperSearchStore.getState().plan;
     const refreshSpy = vi.fn();
     useSuperSearchStore.setState({ refresh: refreshSpy });
-    await useSuperSearchStore.getState().applyAiSearch("无法解析的句子");
+    await useSuperSearchStore.getState().applyAiSearch("找建筑素材");
     const st = useSuperSearchStore.getState();
-    expect(st.aiError).toContain("模型未返回");
+    expect(st.aiError).toContain("429");
     expect(st.error).toBeNull();
     expect(st.expr).toEqual(base);
+    expect(st.plan).toEqual(originalPlan);
+    expect(st.items).toBe(originalItems);
+    expect(st.total).toBe(1);
+    expect(st.aiInput).toBe("找建筑素材");
     expect(st.resolvedTags.length).toBe(1);
     expect(refreshSpy).not.toHaveBeenCalled();
   });
@@ -239,6 +251,26 @@ describe("superSearchStore", () => {
     await task;
     expect(useSuperSearchStore.getState().aiInput).toBe("新条件");
     expect(useSuperSearchStore.getState().plan).toBeNull();
+  });
+
+  it("只接受当前 requestId 的进度，取消后使迟到结果失效", async () => {
+    const { aiParseSearchQuery, cancelAiSearch } = await import("@/api/superSearch");
+    let resolveAi!: (value: Awaited<ReturnType<typeof aiParseSearchQuery>>) => void;
+    vi.mocked(aiParseSearchQuery).mockReturnValueOnce(new Promise((resolve) => { resolveAi = resolve; }));
+    const task = useSuperSearchStore.getState().applyAiSearch("当前请求");
+    await vi.waitFor(() => expect(useSuperSearchStore.getState().aiRequestId).not.toBeNull());
+    const requestId = useSuperSearchStore.getState().aiRequestId!;
+    useSuperSearchStore.getState().handleAiProgress({ requestId: "stale-id", phase: "requesting", elapsedMs: 9000, errorCode: null });
+    expect(useSuperSearchStore.getState().aiPhase).toBe("queued");
+    useSuperSearchStore.getState().handleAiProgress({ requestId, phase: "requesting", elapsedMs: 1200, errorCode: null });
+    expect(useSuperSearchStore.getState().aiPhase).toBe("requesting");
+    await useSuperSearchStore.getState().cancelAiSearch();
+    expect(cancelAiSearch).toHaveBeenCalledWith(requestId);
+    expect(useSuperSearchStore.getState().aiCancelPending).toBe(true);
+    resolveAi({} as Awaited<ReturnType<typeof aiParseSearchQuery>>);
+    await task;
+    expect(useSuperSearchStore.getState().plan).toBeNull();
+    expect(useSuperSearchStore.getState().aiPhase).toBe("cancelling");
   });
 
   it("removeExprAtPath 只摘除 filter 区对应节点", () => {

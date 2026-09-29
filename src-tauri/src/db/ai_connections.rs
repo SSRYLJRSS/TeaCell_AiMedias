@@ -108,21 +108,23 @@ pub fn usage_profile_metadata(
         return Ok(None);
     };
     let credential_ref = c.api_key_ref.clone();
-    Ok(Some((
-        crate::db::settings::ApiProfile {
-            id: c.id.clone(),
-            name: c.name.clone(),
-            api_mode: protocol_to_api_mode(&c.protocol).to_string(),
-            kind: c.deployment.clone(),
-            base_url: c.base_url.clone(),
-            api_key: String::new(),
-            model: c.model.clone(),
-            max_concurrency: c.max_concurrency,
-            requests_per_minute: c.requests_per_minute,
-            requests_per_hour: c.requests_per_hour,
-        },
-        credential_ref,
-    )))
+    Ok(Some((profile_from_connection(&c), credential_ref)))
+}
+
+/// 把连接档案映射到现有 AI HTTP 管线使用的配置，不读取系统凭据。
+pub fn profile_from_connection(c: &AiConnection) -> crate::db::settings::ApiProfile {
+    crate::db::settings::ApiProfile {
+        id: c.id.clone(),
+        name: c.name.clone(),
+        api_mode: protocol_to_api_mode(&c.protocol).to_string(),
+        kind: c.deployment.clone(),
+        base_url: c.base_url.clone(),
+        api_key: String::new(),
+        model: c.model.clone(),
+        max_concurrency: c.max_concurrency,
+        requests_per_minute: c.requests_per_minute,
+        requests_per_hour: c.requests_per_hour,
+    }
 }
 
 /// Backwards-compatible pure metadata projection; never reads the system keyring.

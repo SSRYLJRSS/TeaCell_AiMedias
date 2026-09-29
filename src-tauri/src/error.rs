@@ -14,6 +14,10 @@ pub enum AppErrorCode {
     Timeout,
     FileLocked,
     AiRateLimited,
+    AiFormatUnsupported,
+    AiOutputTruncated,
+    LibraryRootRequired,
+    InvalidLibraryRoot,
     Unauthorized,
     Unsupported,
     Internal,
@@ -29,6 +33,10 @@ impl AppErrorCode {
             Self::Timeout => "TIMEOUT",
             Self::FileLocked => "FILE_LOCKED",
             Self::AiRateLimited => "AI_RATE_LIMITED",
+            Self::AiFormatUnsupported => "AI_FORMAT_UNSUPPORTED",
+            Self::AiOutputTruncated => "AI_OUTPUT_TRUNCATED",
+            Self::LibraryRootRequired => "LIBRARY_ROOT_REQUIRED",
+            Self::InvalidLibraryRoot => "INVALID_LIBRARY_ROOT",
             Self::Unauthorized => "UNAUTHORIZED",
             Self::Unsupported => "UNSUPPORTED",
             Self::Internal => "INTERNAL",
@@ -87,6 +95,14 @@ impl AppError {
 
     pub fn ai_rate_limited(s: impl Into<String>) -> Self {
         Self::coded(AppErrorCode::AiRateLimited, s)
+    }
+
+    pub fn ai_format_unsupported(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AiFormatUnsupported, s)
+    }
+
+    pub fn ai_output_truncated(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AiOutputTruncated, s)
     }
 
     pub fn unauthorized(s: impl Into<String>) -> Self {

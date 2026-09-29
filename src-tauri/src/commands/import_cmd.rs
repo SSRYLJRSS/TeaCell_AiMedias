@@ -1,4 +1,5 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -9,6 +10,58 @@ use crate::error::{AppError, AppResult};
 use crate::services::importer::{self, ImportOptions, ImportProgress};
 use crate::services::{media_refill, thumbnail::ThumbnailService};
 use crate::state::AppState;
+
+struct ImportOperationGuard {
+    running: Arc<AtomicBool>,
+}
+
+impl ImportOperationGuard {
+    fn acquire(state: &AppState) -> AppResult<Self> {
+        state
+            .import_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .map_err(|_| AppError::conflict("已有文件检查或入库任务正在运行"))?;
+        state.import_cancel.store(false, Ordering::Relaxed);
+        Ok(Self {
+            running: Arc::clone(&state.import_running),
+        })
+    }
+}
+
+impl Drop for ImportOperationGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+fn validate_task_id(task_id: &str) -> AppResult<()> {
+    if task_id.is_empty()
+        || task_id.len() > 128
+        || !task_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(AppError::invalid_arg("导入任务 ID 不合法"));
+    }
+    Ok(())
+}
+
+fn emit_import_terminal(app: &AppHandle, task_id: &str, phase: &str, message: String) {
+    let _ = app.emit(
+        "import://progress",
+        ImportProgress {
+            task_id: task_id.to_string(),
+            phase: phase.to_string(),
+            phase_current: 0,
+            phase_total: None,
+            file: None,
+            imported: 0,
+            duplicates: 0,
+            failed: 0,
+            message: Some(message),
+        },
+    );
+}
 
 /// FB4-03（§6.4）：导入后置色板完成事件。只允许导入后置任务发送；手动设置页回算不发。
 /// 发送条件（全部满足）：由 import_files 后台后置任务触发 + 成功抢到 refill gate +
@@ -51,29 +104,80 @@ pub async fn import_files(
     app: AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
+    task_id: String,
     collection: Option<String>,
     rename_pattern: Option<String>,
 ) -> AppResult<ImportResult> {
     if paths.is_empty() {
         return Err(AppError::invalid_arg("未选择任何文件"));
     }
+    validate_task_id(&task_id)?;
+    let _operation = ImportOperationGuard::acquire(&state)?;
+    let cancel = Arc::clone(&state.import_cancel);
+    let library_root = {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        settings::get_settings(&conn)?.library_root
+    };
+    // 路径、类型与写入能力都在释放数据库锁后检查。
+    let validated_root = importer::validate_library_root(&library_root)?;
     // 防止绕过入库页直接调用 IPC：正式复制/写库前再次确认所有图片都能生成
     // 快速缩略图。不可预览项必须先从队列剔除，不能进入半成功的导入任务。
     let preflight_paths = paths.clone();
-    let preflight =
-        tauri::async_runtime::spawn_blocking(move || importer::inspect_paths(&preflight_paths))
-            .await
-            .map_err(|e| AppError::msg(format!("入库预检查线程异常: {e}")))?;
-    importer::require_previewable(&preflight)?;
-    state.import_cancel.store(false, Ordering::Relaxed);
-    // W5c：入库进行中标志（restore_db 阻断依据）
-    state.import_running.store(true, Ordering::Relaxed);
+    let preflight_app = app.clone();
+    let preflight_task_id = task_id.clone();
+    let preflight_cancel = Arc::clone(&cancel);
+    let preflight_started_at = std::time::Instant::now();
+    let preflight = tauri::async_runtime::spawn_blocking(move || {
+        importer::validate_library_root(validated_root.to_string_lossy().as_ref())?;
+        importer::inspect_paths_with_control(
+            &preflight_paths,
+            preflight_task_id,
+            &preflight_cancel,
+            |progress| {
+                let _ = preflight_app.emit("import://progress", progress);
+            },
+        )
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("入库预检查线程异常: {e}")))?;
+    let preflight = match preflight {
+        Ok(plan) => plan,
+        Err(error) => {
+            let phase = if error.code() == "CANCELLED" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            emit_import_terminal(&app, &task_id, phase, error.to_string());
+            return Err(error);
+        }
+    };
+    if let Err(error) = importer::require_previewable(&preflight) {
+        emit_import_terminal(&app, &task_id, "failed", error.to_string());
+        return Err(error);
+    }
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        stage = "confirm_preflight",
+        candidate_count = preflight.items.len(),
+        warning_count = preflight.warnings.len(),
+        duration_ms = preflight_started_at.elapsed().as_millis() as u64,
+        "确认入库预检查完成"
+    );
+    if cancel.load(Ordering::Relaxed) {
+        let error = AppError::cancelled("入库已取消，尚未复制或写入素材");
+        emit_import_terminal(&app, &task_id, "cancelled", error.to_string());
+        return Err(error);
+    }
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
-    let cancel = std::sync::Arc::clone(&state.import_cancel);
     // 后置色板任务也需要 emit：AppHandle 是 Clone，先克隆一份供第二个 spawn_blocking 使用
     let post_app = app.clone();
 
+    let worker_task_id = task_id.clone();
+    let worker_app = app.clone();
+    let worker_preflight = preflight;
     let result = match tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
         let library_root = {
@@ -81,28 +185,44 @@ pub async fn import_files(
             settings::get_settings(&conn)?.library_root
         };
         let opts = ImportOptions {
-            library_root: if library_root.trim().is_empty() {
-                None
-            } else {
-                Some(library_root)
-            },
+            library_root: Some(library_root),
             collection,
             rename_pattern: rename_pattern.filter(|p| !p.trim().is_empty()),
         };
-        importer::import_paths(&db, &thumbs, &paths, &opts, &cancel, |p: ImportProgress| {
-            let _ = app.emit("import://progress", p);
-        })
+        importer::validate_library_root(opts.library_root.as_deref().unwrap_or_default())?;
+        importer::import_preflight_plan_with_task_id(
+            &db,
+            &thumbs,
+            worker_preflight,
+            &opts,
+            &cancel,
+            worker_task_id,
+            |p: ImportProgress| {
+                let _ = worker_app.emit("import://progress", p);
+            },
+        )
     })
     .await
     {
         Ok(r) => r,
         Err(e) => {
-            state.import_running.store(false, Ordering::Relaxed);
-            return Err(AppError::msg(format!("入库线程异常: {e}")));
+            let error = AppError::msg(format!("入库线程异常: {e}"));
+            emit_import_terminal(&app, &task_id, "failed", error.to_string());
+            return Err(error);
         }
     };
-    state.import_running.store(false, Ordering::Relaxed);
-    let result = result?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let phase = if error.code() == "CANCELLED" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            emit_import_terminal(&app, &task_id, phase, error.to_string());
+            return Err(error);
+        }
+    };
 
     // FB2-08（§14.7）：入库完成后自动补算色板。
     // 不塞进 importer 热路径：placeholder 生成是 par_iter 并行块，图像不驻留内存，
@@ -191,10 +311,44 @@ pub async fn import_files(
 /// FB2-03：对清单内每个原文件逐路径放行 asset 协议，使入库页可在卡片内播放视频。
 /// 安全边界与 list_assets 一致——只放行用户主动选择/拖入的路径，只读，不放宽 scope、不用 allow_directory。
 #[tauri::command]
-pub async fn inspect_import(app: AppHandle, paths: Vec<String>) -> AppResult<importer::ImportPlan> {
-    let plan = tauri::async_runtime::spawn_blocking(move || importer::inspect_paths(&paths))
-        .await
-        .map_err(|e| AppError::msg(format!("扫描线程异常: {e}")))?;
+pub async fn inspect_import(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    task_id: String,
+) -> AppResult<importer::ImportPlan> {
+    if paths.is_empty() {
+        return Err(AppError::invalid_arg("未选择任何文件"));
+    }
+    validate_task_id(&task_id)?;
+    let _operation = ImportOperationGuard::acquire(&state)?;
+    let cancel = Arc::clone(&state.import_cancel);
+    let library_root = {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        settings::get_settings(&conn)?.library_root
+    };
+    let task_id_for_worker = task_id.clone();
+    let worker_app = app.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        importer::validate_library_root(&library_root)?;
+        importer::inspect_paths_with_control(&paths, task_id_for_worker, &cancel, |progress| {
+            let _ = worker_app.emit("import://progress", progress);
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("扫描线程异常: {e}")))?;
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            let phase = if error.code() == "CANCELLED" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            emit_import_terminal(&app, &task_id, phase, error.to_string());
+            return Err(error);
+        }
+    };
     for item in &plan.items {
         allow_import_asset(&app, &item.path);
     }

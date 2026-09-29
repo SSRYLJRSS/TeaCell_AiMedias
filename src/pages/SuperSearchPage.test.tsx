@@ -22,6 +22,7 @@ vi.mock("@/api/assets", () => ({
   listMetadataFacets: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@/api/superSearch", () => ({
+  onAiSearchProgress: vi.fn().mockResolvedValue(() => undefined),
   aiParseSearchQuery: vi.fn().mockResolvedValue({
     intent: { groups: [], exclusions: [], sortBy: null, sortDir: null },
     expr: null,

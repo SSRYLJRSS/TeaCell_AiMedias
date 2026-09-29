@@ -171,11 +171,8 @@ pub fn init_memory() -> AppResult<Connection> {
     Ok(conn)
 }
 
-/// 生产启动和恢复库后的统一补齐入口：
-/// 只升级未改过的系统分面默认值；标签表为空时才播种核心层级词表。
+/// 生产启动和恢复库后的统一补齐入口：只在分面表为空时播种，绝不改写已有分类说明。
 pub fn ensure_default_taxonomy(conn: &Connection) -> AppResult<()> {
-    let now = chrono::Utc::now().timestamp_millis();
-    tag_facets::refresh_system_facet_defaults(conn, now)?;
     tag_facets::seed_system_facets_if_empty(conn)?;
     tags::seed_core_taxonomy_if_empty(conn)?;
     tags::ensure_core_taxonomy_aliases(conn)?;

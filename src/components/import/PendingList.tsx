@@ -170,8 +170,8 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
   const cancelHover = hover.cancel;
   // FB2-02（§9.4）：入库网格卡片比例与填充沿用 appearance.grid（决策 4：一个设置管两页）
   const { grid } = useAppearance();
-  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["1:1"];
-  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["4:3"];
+  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["4:3"];
   const fit = resolveFit(grid.cellFit, null, cw / ch); // 未入库无内容宽高 → smart 退 cover
   const { onClick, onDoubleClick } = useDoubleAction(
     () => {

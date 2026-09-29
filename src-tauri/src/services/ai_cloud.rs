@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::Serialize;
@@ -26,9 +26,66 @@ use crate::state::Database;
 /// A2：提示词版本（手工维护常量）—— 改提示词时必须递增，随 request_config 一起落库溯源。
 pub const PROMPT_VERSION: &str = "tagging-v2.1-2026-09";
 pub const ANALYSIS_SCHEMA_VERSION: i64 = 2;
-pub const MIN_DESCRIPTION_CHARS: usize = 12;
-pub const MAX_DESCRIPTION_CHARS: usize = 30;
 pub const DEFAULT_CONFIDENCE_MIN_SUGGEST: f64 = 0.30;
+pub const AI_SEARCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
+const AI_SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const AI_SEARCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 打标业务约束由当前启用的分类说明提供；缺少说明时在服务层阻止启动，
+/// 避免命令层自行解释分类配置。
+pub fn validate_tagging_facet_descriptions<'a>(
+    facets: impl IntoIterator<Item = &'a FacetPromptContext>,
+) -> AppResult<()> {
+    let missing = facets
+        .into_iter()
+        .filter(|facet| facet.description.trim().is_empty())
+        .map(|facet| facet.display_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::invalid_arg(format!(
+        "以下 AI 分类尚未填写「给 AI 的分类说明」：{}。请先完善分类说明并保存。",
+        missing.into_iter().collect::<Vec<_>>().join("、")
+    )))
+}
+
+#[cfg(test)]
+mod tagging_facet_validation_tests {
+    use super::validate_tagging_facet_descriptions;
+    use crate::db::tag_facets::FacetPromptContext;
+
+    #[test]
+    fn rejects_enabled_facet_without_visible_description() {
+        let facets = [
+            FacetPromptContext {
+                display_name: "场景/地点".into(),
+                description: "  ".into(),
+                ..Default::default()
+            },
+            FacetPromptContext {
+                display_name: "品牌信息".into(),
+                description: "品牌标识和包装文字".into(),
+                ..Default::default()
+            },
+        ];
+
+        let error = validate_tagging_facet_descriptions(facets.iter()).unwrap_err();
+        assert!(error.to_string().contains("场景/地点"));
+        assert!(!error.to_string().contains("品牌信息"));
+    }
+
+    #[test]
+    fn accepts_nonempty_user_defined_facet_descriptions() {
+        let facets = [FacetPromptContext {
+            key: "brand_info".into(),
+            display_name: "品牌信息".into(),
+            description: "记录画面中能够读出的品牌名称".into(),
+            ..Default::default()
+        }];
+        assert!(validate_tagging_facet_descriptions(facets.iter()).is_ok());
+    }
+}
 
 /// 产品层的打标传输边界：只有 Windows 上由应用管理的默认 Ollama 才属于“本地打标”。
 /// 其他 localhost、局域网地址或自定义 Ollama 都按外部 API 处理，不触发 Ollama 生命周期
@@ -270,40 +327,134 @@ fn safe_http_detail_with_plain_text(body: &str, allow_plain_text: bool) -> Optio
 }
 
 fn ai_http_status_error_with_body(service: &str, status: u16, body: &str) -> AppError {
-    let message = match status {
-        401 | 403 => format!("{service}鉴权失败（HTTP {status}），请检查 API Key 和访问权限"),
-        408 => format!("{service}请求超时（HTTP {status}）"),
-        429 => format!("{service}请求过于频繁（HTTP {status}），请稍后重试"),
-        500..=599 => format!("{service}服务异常（HTTP {status}），请稍后重试"),
-        _ => format!("{service}返回 HTTP {status}"),
-    };
-    let detail = if status == 429 {
-        safe_http_rate_limit_detail(body)
+    let error = if explicitly_rejects_output_format(status, body) {
+        AppError::ai_format_unsupported(format!(
+            "{service}不支持当前结构化输出格式（HTTP {status}），将尝试兼容格式"
+        ))
     } else {
-        safe_http_detail(body)
+        let message = match status {
+            401 | 403 => format!("{service}鉴权失败（HTTP {status}），请检查 API Key 和访问权限"),
+            408 => format!("{service}请求超时（HTTP {status}）"),
+            429 => format!("{service}请求过于频繁（HTTP {status}），请稍后重试"),
+            500..=599 => format!("{service}服务异常（HTTP {status}），请稍后重试"),
+            _ => format!("{service}返回 HTTP {status}"),
+        };
+        let detail = if status == 429 {
+            safe_http_rate_limit_detail(body)
+        } else {
+            safe_http_detail(body)
+        };
+        let message = detail
+            .map(|detail| format!("{message}：{detail}"))
+            .unwrap_or(message);
+        match status {
+            401 | 403 => AppError::unauthorized(message),
+            408 => AppError::timeout(message),
+            429 => AppError::ai_rate_limited(message),
+            _ => AppError::internal(message),
+        }
     };
-    let message = detail
-        .map(|detail| format!("{message}：{detail}"))
-        .unwrap_or(message);
-    match status {
-        401 | 403 => AppError::unauthorized(message),
-        408 => AppError::timeout(message),
-        429 => AppError::ai_rate_limited(message),
-        _ => AppError::internal(message),
-    }
+    tracing::warn!(
+        operation = "ai_request",
+        stage = "http_error",
+        service,
+        http_status = status,
+        error_code = error.code(),
+        "AI 服务返回非成功状态"
+    );
+    error
 }
 
-fn vision_transport_error(service: &str, error: reqwest::Error, cfg: &ApiProfile) -> AppError {
+/// 只有供应商在有限状态码下明确指出请求中的结构化格式字段不受支持，
+/// 才允许请求层尝试下一种 JSON 输出协议。这里集中处理供应商错误文案，
+/// 上层只检查稳定错误码，不再解析本地化消息。
+fn explicitly_rejects_output_format(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 404 | 422) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let mut details = Vec::new();
+    for pointer in [
+        "/error/message",
+        "/error/param",
+        "/error/type",
+        "/error/code",
+        "/message",
+        "/error",
+        "/detail",
+    ] {
+        if let Some(detail) = value.pointer(pointer) {
+            if let Some(detail) = detail.as_str() {
+                details.push(detail.to_string());
+            } else if detail.is_object() {
+                details.push(detail.to_string());
+            }
+        }
+    }
+    let details = details.join(" ").to_ascii_lowercase();
+    let names_format_field = [
+        "response_format",
+        "json_schema",
+        "json schema",
+        "json_object",
+        "json mode",
+        "tool_choice",
+        "input_schema",
+        "structured output",
+        "structured_outputs",
+        "output format",
+        "response format",
+        "json format",
+        "format field",
+        "format parameter",
+        "format option",
+        "unknown field 'format'",
+        "unknown field \\\"format\\\"",
+        "unknown field format",
+        "unknown field 'think'",
+        "unknown field \\\"think\\\"",
+        "unknown field think",
+        "think parameter",
+        "think option",
+        "结构化输出",
+        "json格式",
+    ]
+    .iter()
+    .any(|field| details.contains(field));
+    let explicitly_rejected = [
+        "unsupported",
+        "not supported",
+        "does not support",
+        "not support",
+        "unknown field",
+        "unrecognized field",
+        "unknown parameter",
+        "unrecognized parameter",
+        "unsupported parameter",
+        "invalid parameter",
+        "not allowed",
+        "不支持",
+        "未知字段",
+        "未识别字段",
+        "未知参数",
+        "无效参数",
+        "不允许",
+    ]
+    .iter()
+    .any(|phrase| details.contains(phrase));
+    names_format_field && explicitly_rejected
+}
+
+fn ai_transport_error(service: &str, error: reqwest::Error, cfg: &ApiProfile) -> AppError {
     if error.is_timeout() {
         return AppError::timeout(format!("{service}请求超时，请检查网络或服务状态"));
     }
     if is_managed_ollama_profile(cfg) {
-        AppError::internal(format!(
-            "无法连接应用管理的 Ollama {}：请确认本地服务已启动: {error}",
-            cfg.base_url
-        ))
+        AppError::internal("无法连接应用管理的 Ollama，请确认本地服务已启动")
     } else {
-        AppError::internal(format!("{service}请求失败: {error}"))
+        AppError::internal(format!("{service}连接失败，请检查服务地址或网络"))
     }
 }
 
@@ -347,219 +498,88 @@ pub struct MediaAnalysis {
 
 /// 按分面组装提示词（P1B + C-3）：使用稳定英文 facetKey 作为 JSON 键，中文显示名仅作说明；
 /// 避免模型返回中文分类名导致归类不稳定。
-/// FB5-05（§7.4）：同时要求输出 description（一句话描述，目标 12–30 字，规则见下）。
-fn build_system_prompt() -> String {
-    let mut sys = String::from(
-        "你是图片素材打标助手。仅依据画面中清晰可见的内容，生成画面摘要和分类标签。\n",
-    );
-    sys.push_str(
-        "不要推测素材用途、授权情况、商业价值、可用性、质量评价，以及无法确认的人物身份或地点。\n",
-    );
-    sys.push_str("输出要求：\n");
-    sys.push_str("- 只返回一个 JSON 对象，不要解释或代码围栏；\n");
-    sys.push_str(
-        "- 结构：{\"description\":\"画面摘要\",\"peoplePresence\":{\"status\":\"present|absent|unknown\",\"confidence\":0.9},\"tags\":{\"分面key\":[{\"name\":\"标签\",\"confidence\":0.9}]},\"numbers\":{}}。\n",
-    );
-    sys.push_str("画面摘要：\n");
-    sys.push_str("- 用一句自然、具体的中文描述主要对象、正在进行的动作或状态、所处环境，严格写 12–30 个字符；\n");
-    sys.push_str("- 不得只写「女子湖边」「城市建筑」这类关键词串；信息不足时也要把可确认的对象、状态和环境组成完整一句；\n");
-    sys.push_str("- 不以「这是一张」「这张图片展示」开头，不写建议，不堆砌标签；\n");
-    sys.push_str("- 摘要内容不得重复放入 tags 数组。\n");
-    sys.push_str("分类标签：\n");
-    sys.push_str("- tags 对象必须逐项包含用户列出的全部非数值分面 key；不适用或无法判断也必须显式写空数组 []，禁止省略 key；\n");
-    sys.push_str(
-        "- 每个标签为中文 2–6 字（如「人」「海边」「逆光」），并给出 0–1 的 confidence；\n",
-    );
-    sys.push_str("- 只标注能够从画面确认的内容；其他分面无法确认时返回空数组，不要猜测；\n");
-    sys.push_str("- peoplePresence 必须先判断画面是否有人：present=有人，absent=确认无人，unknown=无法确认；\n");
-    sys.push_str("- peoplePresence=absent 时 people 标签只写「无人」；present 时禁止写「无人、未知、人物」，只写可观察属性；unknown 时 people 只写「未知」；\n");
-    sys.push_str("- 若包含 subject 分面，填写最具代表性的可见对象；人物统一写「人」，禁止在 subject 写男子、女子、行人、男孩、女孩、老人、人数或穿着；\n");
-    sys.push_str(
-        "- subject 通常输出 2–3 个清晰主体，只有一个明确主体时只写一个，不得为了凑数编造；\n",
-    );
-    sys.push_str("- 若包含 scene 分面，只写空间、环境和地点；通常输出 2–3 个清晰维度，不得把树木、水面、楼梯等主体物当作场景；\n");
-    sys.push_str("- 若包含 people 分面，按人数档位、性别、年龄段、穿着和动作分别输出原子标签；男女同框分别写，老少同框分别写，禁止输出「年轻女子」这类复合词；\n");
-    sys.push_str("- 人数档位固定：0 无人、1 单人、2 双人、3–10 多人、超过 10 或无法准确计数为人群；人数不确定时不猜档位；\n");
-    sys.push_str("- 一个标签只归入一个分面；\n");
-    sys.push_str("- 优先使用已有候选词；候选不足时可新增简短原子标签，新词将进入「其他」分组等待人工确认；\n");
-    sys.push_str(
-        "- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n",
-    );
-    sys.push_str("- 用户给出候选词时，含义相同必须用已有词，不要造近义词（已有「海边」就不要写「海滨」）。\n");
-    sys.push_str("- 标签必须使用 {\"name\":\"标签\",\"confidence\":0.9}，不得输出裸字符串。\n");
-    // V24（§6.4）：数值分面输出协议 —— numbers 对象，值为原文（字符串或数字都接受）。
-    // 歧义表达（范围/约数）如实输出，由解析层判定（绝不取首个数字）。
-    sys.push_str("- 数值分类输出到 \"numbers\" 对象：{\"numbers\": {\"分面key\": \"原文\"}}；");
-    sys.push_str("原文如实写（如 \"5\" 或 \"5人\"），画不出数字的分面不要出现在 numbers 里。\n");
+/// description 内容由用户可见提示词约定；协议层不设固定字数或句式。
+fn build_system_prompt(global_instructions: &str) -> String {
+    let mut sys =
+        String::from("你是图片与视频素材分析助手。根据当前请求提供的分类信息分析素材。\n");
+    sys.push_str("只返回一个 JSON 对象，不要附加解释或代码围栏。输出形状为：");
+    sys.push_str("{\"description\":\"文本\",\"tags\":{\"当前分类key\":[{\"name\":\"标签\",\"confidence\":0.9}]},\"numbers\":{\"数值分类key\":\"原始数值\"}}。\n");
+    sys.push_str("tags 中只使用请求提供的非数值分类 key；每个分类返回数组，没有对应标签时返回空数组。标签项包含 name 与 0–1 的 confidence。数值分类使用 numbers 对象，值为字符串或数字。\n");
+    if !global_instructions.trim().is_empty() {
+        sys.push_str("全局打标说明（由用户设置）：\n");
+        sys.push_str(global_instructions);
+        sys.push('\n');
+    }
     sys
 }
 
 /// W5a（a2/a3/a5）：user 段 —— 每分面拼 description + 规则 + Top-N 候选词 + 真实 few-shot。
 /// top_tags 来自 W2-9 top_tags_per_facet（按使用次数降序，高频词优先 → 标签收敛）。
 pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, String)]) -> String {
-    // V24（§6.4）：数值分面独立成段 —— 不发词表（无候选词可给），发「输出一个数字 + 值域 + 单位」
     let number_facets: Vec<&FacetPromptContext> =
         facets.iter().filter(|f| f.facet_kind == "number").collect();
     let tag_facets: Vec<&FacetPromptContext> = facets
         .iter()
         .filter(|f| f.facet_kind != "number" && f.key != "custom")
         .collect();
-    let mut user = String::from("请为这张图片打标。可用的分类（key 为英文标识）：\n");
-    for c in &tag_facets {
-        let rule = if c.selection_mode == "single" {
-            "单选，最多 1 个".to_string()
+    let mut user = String::from("请为这份素材打标。可用分类及机器标识如下：\n");
+    for facet in &tag_facets {
+        let limit = if facet.selection_mode == "single" {
+            "单选，最多 1 项".to_string()
         } else {
-            match c.max_items {
-                Some(n) => format!("可多选，最多 {n} 个"),
-                None => "可多选，数量不限".to_string(),
+            match facet.max_items {
+                Some(n) => format!("多选，最多 {n} 项"),
+                None => "多选，不限数量".to_string(),
             }
-        };
-        let facet_rule = match c.key.as_str() {
-            "people" => {
-                "；按原子属性输出：人数档位、性别、年龄段、穿着、动作；男女同框分别写，老少同框分别写；禁止复合词；只有确认完全无人物时才输出 [\"无人\"]，无法判断时输出 [\"未知\"]；present 时禁止输出无人、未知、人物"
-            }
-            "subject" => {
-                "；人物统一写「人」，禁止写男子、女子、行人、男孩、女孩、老人、人数或穿着；优先选择 2–3 个最具代表性的可见对象，确实只有一个时才写一个"
-            }
-            "scene" => {
-                "；只写空间、环境和地点，多为 2–3 个清晰维度；树木、水面、楼梯等主体物不得当场景"
-            }
-            _ => "",
         };
         user.push_str(&format!(
-            "- {}（key: {}，{rule}）{}{}\n",
-            c.display_name,
-            c.key,
-            if c.description.trim().is_empty() {
-                String::new()
-            } else {
-                format!("：{}", c.description)
-            },
-            facet_rule,
+            "- {}（key: {}；{limit}）给 AI 的分类说明：{}\n",
+            facet.display_name, facet.key, facet.description
         ));
     }
-    let required_keys: Vec<&str> = facets
-        .iter()
-        .filter(|f| f.facet_kind != "number" && f.key != "custom")
-        .map(|f| f.key.as_str())
-        .collect();
+
+    let required_keys: Vec<&str> = tag_facets.iter().map(|facet| facet.key.as_str()).collect();
     if !required_keys.is_empty() {
         user.push_str(&format!(
-            "\ntags 必须完整包含这些 key（允许值为 []，但不得漏 key）：{}\n",
+            "\ntags 中必须包含这些分类 key；没有对应标签时值为 []：{}\n",
             required_keys.join(", ")
         ));
     }
+
     if !number_facets.is_empty() {
-        user.push_str("\n数值分类（输出到 numbers 对象，不进 tags）：\n");
-        for c in &number_facets {
-            let range = match (c.num_min, c.num_max) {
-                (Some(lo), Some(hi)) => format!("{lo}–{hi} 的"),
-                (Some(lo), None) => format!("不小于 {lo} 的"),
-                (None, Some(hi)) => format!("不大于 {hi} 的"),
-                (None, None) => String::new(),
-            };
-            let unit = if c.num_unit.trim().is_empty() {
-                String::new()
-            } else {
-                format!("，单位：{}", c.num_unit)
+        user.push_str("\n数值分类配置：\n");
+        for facet in number_facets {
+            let range = match (facet.num_min, facet.num_max) {
+                (Some(min), Some(max)) => format!("{min} 到 {max}"),
+                (Some(min), None) => format!("不小于 {min}"),
+                (None, Some(max)) => format!("不大于 {max}"),
+                (None, None) => "不限".to_string(),
             };
             user.push_str(&format!(
-                "- {}（key: {}）：输出一个{}数字{unit}；画面中数不出来就不输出该 key，不要猜{}\n",
-                c.display_name,
-                c.key,
-                range,
-                if c.description.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("（{}）", c.description)
-                },
+                "- {}（key: {}；范围：{range}；单位：{}；精度：{} 位；步进：{}）给 AI 的分类说明：{}\n",
+                facet.display_name,
+                facet.key,
+                facet.num_unit,
+                facet.num_decimals,
+                facet.num_step,
+                facet.description,
             ));
         }
     }
+
     if !top_tags.is_empty() {
-        user.push_str("\n已有标签候选词（含义相同就用已有的词，不要造近义词）：\n");
+        user.push_str("\n已有标签仅供参考，可依据分类说明提出新的候选标签：\n");
         for (facet, words) in top_tags {
             user.push_str(&format!("- {facet}: {words}\n"));
         }
     }
-    // R3-2：a3 真实 few-shot —— 不输出「示例词」占位符，而是完整「画面 → JSON」对。
-    // 优先覆盖 subject/scene/people，重点示范人物识别与属性必须自洽。
-    let mut ex_keys: Vec<&str> = Vec::new();
-    for preferred in ["subject", "scene", "people"] {
-        if ex_keys.len() < 3 && tag_facets.iter().any(|f| f.key == preferred) {
-            ex_keys.push(preferred);
-        }
-    }
-    for facet in &tag_facets {
-        if ex_keys.len() >= 3 {
-            break;
-        }
-        if !ex_keys.contains(&facet.key.as_str()) {
-            ex_keys.push(facet.key.as_str());
-        }
-    }
-    if !ex_keys.is_empty() {
-        let real_word = |key: &str, alt: bool| -> Option<String> {
-            let table: &[(&str, &str, &str)] = &[
-                ("scene", "海边", "城市"),
-                ("subject", "人", "人"),
-                ("people", "多人", "单人"),
-                ("lighting", "夜景", "白天"),
-            ];
-            table
-                .iter()
-                .find(|(k, _, _)| *k == key)
-                .map(|(_, a, b)| (if alt { *b } else { *a }).to_string())
-        };
-        let tags_json = |alt: bool| -> String {
-            // 示例 A：黄昏海边，树下多人 → scene=海边、subject=树、people=多人…
-            // 示例 B：清晨城市建筑，单人 → 对应 alt 词。画面没有的分面输出空数组。
-            let pairs: Vec<String> = ex_keys
-                .iter()
-                .map(|k| {
-                    let w = real_word(k, alt).unwrap_or_default();
-                    format!(
-                        "\"{k}\": {}",
-                        if w.is_empty() {
-                            "[]".to_string()
-                        } else {
-                            format!("[{{\"name\":\"{w}\",\"confidence\":0.9}}]")
-                        }
-                    )
-                })
-                .collect();
-            format!("{{{}}}", pairs.join(", "))
-        };
-        user.push_str(
-            "\n输出示例（真实输入→输出对，结构参考；tags 只含该图真实可观察到的分类）：\n",
-        );
-        user.push_str(&format!(
-            "示例 A：输入「黄昏的海边，树下有一群人散步」→ 输出 {{\"description\":\"一群人在黄昏海边散步交谈\",\"peoplePresence\":{{\"status\":\"present\",\"confidence\":0.96}},\"tags\":{}}}\n",
-            tags_json(false)
-        ));
-        user.push_str(&format!(
-            "示例 B：输入「清晨的城市建筑，天空晴朗，只有一个行人」→ 输出 {{\"description\":\"行人独自走过清晨的城市街道\",\"peoplePresence\":{{\"status\":\"present\",\"confidence\":0.94}},\"tags\":{}}}\n",
-            tags_json(true)
-        ));
-        if tag_facets.iter().any(|f| f.key == "people") {
-            user.push_str(
-                "人物一致性示例：description「女子站在湖边树下抬头张望」时，peoplePresence 必须是 present，subject 必须写「人」，people 输出「女性」等原子属性（人数已知时再写单人/双人/多人/人群），绝不能写无人。\n",
-            );
-        }
-    } else {
-        user.push_str(
-            "\n输出示例：{\"description\":\"黄昏海边有人散步\",\"peoplePresence\":{\"status\":\"present\",\"confidence\":0.9},\"tags\":{}}\n",
-        );
-    }
     user
 }
-
-/// W5a（a7）：动态 max_tokens —— 固定 500 在分面多时会把 JSON 截断 → 解析失败 → 整条 rejected。
 fn dynamic_max_tokens(facet_count: usize) -> i64 {
     (500 + 180 * facet_count as i64).clamp(800, 3200)
 }
 
-/// 打标视觉请求的强类型协议。模型必须输出对象标签、人物状态和分面 key。
+/// 打标视觉请求的结构协议。业务含义仅来自可编辑的全局与分类说明。
 fn tagging_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
     let mut tag_properties = serde_json::Map::new();
     let mut required_tags = Vec::new();
@@ -572,7 +592,7 @@ fn tagging_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
             "items": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "minLength": 1, "maxLength": 12 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 64 },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 },
                 "required": ["name", "confidence"],
@@ -596,7 +616,6 @@ fn tagging_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
         number_properties.insert(
             facet.key.clone(),
             serde_json::json!({
-                "description": facet.description,
                 "anyOf": [
                     { "type": "string" },
                     { "type": "number" }
@@ -608,20 +627,7 @@ fn tagging_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "description": {
-                "type": "string",
-                "minLength": MIN_DESCRIPTION_CHARS,
-                "maxLength": MAX_DESCRIPTION_CHARS
-            },
-            "peoplePresence": {
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string", "enum": ["present", "absent", "unknown"] },
-                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
-                },
-                "required": ["status", "confidence"],
-                "additionalProperties": false
-            },
+            "description": { "type": "string" },
             "tags": {
                 "type": "object",
                 "properties": tag_properties,
@@ -634,7 +640,7 @@ fn tagging_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
                 "additionalProperties": false
             }
         },
-        "required": ["description", "peoplePresence", "tags"],
+        "required": ["description", "tags", "numbers"],
         "additionalProperties": false
     })
 }
@@ -780,290 +786,12 @@ fn resolve_facet<'a>(
         .find(|facet| facet.key == label || facet.display_name.trim() == label)
 }
 
-fn replace_facet_values(
-    tags: &mut CategorizedTags,
-    proposals: &mut Vec<ai::TagProposal>,
-    key: &str,
-    values: Vec<String>,
-) {
-    proposals.retain(|proposal| proposal.facet_key != key);
-    if values.is_empty() {
-        tags.remove(key);
-        return;
-    }
-    tags.insert(key.to_string(), values.clone());
-    proposals.extend(values.into_iter().map(|raw_name| ai::TagProposal {
-        facet_key: key.to_string(),
-        raw_name,
-        confidence: None,
-    }));
-}
-
-fn description_mentions_people(description: &str) -> bool {
-    [
-        "人", "女子", "女孩", "女性", "男子", "男孩", "男性", "老人", "儿童", "孩子", "人群",
-        "行人", "模特", "游客", "人物", "少年", "青年", "中年",
-    ]
-    .iter()
-    .any(|word| description.contains(word))
-}
-
-fn subject_is_missing(analysis: &MediaAnalysis, facets: &[FacetPromptContext]) -> bool {
-    facets.iter().any(|facet| facet.key == "subject")
-        && analysis
-            .tags
-            .get("subject")
-            .is_none_or(|values| values.is_empty())
-}
-
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
-}
-
-/// 人物属性按图片级原子标签归一；未知新词保留，交由人工确认。
-fn normalize_people_name(raw: &str) -> Vec<String> {
-    let value = raw.trim();
-    if value.is_empty() || matches!(value, "人物" | "有人") {
-        return Vec::new();
-    }
-    let mapped: &[&str] = match value {
-        "男性" | "男子" | "男人" => &["男性"],
-        "女性" | "女子" | "女人" => &["女性"],
-        "男孩" => &["男性", "儿童"],
-        "女孩" => &["女性", "儿童"],
-        "男女" => &["男性", "女性"],
-        "一个人" | "一人" | "单人" => &["单人"],
-        "两个人" | "两人" | "二人" | "双人" => &["双人"],
-        "多人" | "三人以上" => &["多人"],
-        "人群" | "大量人群" => &["人群"],
-        "婴儿" | "婴幼儿" => &["婴幼儿"],
-        "儿童" | "孩子" => &["儿童"],
-        "少年" | "青少年" => &["青少年"],
-        "年轻人" | "青年" => &["青年"],
-        "中年" => &["中年"],
-        "老人" | "年老" | "老年" => &["老年"],
-        "现代服装" | "现代装" => &["现代装"],
-        "古代服饰" | "古装" => &["古装"],
-        "少数民族服饰" | "民族服饰" => &["民族服饰"],
-        "工作服" | "职业装" => &["职业装"],
-        "制服" => &["制服"],
-        "礼服" => &["礼服"],
-        "运动服" | "运动装" => &["运动装"],
-        "便装" | "休闲装" => &["休闲装"],
-        "泳装" => &["泳装"],
-        "站姿" | "站立" => &["站立"],
-        "坐着" | "坐姿" => &["坐姿"],
-        "走路" | "步行" | "行走" => &["行走"],
-        "跑步" | "奔跑" => &["奔跑"],
-        "交流" | "交谈" => &["交谈"],
-        "工作" => &["工作"],
-        "表演" => &["表演"],
-        "休息" => &["休息"],
-        _ => &[],
-    };
-    if mapped.is_empty() {
-        vec![value.to_string()]
-    } else {
-        mapped.iter().map(|value| (*value).to_string()).collect()
-    }
-}
-
-fn is_person_subject(value: &str) -> bool {
-    if value == "人" {
-        return true;
-    }
-    const PERSON_TERMS: &[&str] = &[
-        "人物", "男子", "女子", "男孩", "女孩", "男性", "女性", "行人", "人群", "老人", "儿童",
-        "青年", "中年", "游客", "顾客", "模特", "人像",
-    ];
-    PERSON_TERMS.iter().any(|term| value.contains(term))
-}
-
-fn rewrite_facet_with_proposals(
-    analysis: &mut MediaAnalysis,
-    key: &str,
-    values: Vec<String>,
-    proposals: Vec<ai::TagProposal>,
-) {
-    analysis
-        .proposals
-        .retain(|proposal| proposal.facet_key != key);
-    if values.is_empty() {
-        analysis.tags.remove(key);
-        return;
-    }
-    analysis.tags.insert(key.to_string(), values.clone());
-    for value in values {
-        let confidence = proposals
-            .iter()
-            .find(|proposal| proposal.raw_name == value)
-            .and_then(|proposal| proposal.confidence);
-        analysis.proposals.push(ai::TagProposal {
-            facet_key: key.to_string(),
-            raw_name: value,
-            confidence,
-        });
-    }
-}
-
-fn apply_semantic_rules(
-    analysis: &mut MediaAnalysis,
-    facets: &[FacetPromptContext],
-    min_confidence: f64,
-) {
-    if facets.iter().any(|f| f.key == "subject") {
-        let mut values = analysis.tags.remove("subject").unwrap_or_default();
-        let mut proposals = analysis
-            .proposals
-            .iter()
-            .filter(|p| p.facet_key == "subject")
-            .cloned()
-            .collect::<Vec<_>>();
-        analysis.proposals.retain(|p| p.facet_key != "subject");
-
-        if matches!(
-            analysis.people_presence.status,
-            ai::PeoplePresenceStatus::Absent
-        ) {
-            values.retain(|value| !is_person_subject(value));
-            proposals.retain(|proposal| !is_person_subject(&proposal.raw_name));
-        } else {
-            values = values
-                .into_iter()
-                .map(|value| {
-                    if is_person_subject(&value) {
-                        "人".to_string()
-                    } else {
-                        value
-                    }
-                })
-                .collect();
-            proposals = proposals
-                .into_iter()
-                .map(|mut proposal| {
-                    if is_person_subject(&proposal.raw_name) {
-                        proposal.raw_name = "人".to_string();
-                    }
-                    proposal
-                })
-                .collect();
-        }
-
-        let mut unique = Vec::new();
-        for value in values {
-            push_unique(&mut unique, value);
-        }
-        if matches!(
-            analysis.people_presence.status,
-            ai::PeoplePresenceStatus::Present
-        ) {
-            unique.retain(|value| value != "人");
-            unique.insert(0, "人".to_string());
-        }
-        let cap = facets
-            .iter()
-            .find(|f| f.key == "subject")
-            .and_then(|f| f.max_items)
-            .unwrap_or(3)
-            .max(0) as usize;
-        unique.truncate(cap);
-
-        let mut deduped_proposals = Vec::new();
-        for value in &unique {
-            let mut proposal = proposals
-                .iter()
-                .find(|p| p.raw_name == *value)
-                .cloned()
-                .unwrap_or(ai::TagProposal {
-                    facet_key: "subject".to_string(),
-                    raw_name: value.clone(),
-                    confidence: None,
-                });
-            if value == "人" && proposal.confidence.is_none() {
-                proposal.confidence = Some(analysis.people_presence.confidence);
-            }
-            proposal.facet_key = "subject".to_string();
-            proposal.raw_name = value.clone();
-            deduped_proposals.push(proposal);
-        }
-        rewrite_facet_with_proposals(analysis, "subject", unique, deduped_proposals);
-    }
-
-    let has_people_facet = facets.iter().any(|f| f.key == "people");
-    if has_people_facet {
-        let people_values = analysis.tags.remove("people").unwrap_or_default();
-        let people_proposals = analysis
-            .proposals
-            .iter()
-            .filter(|p| p.facet_key == "people")
-            .cloned()
-            .collect::<Vec<_>>();
-        analysis.proposals.retain(|p| p.facet_key != "people");
-
-        let normalized = match analysis.people_presence.status {
-            ai::PeoplePresenceStatus::Present => {
-                let mut values = Vec::new();
-                for value in people_values {
-                    for normalized_value in normalize_people_name(&value) {
-                        push_unique(&mut values, normalized_value);
-                    }
-                }
-                values.retain(|value| value != "无人" && value != "未知");
-                values
-            }
-            ai::PeoplePresenceStatus::Absent
-                if analysis.people_presence.confidence as f64 >= min_confidence
-                    && !description_mentions_people(&analysis.description) =>
-            {
-                vec!["无人".to_string()]
-            }
-            _ => vec!["未知".to_string()],
-        };
-        let cap = facets
-            .iter()
-            .find(|f| f.key == "people")
-            .and_then(|f| f.max_items)
-            .unwrap_or(8)
-            .max(0) as usize;
-        let mut normalized = normalized;
-        normalized.truncate(cap);
-        let mut rebuilt = Vec::new();
-        for value in &normalized {
-            let confidence = people_proposals
-                .iter()
-                .find(|p| {
-                    p.raw_name == *value
-                        || normalize_people_name(&p.raw_name)
-                            .iter()
-                            .any(|normalized| normalized == value)
-                })
-                .and_then(|p| p.confidence)
-                .or_else(|| {
-                    if value == "无人" || value == "未知" {
-                        Some(analysis.people_presence.confidence)
-                    } else {
-                        None
-                    }
-                });
-            rebuilt.push(ai::TagProposal {
-                facet_key: "people".to_string(),
-                raw_name: value.clone(),
-                confidence,
-            });
-        }
-        rewrite_facet_with_proposals(analysis, "people", normalized, rebuilt);
-    }
-}
-
-/// 打标 V2 协议的唯一解析入口。只接受：
-/// {"description":"…","peoplePresence":{"status":"…","confidence":0.9},
-///  "tags":{"facetKey":[{"name":"…","confidence":0.9}]},"numbers":{…}}
+/// 打标 V2 协议的唯一解析入口。业务输出为 description/tags/numbers；
+/// 旧输入中的 peoplePresence 仅为反序列化兼容字段，不参与结果归一化。
 pub fn parse_media_analysis(
     content: &str,
     facets: &[FacetPromptContext],
-    min_confidence: f64,
+    _min_confidence: f64,
 ) -> AppResult<MediaAnalysis> {
     let trimmed = content.trim();
     let json_candidate = match serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1089,27 +817,25 @@ pub fn parse_media_analysis(
         .ok_or_else(|| AppError::msg("打标 V2 缺少 description"))?;
     let description = normalize_content_description(raw_description);
 
-    let people = root_obj
+    // 兼容旧分析返回；该字段不再驱动任何标签补写、删除、拆分或校验。
+    let people_presence = root_obj
         .get("peoplePresence")
         .and_then(|value| value.as_object())
-        .ok_or_else(|| AppError::msg("打标 V2 缺少 peoplePresence"))?;
-    let people_status = match people.get("status").and_then(|value| value.as_str()) {
-        Some("present") => ai::PeoplePresenceStatus::Present,
-        Some("absent") => ai::PeoplePresenceStatus::Absent,
-        Some("unknown") => ai::PeoplePresenceStatus::Unknown,
-        Some(other) => {
-            return Err(AppError::msg(format!(
-                "非法 peoplePresence.status：{other}"
-            )))
-        }
-        None => return Err(AppError::msg("peoplePresence 缺少 status")),
-    };
-    let people_confidence = people
-        .get("confidence")
-        .and_then(|value| value.as_f64())
-        .filter(|value| (0.0..=1.0).contains(value))
-        .ok_or_else(|| AppError::msg("peoplePresence.confidence 必须是 0–1 的数字"))?
-        as f32;
+        .and_then(|value| {
+            let status = match value.get("status")?.as_str()? {
+                "present" => ai::PeoplePresenceStatus::Present,
+                "absent" => ai::PeoplePresenceStatus::Absent,
+                "unknown" => ai::PeoplePresenceStatus::Unknown,
+                _ => return None,
+            };
+            let confidence = value
+                .get("confidence")?
+                .as_f64()
+                .filter(|confidence| (0.0..=1.0).contains(confidence))?
+                as f32;
+            Some(ai::PeoplePresence { status, confidence })
+        })
+        .unwrap_or_default();
 
     let raw_tags = root_obj
         .get("tags")
@@ -1140,7 +866,7 @@ pub fn parse_media_analysis(
                 .get("name")
                 .and_then(|value| value.as_str())
                 .map(str::trim)
-                .filter(|value| !value.is_empty() && value.chars().count() <= 12)
+                .filter(|value| !value.is_empty() && value.chars().count() <= 64)
                 .ok_or_else(|| AppError::msg(format!("tags.{label} 的元素缺少合法 name")))?;
             let confidence = object
                 .get("confidence")
@@ -1203,16 +929,13 @@ pub fn parse_media_analysis(
         return Err(AppError::msg("numbers 必须是对象"));
     }
 
-    if tags.is_empty() && description.is_empty() {
+    if tags.is_empty() && description.is_empty() && numbers.is_empty() {
         return Err(AppError::msg("打标 V2 未返回可用描述或标签"));
     }
 
-    let mut analysis = MediaAnalysis {
+    let analysis = MediaAnalysis {
         description,
-        people_presence: ai::PeoplePresence {
-            status: people_status,
-            confidence: people_confidence,
-        },
+        people_presence,
         tags,
         proposals,
         numbers,
@@ -1223,50 +946,11 @@ pub fn parse_media_analysis(
         analysis_json: None,
         blocked_low_confidence: 0,
     };
-    apply_semantic_rules(&mut analysis, facets, min_confidence);
     Ok(analysis)
 }
 
-fn vision_request_should_fallback(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("http 429")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-        || lower.contains("请求过于频繁")
-        || lower.contains("请求频率受限")
-    {
-        return false;
-    }
-    let structured_compatibility = lower.contains("response_format")
-        || lower.contains("json_schema")
-        || lower.contains("json schema")
-        || lower.contains("structured output")
-        || lower.contains("structured_outputs")
-        || lower.contains("tool_choice")
-        || ((lower.contains("format") || lower.contains("格式"))
-            && (lower.contains("unsupported")
-                || lower.contains("not support")
-                || lower.contains("不支持")
-                || lower.contains("格式")));
-    let extension_field_compatibility = (lower.contains("unknown field")
-        || lower.contains("unrecognized field")
-        || lower.contains("unsupported parameter")
-        || lower.contains("invalid parameter"))
-        && (lower.contains("think") || lower.contains("format"));
-    !is_context_overflow_message(message)
-        && !lower.contains("无法连接")
-        && !lower.contains("connect")
-        && !lower.contains("timed out")
-        && !lower.contains("timeout")
-        && !lower.contains("401")
-        && !lower.contains("403")
-        && !lower.contains("unauthorized")
-        && !lower.contains("forbidden")
-        && !lower.contains("api key")
-        && !lower.contains("authentication")
-        && !lower.contains("未返回最终内容")
-        && !lower.contains("returned empty content")
-        && (structured_compatibility || extension_field_compatibility)
+fn vision_request_should_fallback(error: &AppError) -> bool {
+    error.code() == "AI_FORMAT_UNSUPPORTED" && !is_context_overflow_message(&error.to_string())
 }
 
 fn is_context_overflow_message(message: &str) -> bool {
@@ -1308,6 +992,59 @@ fn openai_message_content(value: &serde_json::Value, managed_ollama: bool) -> Ap
     Err(AppError::msg(format!(
         "服务未返回最终内容（returned empty content；finish_reason={finish_reason}，reasoning_chars={reasoning_len}）。{action}"
     )))
+}
+
+fn is_output_limit_reason(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "length" | "max_tokens"
+    )
+}
+
+fn truncated_output_error(service: &str, finish_reason: &str, response_chars: usize) -> AppError {
+    tracing::warn!(
+        operation = "super_search_ai",
+        stage = "output_truncated",
+        service,
+        finish_reason,
+        response_chars,
+        "AI 搜索模型输出达到上限"
+    );
+    AppError::ai_output_truncated(
+        "AI 模型输出达到长度上限，搜索条件未能完整生成。本次没有应用解析结果；请缩短查询或在 AI 服务设置中更换模型后重试。",
+    )
+}
+
+fn ensure_openai_output_complete(value: &serde_json::Value) -> AppResult<()> {
+    let choice = &value["choices"][0];
+    let finish_reason = choice["finish_reason"].as_str().unwrap_or("unknown");
+    if is_output_limit_reason(finish_reason) {
+        let content_chars = choice["message"]["content"]
+            .as_str()
+            .map(|content| content.chars().count())
+            .unwrap_or(0);
+        return Err(truncated_output_error(
+            "openai_compatible",
+            finish_reason,
+            content_chars,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_anthropic_output_complete(value: &serde_json::Value) -> AppResult<()> {
+    let stop_reason = value["stop_reason"].as_str().unwrap_or("unknown");
+    if is_output_limit_reason(stop_reason) {
+        let response_chars = extract_anthropic_text(value)
+            .map(|content| content.chars().count())
+            .unwrap_or(0);
+        return Err(truncated_output_error(
+            "anthropic",
+            stop_reason,
+            response_chars,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1368,7 +1105,7 @@ fn openai_vision_request(
             .json(&body)
             .send()
     }
-    .map_err(|e| vision_transport_error("视觉请求", e, cfg))?;
+    .map_err(|e| ai_transport_error("视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
         let status_code = status.as_u16();
@@ -1454,7 +1191,7 @@ fn ollama_native_vision_request(
         .post(format!("{root}/api/chat"))
         .json(&body)
         .send()
-        .map_err(|e| vision_transport_error("Ollama 视觉请求", e, cfg))?;
+        .map_err(|e| ai_transport_error("Ollama 视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
         let status_code = status.as_u16();
@@ -1524,7 +1261,7 @@ fn anthropic_vision_request(
         .header("anthropic-version", "2023-06-01")
         .json(&body)
         .send()
-        .map_err(|e| vision_transport_error("Anthropic 视觉请求", e, cfg))?;
+        .map_err(|e| ai_transport_error("Anthropic 视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
         let status_code = status.as_u16();
@@ -1546,28 +1283,7 @@ fn anthropic_vision_request(
     extract_anthropic_text(&value).ok_or_else(|| AppError::msg("Anthropic 返回缺少 text 内容块"))
 }
 
-fn apply_people_conflict_guard(
-    analysis: &mut MediaAnalysis,
-    facets: &[FacetPromptContext],
-    min_confidence: f64,
-) {
-    if analysis.people_presence.status != ai::PeoplePresenceStatus::Absent
-        || !description_mentions_people(&analysis.description)
-    {
-        return;
-    }
-    analysis.people_presence.status = ai::PeoplePresenceStatus::Unknown;
-    analysis.people_presence.confidence = analysis.people_presence.confidence.min(0.49);
-    replace_facet_values(
-        &mut analysis.tags,
-        &mut analysis.proposals,
-        "people",
-        vec!["未知".to_string()],
-    );
-    apply_semantic_rules(analysis, facets, min_confidence);
-}
-
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Explicit request snapshot plus per-item limits and cancellation.
 fn request_analysis(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
@@ -1576,7 +1292,6 @@ fn request_analysis(
     image_path: &std::path::Path,
     system_override: &str,
     min_confidence: f64,
-    repair_empty_subject: bool,
     tier_cache: &Cell<TextJsonTier>,
     limiter: Option<&AiRateLimiter>,
     cancel: &AtomicBool,
@@ -1599,12 +1314,8 @@ fn request_analysis(
     let mut image_payload = prepare_image(imaging::AI_IMAGE_MAX_PX)?;
     let mime = "image/jpeg";
 
-    // system prompt 可由用户完整替换；JSON Schema 始终在请求层附加，不能被提示词关闭。
-    let system = if system_override.trim().is_empty() {
-        build_system_prompt()
-    } else {
-        system_override.to_string()
-    };
+    // 固定内容只描述机器协议；可编辑的全局业务说明始终作为同一提示词快照附加。
+    let system = build_system_prompt(system_override);
     let user = build_user_prompt(facets, top_tags);
     let max_tokens = dynamic_max_tokens(facets.len());
     let schema = tagging_schema(facets);
@@ -1625,7 +1336,7 @@ fn request_analysis(
             ) {
                 Ok(content) => return Ok(content),
                 Err(native_error) => {
-                    if !vision_request_should_fallback(&native_error.to_string()) {
+                    if !vision_request_should_fallback(&native_error) {
                         return Err(native_error);
                     }
                     tracing::warn!(
@@ -1638,9 +1349,14 @@ fn request_analysis(
                         client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema,
                         limiter, cancel,
                     )
-                    .map_err(|compat_error| AppError::msg(format!(
-                        "Ollama 原生结构化请求失败：{native_error}；兼容接口回退失败：{compat_error}"
-                    )));
+                    .inspect_err(|compat_error| {
+                        tracing::warn!(
+                            operation = "ai_tagging",
+                            stage = "native_fallback_failed",
+                            fallback_error_code = compat_error.code(),
+                            "Ollama 兼容接口回退失败"
+                        );
+                    });
                 }
             }
         }
@@ -1662,7 +1378,7 @@ fn request_analysis(
             TextJsonTier::JsonObject => &[TextJsonTier::JsonObject, TextJsonTier::Plain],
             TextJsonTier::Plain => &[TextJsonTier::Plain],
         };
-        let mut last_error = None;
+        let mut last_compatibility_error = None;
         for tier in tiers {
             match send(payload, *tier, prompt) {
                 Ok(content) => {
@@ -1670,18 +1386,15 @@ fn request_analysis(
                     return Ok((*tier, content));
                 }
                 Err(error) => {
-                    let message = error.to_string();
-                    if !vision_request_should_fallback(&message) {
+                    if !vision_request_should_fallback(&error) {
                         return Err(error);
                     }
-                    last_error = Some(message);
+                    last_compatibility_error = Some(error);
                 }
             }
         }
-        Err(AppError::msg(format!(
-            "视觉结构化请求逐级降级后仍失败：{}",
-            last_error.unwrap_or_else(|| "未知错误".to_string())
-        )))
+        Err(last_compatibility_error
+            .unwrap_or_else(|| AppError::internal("视觉结构化请求没有可用的输出格式")))
     };
 
     let (mut used_tier, mut content) =
@@ -1740,92 +1453,39 @@ fn request_analysis(
         }
     };
 
-    let missing_subject = repair_empty_subject
-        && !analysis.description.trim().is_empty()
-        && subject_is_missing(&analysis, facets);
-    let needs_repair = first_error.is_some()
-        || !missing_tag_facet_keys(&analysis, facets).is_empty()
-        || analysis.description.chars().count() < MIN_DESCRIPTION_CHARS
-        || missing_subject
-        || (analysis.people_presence.status == ai::PeoplePresenceStatus::Absent
-            && description_mentions_people(&analysis.description));
+    let missing_keys = missing_tag_facet_keys(&analysis, facets);
+    let needs_repair = first_error.is_some() || !missing_keys.is_empty();
 
     if needs_repair {
-        let problems = if let Some(error) = &first_error {
-            error.clone()
-        } else {
-            let mut items = Vec::new();
-            let missing = missing_tag_facet_keys(&analysis, facets);
-            if !missing.is_empty() {
-                items.push(format!("缺少必需分面：{}", missing.join(", ")));
-            }
-            if analysis.description.chars().count() < MIN_DESCRIPTION_CHARS {
-                items.push(format!(
-                    "description 过短，必须为 {MIN_DESCRIPTION_CHARS}–{MAX_DESCRIPTION_CHARS} 个字符"
-                ));
-            }
-            if missing_subject {
-                items.push(
-                    "subject 为空：description 中有明确主体时必须补全；确实没有可命名对象时可保持空数组"
-                        .to_string(),
-                );
-            }
-            if analysis.people_presence.status == ai::PeoplePresenceStatus::Absent
-                && description_mentions_people(&analysis.description)
-            {
-                items.push("description 已明确出现人物，但 peoplePresence 为 absent".to_string());
-            }
-            items.join("；")
-        };
+        let problems = first_error
+            .clone()
+            .unwrap_or_else(|| format!("缺少必需分类 key：{}", missing_keys.join(", ")));
         let repair_prompt = format!(
-            "{user}\n\n上一次输出不合格：{problems}\n上一次原始输出：{}\n请重新观察同一张图片，只返回完整的打标 V2 JSON。",
+            "{user}\n\n上一次输出不符合 JSON 结构或分类 key 要求：{problems}\n上一次原始输出：{}\n请按相同分类说明重新观察素材，只返回 JSON。",
             content.chars().take(1200).collect::<String>()
         );
         match request_with_fallback(&image_payload, used_tier, &repair_prompt) {
             Ok((tier, repaired)) => match parse_media_analysis(&repaired, facets, min_confidence) {
-                Ok(mut repaired_analysis) => {
+                Ok(repaired_analysis) => {
                     let still_missing = missing_tag_facet_keys(&repaired_analysis, facets);
                     if !still_missing.is_empty() {
                         return Err(AppError::msg(format!(
-                            "模型修复后仍漏掉必需分面：{}",
+                            "模型修复后仍漏掉分类 key：{}",
                             still_missing.join(", ")
                         )));
                     }
-                    if repaired_analysis.people_presence.status == ai::PeoplePresenceStatus::Absent
-                        && description_mentions_people(&repaired_analysis.description)
-                    {
-                        apply_people_conflict_guard(&mut repaired_analysis, facets, min_confidence);
-                        repaired_analysis
-                            .warnings
-                            .push("人物状态与描述冲突，已改为未知，避免误写无人。".to_string());
-                    }
-                    if repaired_analysis.description.chars().count() < MIN_DESCRIPTION_CHARS {
-                        repaired_analysis.warnings.push(format!(
-                            "description 修复后仍不足 {MIN_DESCRIPTION_CHARS} 个字符。"
-                        ));
-                    }
-                    if repair_empty_subject
-                        && subject_is_missing(&repaired_analysis, facets)
-                        && !repaired_analysis.description.trim().is_empty()
-                    {
-                        repaired_analysis
-                            .warnings
-                            .push("subject 修复后仍为空：未识别明确主体，已保留空值。".to_string());
-                    }
-                    content.push_str("\n--- validation repair ---\n");
+                    content.push_str("\n--- structural repair ---\n");
                     content.push_str(&repaired);
                     used_tier = tier;
                     analysis = repaired_analysis;
                 }
                 Err(error) if first_error.is_some() => return Err(error),
-                Err(error) => {
-                    tracing::warn!(
-                        operation = "ai_tagging",
-                        stage = "repair_parse",
-                        error = %error,
-                        "打标修复响应仍无法解析，保留首次有效结果"
-                    );
-                }
+                Err(error) => tracing::warn!(
+                    operation = "ai_tagging",
+                    stage = "repair_parse",
+                    error = %error,
+                    "打标修复响应仍无法解析，保留首次有效结果"
+                ),
             },
             Err(error) if first_error.is_some() => return Err(error),
             Err(error) => tracing::warn!(
@@ -1833,7 +1493,7 @@ fn request_analysis(
                 stage = "repair_request",
                 error_code = error.code(),
                 error = %error,
-                "打标修复请求失败，保留首次有效结果"
+                "打标结构修复请求失败，保留首次有效结果"
             ),
         }
     }
@@ -1841,34 +1501,9 @@ fn request_analysis(
     let still_missing = missing_tag_facet_keys(&analysis, facets);
     if !still_missing.is_empty() {
         return Err(AppError::msg(format!(
-            "模型输出仍漏掉必需分面：{}",
+            "模型输出仍漏掉分类 key：{}",
             still_missing.join(", ")
         )));
-    }
-    if analysis.people_presence.status == ai::PeoplePresenceStatus::Absent
-        && description_mentions_people(&analysis.description)
-    {
-        apply_people_conflict_guard(&mut analysis, facets, min_confidence);
-        analysis
-            .warnings
-            .push("人物状态与描述冲突，已改为未知，避免误写无人。".to_string());
-    }
-    if analysis.description.chars().count() < MIN_DESCRIPTION_CHARS {
-        analysis
-            .warnings
-            .push(format!("description 不足 {MIN_DESCRIPTION_CHARS} 个字符。"));
-    }
-    if repair_empty_subject
-        && !analysis.description.trim().is_empty()
-        && subject_is_missing(&analysis, facets)
-        && !analysis
-            .warnings
-            .iter()
-            .any(|warning| warning.starts_with("subject "))
-    {
-        analysis
-            .warnings
-            .push("subject 为空：未识别明确主体，已保留空值。".to_string());
     }
     if is_degenerate(&content) {
         if is_managed_ollama_profile(cfg) {
@@ -1925,60 +1560,9 @@ pub fn parse_model_ids(v: &serde_json::Value) -> Vec<String> {
     Vec::new()
 }
 
-/// 一句话描述规范化，最多 30 个 Unicode 字符（不按 UTF-8 bytes）。
-/// 顺序：1. trim → 2. 换行/连续空白折叠为单空格 → 3. 去除开头无信息套话
-/// （「这是一张/这张图片展示/画面中有」等）→ 4. 取第一个句段并去掉句末 。！？
-/// → 5. 按 chars 截断到 30。
-/// 描述为空/全是空白时返回空串；调用方不得因此让有效标签整条失败。
+/// 只移除模型返回的首尾空白，不重写内容、不按字数或句式截断。
 pub fn normalize_content_description(raw: &str) -> String {
-    const FILLERS: &[&str] = &[
-        "这是一张",
-        "这是一幅",
-        "这张图片展示",
-        "这张图片显示",
-        "这张图片是",
-        "这张照片",
-        "图片展示",
-        "图片中",
-        "画面中有",
-        "画面中",
-        "画面是",
-        "图中是",
-        "照片中",
-        "图中有",
-    ];
-
-    // 1-2. trim + 折叠空白（Unicode 空白统一为单个普通空格）
-    let mut folded = String::with_capacity(raw.len());
-    let mut prev_space = false;
-    for ch in raw.trim().chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                folded.push(' ');
-                prev_space = true;
-            }
-        } else {
-            folded.push(ch);
-            prev_space = false;
-        }
-    }
-    let mut s = folded;
-
-    // 3. 去开头套话（任一命中即停；命中后清掉剩余前导空白）
-    for f in FILLERS {
-        if let Some(rest) = s.strip_prefix(f) {
-            s = rest.trim_start().to_string();
-            break;
-        }
-    }
-
-    // 4. 取第一个完整句段，去掉句末标点
-    if let Some(idx) = s.find(&['。', '！', '？', '.', '!', '?'][..]) {
-        s = s[..idx].trim_end().to_string();
-    }
-
-    // 5. 按 Unicode 字符截断（不按 bytes）
-    s.chars().take(MAX_DESCRIPTION_CHARS).collect()
+    raw.trim().to_string()
 }
 
 /// 结构化输出的降级等级（P3 §9.3）：
@@ -1992,15 +1576,32 @@ pub enum TextJsonTier {
     Structured,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiRequestStage {
+    Queued,
+    Requesting,
+}
+
+fn ensure_ai_search_active(cancel: &AtomicBool, deadline: Instant) -> AppResult<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AppError::cancelled("AI 搜索请求已取消"));
+    }
+    if Instant::now() >= deadline {
+        return Err(AppError::timeout("AI 搜索解析超过 180 秒总时限"));
+    }
+    Ok(())
+}
+
 /// 读取 JSON 响应，并把非 2xx 状态映射成稳定的 AI 错误码与安全详情。
 fn response_json_or_error(
     response: reqwest::blocking::Response,
     service: &str,
+    cfg: &ApiProfile,
 ) -> AppResult<serde_json::Value> {
     let status = response.status();
     let body = response
         .text()
-        .map_err(|error| AppError::msg(format!("{service}响应读取失败: {error}")))?;
+        .map_err(|error| ai_transport_error(service, error, cfg))?;
     if !status.is_success() {
         return Err(ai_http_status_error_with_body(
             service,
@@ -2009,7 +1610,7 @@ fn response_json_or_error(
         ));
     }
     serde_json::from_str(&body)
-        .map_err(|error| AppError::msg(format!("{service}响应解析失败: {error}")))
+        .map_err(|error| AppError::internal(format!("{service}响应格式无效: {error}")))
 }
 
 /// 发起一次纯文本 JSON 请求，返回模型文本回复。
@@ -2017,7 +1618,6 @@ fn response_json_or_error(
 /// structured_schema 仅在 Tier::Structured 下使用（OpenAI json_schema 或 Anthropic tool input_schema）。
 #[allow(clippy::too_many_arguments)]
 fn request_text_raw(
-    client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
     system: &str,
     user: &str,
@@ -2025,20 +1625,29 @@ fn request_text_raw(
     structured_schema: Option<serde_json::Value>,
     limiter: Option<&AiRateLimiter>,
     cancel: &AtomicBool,
+    deadline: Instant,
+    on_stage: &dyn Fn(AiRequestStage),
 ) -> AppResult<String> {
-    let _permit = limiter
-        .map(|rate_limiter| rate_limiter.acquire(cancel))
-        .transpose()?;
-    let conn_err = |e: reqwest::Error| {
-        if is_managed_ollama_profile(cfg) {
-            AppError::msg(format!(
-                "无法连接应用管理的 Ollama {base}：请确认本地服务已启动: {e}",
-                base = cfg.base_url
-            ))
-        } else {
-            AppError::msg(format!("外部 AI 服务请求失败: {e}"))
-        }
+    ensure_ai_search_active(cancel, deadline)?;
+    let permit = if let Some(rate_limiter) = limiter {
+        on_stage(AiRequestStage::Queued);
+        Some(rate_limiter.acquire_until(cancel, Some(deadline))?)
+    } else {
+        None
     };
+    ensure_ai_search_active(cancel, deadline)?;
+    on_stage(AiRequestStage::Requesting);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let request_timeout = remaining.min(AI_SEARCH_REQUEST_TIMEOUT);
+    if request_timeout.is_zero() {
+        return Err(AppError::timeout("AI 搜索解析超过 180 秒总时限"));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(remaining.min(AI_SEARCH_CONNECT_TIMEOUT))
+        .timeout(request_timeout)
+        .build()
+        .map_err(|_| AppError::internal("HTTP 客户端初始化失败"))?;
+    let conn_err = |e: reqwest::Error| ai_transport_error("AI 搜索请求", e, cfg);
     let base = cfg.base_url.trim_end_matches('/');
     let messages = serde_json::json!([
         { "role": "system", "content": system },
@@ -2075,7 +1684,9 @@ fn request_text_raw(
                     .send()
                     .map_err(conn_err)?,
                 "AI 搜索请求",
+                cfg,
             )?;
+            ensure_anthropic_output_complete(&resp)?;
             // Anthropic tool use：取 tool_use 块的 input 作为结构化结果
             if tier == TextJsonTier::Structured {
                 if let Some(tool_input) = extract_anthropic_tool_input(&resp) {
@@ -2111,6 +1722,7 @@ fn request_text_raw(
                         .send()
                         .map_err(conn_err)?,
                     "AI 搜索请求",
+                    cfg,
                 )?
             } else {
                 response_json_or_error(
@@ -2121,19 +1733,20 @@ fn request_text_raw(
                         .send()
                         .map_err(conn_err)?,
                     "AI 搜索请求",
+                    cfg,
                 )?
             };
+            ensure_openai_output_complete(&resp)?;
             resp["choices"][0]["message"]["content"]
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| {
-                    let raw = serde_json::to_string(&resp).unwrap_or_default();
-                    let snippet: String = raw.chars().take(300).collect();
-                    AppError::msg(format!("服务未返回内容。原始响应：{snippet}"))
-                })
+                .ok_or_else(|| AppError::msg("服务未返回可用的最终内容"))
         })
     };
-    fetch()
+    let result = fetch();
+    drop(permit);
+    ensure_ai_search_active(cancel, deadline)?;
+    result
 }
 
 /// 从 Anthropic 响应中提取 tool_use 块的 input（结构化输出第 1 级）
@@ -2149,9 +1762,9 @@ fn extract_anthropic_tool_input(v: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// 三级降级的文本 JSON 请求：第 1 级结构化 → 第 2 级 json_object → 第 3 级纯文本。
-/// 每级失败（含 400/unknown field）自动降级；返回 (tier_used, 模型文本)。
-/// 最终仍失败返回最后一次错误。profile 级能力缓存由调用方（super_search_ai）维护。
+/// 三级兼容的文本 JSON 请求：结构化 → json_object → 纯文本。
+/// 只有服务端明确拒绝当前输出格式时才进入下一层；其他服务或传输错误立即返回。
+/// 返回 (tier_used, 模型文本)。
 pub fn request_text_json(
     cfg: &ApiProfile,
     system: &str,
@@ -2159,11 +1772,32 @@ pub fn request_text_json(
     structured_schema: Option<serde_json::Value>,
     max_structured_tier: TextJsonTier,
 ) -> AppResult<(TextJsonTier, String)> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
-        .build()
-        .map_err(|e| AppError::msg(format!("HTTP 客户端初始化失败: {e}")))?;
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + AI_SEARCH_TOTAL_TIMEOUT;
+    request_text_json_with_control(
+        cfg,
+        system,
+        user,
+        structured_schema,
+        max_structured_tier,
+        &cancel,
+        deadline,
+        &|_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Control token, deadline, and progress callback are per request.
+pub fn request_text_json_with_control(
+    cfg: &ApiProfile,
+    system: &str,
+    user: &str,
+    structured_schema: Option<serde_json::Value>,
+    max_structured_tier: TextJsonTier,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    on_stage: &dyn Fn(AiRequestStage),
+) -> AppResult<(TextJsonTier, String)> {
+    ensure_ai_search_active(cancel, deadline)?;
     let rate_limiter = if is_managed_ollama_profile(cfg) {
         None
     } else {
@@ -2174,93 +1808,46 @@ pub fn request_text_json(
             cfg.requests_per_hour,
         )
     };
-    let cancel = AtomicBool::new(false);
-
-    // 第 3 级失败时带错误重试逻辑单独处理；一级一级降级。
-    let mut last_err: Option<String> = None;
-
-    let should_fallback = |message: &str| {
-        let lower = message.to_ascii_lowercase();
-        !lower.contains("无法连接")
-            && !lower.contains("connect")
-            && !lower.contains("timed out")
-            && !lower.contains("timeout")
-            && !lower.contains("401")
-            && !lower.contains("403")
-            && !lower.contains("unauthorized")
-            && !lower.contains("forbidden")
-            && !lower.contains("api key")
-            && !lower.contains("authentication")
-    };
-
-    if max_structured_tier >= TextJsonTier::Structured {
-        match request_text_raw(
-            &client,
+    request_text_json_tiers(max_structured_tier, structured_schema, |tier, schema| {
+        request_text_raw(
             cfg,
             system,
             user,
-            TextJsonTier::Structured,
-            structured_schema.clone(),
+            tier,
+            schema,
             rate_limiter.as_deref(),
-            &cancel,
-        ) {
+            cancel,
+            deadline,
+            on_stage,
+        )
+    })
+}
+
+fn request_text_json_tiers<F>(
+    max_structured_tier: TextJsonTier,
+    structured_schema: Option<serde_json::Value>,
+    mut request: F,
+) -> AppResult<(TextJsonTier, String)>
+where
+    F: FnMut(TextJsonTier, Option<serde_json::Value>) -> AppResult<String>,
+{
+    if max_structured_tier >= TextJsonTier::Structured {
+        match request(TextJsonTier::Structured, structured_schema.clone()) {
             Ok(t) => return Ok((TextJsonTier::Structured, t)),
-            Err(e) => {
-                if is_ai_rate_limited(&e) {
-                    return Err(e);
-                }
-                let message = e.to_string();
-                if !should_fallback(&message) {
-                    return Err(e);
-                }
-                last_err = Some(message);
-            }
+            Err(e) if e.code() == "AI_FORMAT_UNSUPPORTED" => {}
+            Err(e) => return Err(e),
         }
     }
     if max_structured_tier >= TextJsonTier::JsonObject {
-        match request_text_raw(
-            &client,
-            cfg,
-            system,
-            user,
-            TextJsonTier::JsonObject,
-            None,
-            rate_limiter.as_deref(),
-            &cancel,
-        ) {
+        match request(TextJsonTier::JsonObject, None) {
             Ok(t) => return Ok((TextJsonTier::JsonObject, t)),
-            Err(e) => {
-                if is_ai_rate_limited(&e) {
-                    return Err(e);
-                }
-                let message = e.to_string();
-                if !should_fallback(&message) {
-                    return Err(e);
-                }
-                last_err = Some(message);
-            }
+            Err(e) if e.code() == "AI_FORMAT_UNSUPPORTED" => {}
+            Err(e) => return Err(e),
         }
     }
-    match request_text_raw(
-        &client,
-        cfg,
-        system,
-        user,
-        TextJsonTier::Plain,
-        None,
-        rate_limiter.as_deref(),
-        &cancel,
-    ) {
+    match request(TextJsonTier::Plain, None) {
         Ok(t) => Ok((TextJsonTier::Plain, t)),
-        Err(e) => {
-            if is_ai_rate_limited(&e) {
-                return Err(e);
-            }
-            let detail = last_err.unwrap_or_default();
-            Err(AppError::msg(format!(
-                "AI 请求降级仍失败：{detail}；最后尝试：{e}"
-            )))
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -2689,7 +2276,6 @@ fn analyze_video_frames(
             frame,
             system_override,
             min_confidence,
-            false,
             tier_cache,
             limiter,
             cancel,
@@ -2727,7 +2313,7 @@ fn analyze_video_frames(
     }
     // §7.7：描述 = 时间上最接近视频中点的成功帧描述
     let description = results[results.len() / 2].description.clone();
-    let people_presence = results[results.len() / 2].people_presence.clone();
+    let people_presence = ai::PeoplePresence::default();
     let raw_response = results
         .iter()
         .filter(|analysis| !analysis.raw_response.trim().is_empty())
@@ -2925,7 +2511,6 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &pick_image(asset),
                     &cfg.system_prompt_tagging,
                     min_confidence,
-                    true,
                     &tier_cache,
                     rate_limiter.as_deref(),
                     cancel,
@@ -2941,7 +2526,6 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 &pick_image(asset),
                 &cfg.system_prompt_tagging,
                 min_confidence,
-                true,
                 &tier_cache,
                 rate_limiter.as_deref(),
                 cancel,
@@ -3219,9 +2803,10 @@ mod tests {
     use crate::db::tag_facets::FacetPromptContext;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn mock_http_server(
         status: u16,
@@ -3352,6 +2937,52 @@ mod tests {
     }
 
     #[test]
+    fn detects_openai_and_anthropic_output_limit_reasons() {
+        let openai = serde_json::json!({
+            "choices": [{"finish_reason": "length", "message": {"content": "{\\\"groups\\\":"}}]
+        });
+        let error = super::ensure_openai_output_complete(&openai)
+            .expect_err("被 token 上限截断的响应必须作为错误返回");
+        assert_eq!(error.code(), "AI_OUTPUT_TRUNCATED");
+        assert!(!error.to_string().contains("groups"));
+
+        let anthropic = serde_json::json!({"stop_reason":"max_tokens", "content": []});
+        assert_eq!(
+            super::ensure_anthropic_output_complete(&anthropic)
+                .expect_err("Anthropic 达到 max_tokens 必须报截断")
+                .code(),
+            "AI_OUTPUT_TRUNCATED"
+        );
+        assert!(super::ensure_openai_output_complete(&serde_json::json!({
+            "choices": [{"finish_reason":"stop", "message":{"content":"{}"}}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn text_json_truncation_is_not_retried_as_another_format_tier() {
+        let (base_url, server) = mock_http_server(
+            200,
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\\\"groups\\\":"}}]}"#,
+            Duration::ZERO,
+        );
+        let profile = test_profile(base_url, "cloud");
+        let error = super::request_text_json_with_control(
+            &profile,
+            "system",
+            "user",
+            Some(serde_json::json!({"type":"object"})),
+            super::TextJsonTier::Structured,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(3),
+            &|_| {},
+        )
+        .expect_err("截断 JSON 不能被当作完整模型回复或协议不支持");
+        assert_eq!(error.code(), "AI_OUTPUT_TRUNCATED");
+        assert!(String::from_utf8_lossy(&server.join().unwrap()).contains("POST /chat/completions"));
+    }
+
+    #[test]
     fn rate_limit_error_keeps_safe_provider_reason() {
         let error = super::ai_http_status_error_with_body(
             "视觉请求",
@@ -3367,6 +2998,139 @@ mod tests {
             r#"{"error":{"message":"rate limit","api_key":"sk-secret"}}"#,
         );
         assert!(!secret.to_string().contains("sk-secret"));
+    }
+
+    #[test]
+    fn text_json_format_fallback_retries_only_explicit_format_rejection() {
+        let mut attempts = Vec::new();
+        let mut responses = std::collections::VecDeque::from([
+            Err(crate::error::AppError::ai_format_unsupported(
+                "json_schema 不支持",
+            )),
+            Err(crate::error::AppError::ai_format_unsupported(
+                "json_object 不支持",
+            )),
+            Ok("{}".to_string()),
+        ]);
+        let (tier, content) = super::request_text_json_tiers(
+            super::TextJsonTier::Structured,
+            Some(serde_json::json!({"type": "object"})),
+            |tier, schema| {
+                attempts.push((tier, schema.is_some()));
+                responses.pop_front().expect("提供了完整的模拟响应序列")
+            },
+        )
+        .expect("明确拒绝两种格式后应有限降级为纯文本");
+
+        assert_eq!(tier, super::TextJsonTier::Plain);
+        assert_eq!(content, "{}");
+        assert_eq!(
+            attempts,
+            [
+                (super::TextJsonTier::Structured, true),
+                (super::TextJsonTier::JsonObject, false),
+                (super::TextJsonTier::Plain, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_json_format_fallback_stops_on_non_format_errors() {
+        let mut attempts = Vec::new();
+        let result = super::request_text_json_tiers(
+            super::TextJsonTier::Structured,
+            Some(serde_json::json!({"type": "object"})),
+            |tier, _| {
+                attempts.push(tier);
+                Err(crate::error::AppError::unauthorized("密钥无效"))
+            },
+        );
+
+        assert_eq!(result.expect_err("鉴权失败不应降级").code(), "UNAUTHORIZED");
+        assert_eq!(attempts, [super::TextJsonTier::Structured]);
+    }
+
+    #[test]
+    fn cancelled_in_flight_request_does_not_start_another_format_tier() {
+        let (base_url, handle) = mock_http_server(
+            400,
+            r#"{"error":{"message":"response_format json_schema is not supported"}}"#,
+            Duration::from_millis(300),
+        );
+        let mut profile = test_profile(base_url, "cloud");
+        profile.id = "mock-cancel-in-flight".into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            super::request_text_json_with_control(
+                &profile,
+                "system",
+                "user",
+                Some(serde_json::json!({"type": "object"})),
+                super::TextJsonTier::Structured,
+                &worker_cancel,
+                Instant::now() + Duration::from_secs(3),
+                &|_| {},
+            )
+        });
+        thread::sleep(Duration::from_millis(80));
+        cancel.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().expect_err("取消应终止解析");
+        assert_eq!(error.code(), "CANCELLED");
+        let request = handle.join().unwrap();
+        assert!(!request.is_empty(), "取消前应已发出当前 HTTP 请求");
+    }
+
+    #[test]
+    fn overall_deadline_bounds_an_in_flight_request() {
+        let (base_url, handle) = mock_http_server(
+            200,
+            r#"{"choices":[{"message":{"content":"{}"}}]}"#,
+            Duration::from_millis(250),
+        );
+        let mut profile = test_profile(base_url, "cloud");
+        profile.id = "mock-total-deadline".into();
+        let result = super::request_text_json_with_control(
+            &profile,
+            "system",
+            "user",
+            Some(serde_json::json!({"type": "object"})),
+            super::TextJsonTier::Structured,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_millis(60),
+            &|_| {},
+        );
+        let error = result.expect_err("请求必须受剩余总预算约束");
+        assert_eq!(error.code(), "TIMEOUT");
+        assert!(!handle.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn format_rejection_classifier_requires_status_field_and_explicit_reason() {
+        assert!(super::explicitly_rejects_output_format(
+            400,
+            r#"{"error":{"message":"response_format json_schema is unsupported"}}"#,
+        ));
+        assert!(super::explicitly_rejects_output_format(
+            422,
+            r#"{"error":{"message":"unknown field 'think'"}}"#,
+        ));
+        assert!(!super::explicitly_rejects_output_format(
+            400,
+            r#"{"error":{"message":"invalid request body"}}"#,
+        ));
+        assert!(!super::explicitly_rejects_output_format(
+            400,
+            r#"{"error":{"message":"image format unsupported"}}"#,
+        ));
+        assert!(!super::explicitly_rejects_output_format(
+            503,
+            r#"{"error":{"message":"response_format is unsupported"}}"#,
+        ));
+        assert!(!super::explicitly_rejects_output_format(
+            400,
+            "format unsupported"
+        ));
     }
 
     #[test]
@@ -3392,30 +3156,38 @@ mod tests {
         assert_eq!(r.tags.get("scene").unwrap(), &vec!["公园".to_string()]);
     }
 
-    fn prompt_facets() -> Vec<FacetPromptContext> {
-        vec![FacetPromptContext {
-            key: "people".into(),
-            display_name: "人物属性".into(),
+    #[test]
+    fn user_prompt_uses_exact_category_instructions_without_key_rules() {
+        let facets = vec![FacetPromptContext {
+            key: "scene".into(),
+            display_name: "场景/地点".into(),
+            description: "允许记录树木和水面，也允许使用复合词".into(),
             selection_mode: "multi".into(),
             facet_kind: "tag".into(),
             ..Default::default()
-        }]
+        }];
+        let prompt = super::build_user_prompt(&facets, &[]);
+        assert!(prompt.contains("给 AI 的分类说明：允许记录树木和水面，也允许使用复合词"));
+        assert!(!prompt.contains("peoplePresence"));
+        assert!(!prompt.contains("树木、水面、楼梯等主体物不得当场景"));
     }
 
     #[test]
-    fn user_prompt_hides_custom_and_states_people_consistency() {
-        let mut facets = prompt_facets();
-        facets.push(FacetPromptContext {
-            key: "custom".into(),
-            display_name: "自定义".into(),
+    fn tagging_schema_contains_visible_structure_without_people_enum() {
+        let facets = vec![FacetPromptContext {
+            key: "brand_info".into(),
+            display_name: "品牌信息".into(),
             selection_mode: "multi".into(),
+            max_items: Some(5),
             facet_kind: "tag".into(),
             ..Default::default()
-        });
-        let prompt = super::build_user_prompt(&facets, &[]);
-        assert!(!prompt.contains("key: custom"));
-        assert!(prompt.contains("peoplePresence 必须是 present"));
-        assert!(prompt.contains("绝不能写无人"));
+        }];
+        let schema = super::tagging_schema(&facets);
+        assert_eq!(
+            schema["properties"]["tags"]["properties"]["brand_info"]["maxItems"],
+            5
+        );
+        assert!(schema["properties"].get("peoplePresence").is_none());
     }
 
     // §8.4：本地请求体注入 keep_alive；云端不注入
@@ -3432,25 +3204,44 @@ mod tests {
 
     #[test]
     fn fallback_only_accepts_explicit_format_compatibility_errors() {
-        assert!(super::vision_request_should_fallback(
-            "服务返回 HTTP 400：response_format json_schema unsupported"
-        ));
-        assert!(!super::vision_request_should_fallback(
-            "视觉请求请求过于频繁（HTTP 429）：RPM limit exceeded"
-        ));
-        assert!(!super::vision_request_should_fallback(
-            "服务返回 HTTP 400：context length exceeded"
-        ));
-        assert!(!super::vision_request_should_fallback(
-            "服务返回 HTTP 401：unauthorized"
-        ));
-        assert!(super::vision_request_should_fallback(
-            "Ollama unknown field: think"
-        ));
-        assert!(super::vision_request_should_fallback("响应格式不支持"));
-        assert!(!super::vision_request_should_fallback(
-            "model does not support image input"
-        ));
+        let format_rejection = super::ai_http_status_error_with_body(
+            "视觉请求",
+            400,
+            r#"{"error":{"message":"response_format json_schema unsupported"}}"#,
+        );
+        assert!(super::vision_request_should_fallback(&format_rejection));
+
+        for error in [
+            super::ai_http_status_error_with_body(
+                "视觉请求",
+                429,
+                r#"{"error":{"message":"RPM limit exceeded"}}"#,
+            ),
+            super::ai_http_status_error_with_body(
+                "视觉请求",
+                400,
+                r#"{"error":{"message":"context length exceeded"}}"#,
+            ),
+            super::ai_http_status_error_with_body(
+                "视觉请求",
+                401,
+                r#"{"error":{"message":"unauthorized"}}"#,
+            ),
+            super::ai_http_status_error_with_body(
+                "视觉请求",
+                400,
+                r#"{"error":{"message":"model does not support image input"}}"#,
+            ),
+        ] {
+            assert!(!super::vision_request_should_fallback(&error));
+        }
+
+        let ollama_extension = super::ai_http_status_error_with_body(
+            "Ollama 视觉请求",
+            422,
+            r#"{"error":"json: unknown field 'think'"}"#,
+        );
+        assert!(super::vision_request_should_fallback(&ollama_extension));
     }
 
     #[test]
@@ -3825,18 +3616,18 @@ mod tests {
     // ── FB5-05（§7.5）：一句话描述规范化 ──
 
     #[test]
-    fn normalize_description_trims_whitespace_and_folds() {
+    fn normalize_description_only_trims_outer_whitespace() {
         assert_eq!(
             super::normalize_content_description("  夜晚树下多人合影  "),
             "夜晚树下多人合影"
         );
         assert_eq!(
             super::normalize_content_description("夜晚树下\n多人合影"),
-            "夜晚树下 多人合影"
+            "夜晚树下\n多人合影"
         );
         assert_eq!(
             super::normalize_content_description("夜晚树下\t\t多人  合影"),
-            "夜晚树下 多人 合影"
+            "夜晚树下\t\t多人  合影"
         );
         assert_eq!(super::normalize_content_description(""), "");
         assert_eq!(super::normalize_content_description("   "), "");
@@ -3866,16 +3657,13 @@ mod tests {
             0.30,
         )
         .unwrap();
-        assert_eq!(a.description, "夜晚树下多人合影");
-        assert_eq!(
-            a.tags.get("subject").unwrap(),
-            &vec!["人".to_string(), "树".to_string()]
-        );
+        assert_eq!(a.description, "这是一张夜晚树下多人合影。");
+        assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
         assert_eq!(a.tags.get("people").unwrap(), &vec!["多人".to_string()]);
     }
 
     #[test]
-    fn parse_media_analysis_keeps_people_attrs_atomic() {
+    fn parse_media_analysis_preserves_category_values_without_rewriting() {
         let facets = vec![
             FacetPromptContext {
                 key: "subject".into(),
@@ -3898,21 +3686,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             a.tags.get("subject").unwrap(),
-            &vec!["人".to_string(), "树".to_string(), "建筑".to_string()]
+            &vec!["女子".to_string(), "树".to_string(), "建筑".to_string()]
         );
         assert_eq!(
             a.tags.get("people").unwrap(),
-            &vec![
-                "男性".to_string(),
-                "女性".to_string(),
-                "老年".to_string(),
-                "古装".to_string()
-            ]
+            &vec!["男女".to_string(), "老人".to_string(), "古装".to_string()]
         );
     }
 
     #[test]
-    fn parse_media_analysis_absent_people_removes_human_subject() {
+    fn legacy_people_presence_does_not_rewrite_category_values() {
         let facets = vec![
             FacetPromptContext {
                 key: "subject".into(),
@@ -3933,8 +3716,11 @@ mod tests {
             0.30,
         )
         .unwrap();
-        assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
-        assert_eq!(a.tags.get("people").unwrap(), &vec!["无人".to_string()]);
+        assert_eq!(
+            a.tags.get("subject").unwrap(),
+            &vec!["女子".to_string(), "树".to_string()]
+        );
+        assert_eq!(a.tags.get("people").unwrap(), &vec!["女性".to_string()]);
     }
 
     #[test]
@@ -3962,6 +3748,28 @@ mod tests {
         assert_eq!(
             a.tags.get("people").unwrap(),
             &vec!["赛博朋克少女".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_analysis_can_omit_legacy_people_presence() {
+        let facets = vec![FacetPromptContext {
+            key: "brand_info".into(),
+            display_name: "品牌信息".into(),
+            description: "品牌标识".into(),
+            facet_kind: "tag".into(),
+            ..Default::default()
+        }];
+        let analysis = super::parse_media_analysis(
+            r#"{"description":"较长的摘要文本保留原样。","tags":{"brand_info":[{"name":"年轻女子","confidence":0.94}]},"numbers":{}}"#,
+            &facets,
+            0.3,
+        )
+        .unwrap();
+        assert_eq!(analysis.tags["brand_info"], vec!["年轻女子"]);
+        assert_eq!(
+            analysis.people_presence,
+            crate::db::ai::PeoplePresence::default()
         );
     }
 
@@ -4071,6 +3879,8 @@ mod tests {
             num_min: None,
             num_max: None,
             num_unit: String::new(),
+            num_decimals: 0,
+            num_step: 1.0,
         }];
         let error = super::parse_media_analysis(
             r#"{"description":"五人合影","peoplePresence":{"status":"present","confidence":0.9},"tags":{"people_count":[{"name":"5","confidence":0.9}]}}"#,
@@ -4096,6 +3906,24 @@ mod tests {
         .unwrap();
         assert_eq!(a.description, "纯红色背景没有其他物体");
         assert!(a.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_media_analysis_number_only_is_valid() {
+        let facets = vec![FacetPromptContext {
+            key: "frame_count".into(),
+            display_name: "帧数".into(),
+            facet_kind: "number".into(),
+            ..Default::default()
+        }];
+        let analysis = super::parse_media_analysis(
+            r#"{"description":"","tags":{},"numbers":{"frame_count":"12"}}"#,
+            &facets,
+            0.3,
+        )
+        .unwrap();
+        assert_eq!(analysis.numbers.len(), 1);
+        assert!(analysis.description.is_empty());
     }
 
     #[test]
@@ -4155,64 +3983,46 @@ mod tests {
         let raw = "好的，以下是整理好的并符合规格的JSON格式：\n```json\n{\"description\":\"夜晚树下自拍\",\"peoplePresence\":{\"status\":\"present\",\"confidence\":0.9},\"tags\":{\"subject\":[{\"name\":\"树\",\"confidence\":0.9}]},\"numbers\":{}}\n```";
         let a = super::parse_media_analysis(raw, &facets, 0.30).unwrap();
         assert_eq!(a.description, "夜晚树下自拍");
-        assert_eq!(
-            a.tags.get("subject").unwrap(),
-            &vec!["人".to_string(), "树".to_string()]
-        );
+        assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
     }
 
     #[test]
-    fn normalize_description_strips_fillers_and_sentence() {
-        // 开头套话去除
-        assert_eq!(
-            super::normalize_content_description("这是一张夜晚树下多人合影。"),
-            "夜晚树下多人合影"
-        );
-        assert_eq!(
-            super::normalize_content_description("这张图片展示夜晚的海滩！"),
-            "夜晚的海滩"
-        );
-        assert_eq!(
-            super::normalize_content_description("画面中有树和多人，氛围温馨。"),
-            "树和多人，氛围温馨"
-        );
-        // 只取第一个句段（逗号不在截断范围，但句号截断）
-        assert_eq!(
-            super::normalize_content_description("夜晚树下多人合影，氛围温馨。整体色调偏冷。"),
-            "夜晚树下多人合影，氛围温馨"
-        );
-        // 无套话/无标点原样保留
-        assert_eq!(
-            super::normalize_content_description("夜晚树下多人合影"),
-            "夜晚树下多人合影"
-        );
+    fn description_content_is_not_rewritten() {
+        let original = "这张图片展示了一个较长的画面描述。第二句也保留。";
+        assert_eq!(super::normalize_content_description(original), original);
     }
 
     #[test]
-    fn normalize_description_truncates_to_30_unicode_chars() {
+    fn description_content_is_not_truncated_by_hidden_character_limit() {
         let long = "一个阳光明媚的海边沙滩上人们正在散步的场景十分美好";
         assert_eq!(long.chars().count(), 25);
         let out = super::normalize_content_description(long);
-        assert_eq!(out.chars().count(), 25, "未超过 30 字不得截断：{out}");
+        assert_eq!(out, long, "短文本原样保留");
         let longer = "一个阳光明媚的海边沙滩上人们正在散步聊天的场景十分美好且热闹非凡";
         assert!(longer.chars().count() > 30);
-        let truncated = super::normalize_content_description(longer);
-        assert_eq!(truncated.chars().count(), 30);
+        let preserved = super::normalize_content_description(longer);
+        assert_eq!(preserved, longer);
         // 表情符号（多字节）也不被切坏
         let emoji = "🌅海边日落很美很浪漫的景色";
         let out2 = super::normalize_content_description(emoji);
-        assert!(out2.chars().count() <= 30);
-        assert!(!out2.is_empty());
+        assert_eq!(out2, emoji);
     }
 
     #[test]
-    fn system_prompt_limits_inference_and_preserves_json_contract() {
-        let prompt = super::build_system_prompt();
-        assert!(prompt.contains("不要推测素材用途"));
-        assert!(prompt.contains("无法确认时返回空数组"));
-        assert!(prompt.contains("12–30 个字符"));
-        assert!(prompt.contains("peoplePresence"));
+    fn system_prompt_preserves_protocol_and_uses_visible_global_prompt() {
+        let prompt = super::build_system_prompt("可编辑的全局业务说明");
+        assert!(prompt.contains("可编辑的全局业务说明"));
         assert!(prompt.contains("\"description\""));
         assert!(prompt.contains("\"tags\""));
+        assert!(!prompt.contains("peoplePresence"));
+        assert!(!prompt.contains("subject"));
+    }
+
+    #[test]
+    fn intentionally_empty_global_prompt_does_not_restore_a_hidden_default() {
+        let prompt = super::build_system_prompt("");
+        assert!(prompt.contains("\"description\""));
+        assert!(!prompt.contains("全局打标说明（由用户设置）"));
+        assert!(!prompt.contains("只根据素材中能直接观察到的信息"));
     }
 }

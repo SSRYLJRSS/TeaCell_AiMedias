@@ -2,7 +2,7 @@
 name = "bagertea_ai_media_v2"
 version = "1.0.1"
 edition = "2021"
-description = "茶包素材 BagerTea AiMdeias V2 — 本地图片/视频素材数据库"
+description = "茶馆AI素材管理 — 本地图片与视频素材库"
 
 [lib]
 name = "bagertea_ai_media_v2_lib"

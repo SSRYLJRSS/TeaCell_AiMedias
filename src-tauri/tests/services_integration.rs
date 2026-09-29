@@ -10,6 +10,15 @@ use bagertea_ai_media_v2_lib::error::AppResult;
 use bagertea_ai_media_v2_lib::services::{export_local, importer, thumbnail::ThumbnailService};
 use bagertea_ai_media_v2_lib::state::Database;
 
+fn default_import_options(temp_dir: &std::path::Path) -> AppResult<importer::ImportOptions> {
+    let library_root = temp_dir.join("library");
+    std::fs::create_dir_all(&library_root)?;
+    Ok(importer::ImportOptions {
+        library_root: Some(library_root.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+}
+
 /// 生成 N 张测试 JPEG（image crate 直接出图）
 fn make_jpegs(dir: &std::path::Path, n: usize) {
     for i in 0..n {
@@ -41,7 +50,7 @@ fn import_100_images_with_placeholders() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -69,12 +78,46 @@ fn import_100_images_with_placeholders() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
     assert_eq!(r2.duplicates, 100);
     assert_eq!(r2.imported, 0);
+    Ok(())
+}
+
+// ①a 复用确认阶段已经完成的后端预检清单继续入库。
+#[test]
+fn import_reuses_preflight_candidate_plan() -> AppResult<()> {
+    let tmp = tempfile::tempdir()?;
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src)?;
+    make_jpegs(&src, 1);
+
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
+    let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
+    let cancel = AtomicBool::new(false);
+    let paths = [src.join("photo000.jpg").to_string_lossy().into_owned()];
+    let plan = importer::inspect_paths(&paths);
+    assert_eq!(plan.items.len(), 1);
+
+    let result = importer::import_preflight_plan_with_task_id(
+        &dbm,
+        &thumbs,
+        plan,
+        &default_import_options(tmp.path())?,
+        &cancel,
+        "preflight-test".into(),
+        |_| {},
+    )?;
+
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.failed, 0, "errors: {:?}", result.errors);
+    assert_eq!(
+        assets::list(&dbm.lock().unwrap(), &AssetFilter::default())?.total,
+        1
+    );
     Ok(())
 }
 
@@ -93,7 +136,7 @@ fn hd_thumbnail_generate_and_cache() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -130,7 +173,7 @@ fn export_copy_integrity() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -186,7 +229,7 @@ fn delete_cleans_thumbnails() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -216,6 +259,7 @@ fn managed_library_import() -> AppResult<()> {
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     let root = tmp.path().join("library");
+    std::fs::create_dir_all(&root)?;
     let opts = importer::ImportOptions {
         library_root: Some(root.to_string_lossy().into_owned()),
         collection: Some("旅行".into()),
@@ -269,7 +313,7 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -347,7 +391,7 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -421,23 +465,14 @@ fn b01_import_cancel_zero_imported() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
-    )?;
+    )
+    .expect_err("入库检查期间取消应返回明确的取消状态");
+    assert_eq!(r.code(), "CANCELLED");
 
-    // 取消后 0 导入
-    assert_eq!(r.imported, 0, "取消后不应导入任何文件");
-    assert_eq!(r.duplicates, 0);
-    assert_eq!(r.failed, 0, "取消不算失败");
-    // B15：应含"用户取消"语义化提示
-    assert!(
-        r.errors.iter().any(|e| e.contains("用户取消")),
-        "应包含取消提示: {:?}",
-        r.errors
-    );
-
-    // 库中无记录
+    // 取消后不复制文件、不写库；随后可安全重新导入。
     let page = assets::list(&dbm.lock().unwrap(), &AssetFilter::default())?;
     assert_eq!(page.total, 0, "取消后库应无记录");
 
@@ -447,7 +482,7 @@ fn b01_import_cancel_zero_imported() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel2,
         |_| {},
     )?;
@@ -471,7 +506,7 @@ fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         |_| {},
     )?;
@@ -557,7 +592,7 @@ fn import_phase_progress_sequence() -> AppResult<()> {
         &dbm,
         &thumbs,
         &[src.to_string_lossy().into_owned()],
-        &Default::default(),
+        &default_import_options(tmp.path())?,
         &cancel,
         progress,
     )?;

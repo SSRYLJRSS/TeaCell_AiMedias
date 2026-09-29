@@ -55,11 +55,17 @@ impl Default for PeoplePresence {
     }
 }
 
+fn is_unknown_people_presence(value: &PeoplePresence) -> bool {
+    value == &PeoplePresence::default()
+}
+
 /// A1：单图分析结果（强类型）。warnings 回传前端（R2-1），不只进日志。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisResult {
     pub description: String,
+    /// 旧分析 JSON 读取兼容；新结果缺省时不再序列化此业务字段。
+    #[serde(default, skip_serializing_if = "is_unknown_people_presence")]
     pub people_presence: PeoplePresence,
     pub proposals: Vec<TagProposal>,
     /// V24（§6.3④）：数值分面提议（平行字段，不改 CategorizedTags 形状）
@@ -1365,6 +1371,25 @@ pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
 #[cfg(test)]
 mod number_tests {
     use super::*;
+
+    #[test]
+    fn analysis_result_reads_legacy_people_presence_but_omits_default_field() {
+        let legacy: AnalysisResult = serde_json::from_str(
+            r#"{"description":"旧摘要","peoplePresence":{"status":"present","confidence":0.9},"proposals":[],"numbers":[],"warnings":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.people_presence.status, PeoplePresenceStatus::Present);
+
+        let current = AnalysisResult {
+            description: "新摘要".into(),
+            people_presence: PeoplePresence::default(),
+            proposals: Vec::new(),
+            numbers: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let serialized = serde_json::to_value(current).unwrap();
+        assert!(serialized.get("peoplePresence").is_none());
+    }
 
     // ═══════════ Phase 6 · §6.5 数值解析严格规则（8 条） ═══════════
 

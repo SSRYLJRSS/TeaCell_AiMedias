@@ -1,4 +1,4 @@
-//! 超级搜索 AI 服务（FB5-05 §9）：自然语言 → SearchIntentV2 → QueryExpr。
+//! 超级搜索 AI 服务（FB5-05 §9）：自然语言 → SearchIntentV3 → QueryExpr / SearchPlanV3。
 //! - 模型只输出分组概念事实源（组内 AND、组间 OR），后端生成并校验 QueryExpr；
 //! - AI parse result 只返回 expr/排序/解释/warnings/resolvedTags，无扁平 query；
 //! - 未知/歧义标签 → content 搜索 leaf 或 warning；强制不查询回收站；零数据库写入。
@@ -13,10 +13,28 @@ use crate::db::tag_facets::FacetPromptContext;
 use crate::db::tags;
 use crate::error::{AppError, AppResult};
 use crate::services::ai_cloud::{self, TextJsonTier};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 pub const MAX_INPUT_LEN: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSearchStage {
+    Queued,
+    Requesting,
+    Validating,
+}
+
+fn ensure_search_active(cancel: &AtomicBool, deadline: Instant) -> AppResult<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AppError::cancelled("AI 搜索请求已取消"));
+    }
+    if Instant::now() >= deadline {
+        return Err(AppError::timeout("AI 搜索解析超过 180 秒总时限"));
+    }
+    Ok(())
+}
 
 /// §9.2-2：共享停用词（单一常量）。Prompt 文本由本常量生成，本地清洗复用同一集合——
 /// 禁止维护两份会漂移的列表。
@@ -172,7 +190,7 @@ where
     Ok(v.unwrap_or_default())
 }
 
-/// V3 组：V2 字段语义不变（全部进 filter），新增 `preferred`（加分项 → should）。
+/// V3 组：V2 硬条件语义不变；`preferred` 与 `preferred_metadata` 只进入 should。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchGroupV3 {
@@ -184,6 +202,9 @@ pub struct SearchGroupV3 {
     pub text_terms: Vec<IntentTextTerm>,
     #[serde(default)]
     pub metadata: Vec<MetadataFilter>,
+    /// 算法元数据的可选偏好；不满足时只影响排序，不淘汰素材。
+    #[serde(default)]
+    pub preferred_metadata: Vec<PreferredMetadataV3>,
     /// 「没打标签 / 未分类」→ true，编译为 LeafCond::Untagged
     #[serde(default)]
     pub untagged_only: bool,
@@ -192,8 +213,20 @@ pub struct SearchGroupV3 {
     pub preferred: Vec<SearchConceptV3>,
 }
 
+/// 软元数据条件。字段在 JSON 中与 MetadataFilter 平铺，便于模型复用同一条件格式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreferredMetadataV3 {
+    #[serde(flatten)]
+    pub filter: MetadataFilter,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub weight: Option<f32>,
+}
+
 /// S3：V3 顶层意图 —— 与 V2 同构（组间 OR、组内 AND、全局 exclusions），
-/// 只是组用 V3（concepts 进 filter、preferred 进 should）。
+/// 只是组用 V3（required metadata/concepts 进 filter，preferred 与 preferred_metadata 进 should）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchIntentV3 {
@@ -524,11 +557,169 @@ pub fn guard_preferred(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
     warnings
 }
 
+/// 校验软元数据条件。元数据偏好只改变排序，因此证据无效时直接丢弃，不得转为硬筛选。
+fn guard_preferred_metadata(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
+    let input_n = tags::normalize_name(input);
+    let mut warnings = Vec::new();
+    group.preferred_metadata.retain_mut(|preferred| {
+        let invalid = search_query::compile_metadata(&preferred.filter).err();
+        let evidence_ok = preferred.evidence.as_deref().is_some_and(|evidence| {
+            let normalized = tags::normalize_name(evidence);
+            !normalized.is_empty()
+                && input_n.contains(&normalized)
+                && evidence_mentions_hue_color(evidence, &preferred.filter)
+        });
+        if let Some(error) = invalid {
+            warnings.push(format!(
+                "已忽略无效的元数据加分项（{} {}）：{error}",
+                preferred.filter.key, preferred.filter.op
+            ));
+            return false;
+        }
+        if !evidence_ok {
+            warnings.push(format!(
+                "元数据加分项「{}」缺少有效的原文依据，已忽略。",
+                preferred.filter.key
+            ));
+            return false;
+        }
+        preferred.weight = Some(snap_to_allowed_weight(preferred.weight.unwrap_or(1.0)));
+        true
+    });
+    warnings
+}
+
+const COLOR_HUE_RANGES: &[(&[&str], f64, f64)] = &[
+    (&["红色", "红"], 345.0, 15.0),
+    (&["橙色", "橙"], 15.0, 45.0),
+    (&["黄色", "黄"], 45.0, 70.0),
+    (&["绿色", "绿"], 70.0, 155.0),
+    (&["青色", "青"], 155.0, 225.0),
+    (&["蓝色", "蓝"], 225.0, 295.0),
+    (&["紫色", "紫"], 295.0, 345.0),
+];
+
+const PREFERENCE_MARKERS: &[&str] = &["最好", "优先", "尽量", "更好", "倾向", "偏好", "希望"];
+const PREFERENCE_DELIMITERS: &[char] = &['，', ',', '。', '；', ';', '！', '!', '？', '?', '\n'];
+
+fn preferred_spans(input: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for marker in PREFERENCE_MARKERS {
+        for (start, _) in input.match_indices(marker) {
+            let end = input[start..]
+                .char_indices()
+                .find(|(_, ch)| PREFERENCE_DELIMITERS.contains(ch))
+                .map_or(input.len(), |(offset, _)| start + offset);
+            if end > start {
+                spans.push((start, end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    spans
+}
+
+fn hue_color_for_filter(filter: &MetadataFilter) -> Option<(&'static str, f64, f64)> {
+    if filter.key != "dominant_hue" || filter.op != "between" {
+        return None;
+    }
+    let min = filter.min.as_ref()?.as_f64()?;
+    let max = filter.max.as_ref()?.as_f64()?;
+    COLOR_HUE_RANGES
+        .iter()
+        .find(|(_, expected_min, expected_max)| {
+            (min - expected_min).abs() < 0.01 && (max - expected_max).abs() < 0.01
+        })
+        .map(|(names, min, max)| (names[0], *min, *max))
+}
+
+fn evidence_mentions_hue_color(evidence: &str, filter: &MetadataFilter) -> bool {
+    if filter.key != "dominant_hue" {
+        return true;
+    }
+    let Some((_, min, max)) = hue_color_for_filter(filter) else {
+        return false;
+    };
+    COLOR_HUE_RANGES.iter().any(|(names, lo, hi)| {
+        (*lo - min).abs() < 0.01
+            && (*hi - max).abs() < 0.01
+            && names.iter().any(|name| evidence.contains(name))
+    })
+}
+
+/// 兼容模型把「最好主要是绿色」输出为 required metadata 的情况。
+/// 只有色相范围与偏好短语中的颜色完全对应、且该颜色未在偏好短语外再次出现时，
+/// 才纠正为 should；任何存在歧义的颜色仍保留用户明确给出的 required 语义。
+fn repair_misplaced_preferred_hue(input: &str, groups: &mut [SearchGroupV3]) -> Vec<String> {
+    let spans = preferred_spans(input);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    for group in groups {
+        let mut required = Vec::with_capacity(group.metadata.len());
+        for filter in group.metadata.drain(..) {
+            let Some((canonical_color, _, _)) = hue_color_for_filter(&filter) else {
+                required.push(filter);
+                continue;
+            };
+            let color_aliases = COLOR_HUE_RANGES
+                .iter()
+                .find(|(names, _, _)| names[0] == canonical_color)
+                .map(|(names, _, _)| *names)
+                .unwrap_or(&[]);
+            let Some((start, end)) = spans.iter().copied().find(|(start, end)| {
+                color_aliases
+                    .iter()
+                    .any(|alias| input[*start..*end].contains(alias))
+            }) else {
+                required.push(filter);
+                continue;
+            };
+            let color_is_required_elsewhere = color_aliases.iter().any(|alias| {
+                input.match_indices(alias).any(|(position, _)| {
+                    !spans
+                        .iter()
+                        .any(|(start, end)| position >= *start && position < *end)
+                })
+            });
+            if color_is_required_elsewhere {
+                required.push(filter);
+                continue;
+            }
+            let evidence = input[start..end].trim().to_string();
+            if let Some(existing) = group.preferred_metadata.iter_mut().find(|preferred| {
+                serde_json::to_value(&preferred.filter).ok() == serde_json::to_value(&filter).ok()
+            }) {
+                // 模型已经给出同一 soft 条件时合并为一条，并补齐可追溯的原文证据。
+                existing.evidence = Some(evidence);
+                existing.weight = Some(snap_to_allowed_weight(existing.weight.unwrap_or(1.0)));
+            } else {
+                group.preferred_metadata.push(PreferredMetadataV3 {
+                    filter,
+                    evidence: Some(evidence),
+                    weight: Some(1.0),
+                });
+            }
+            warnings.push(format!(
+                "已将「{}」对应的颜色条件从必筛改为加分项，因为原文把它表达为偏好。",
+                input[start..end].trim()
+            ));
+        }
+        group.metadata = required;
+    }
+    warnings
+}
+
 fn warn_missing_preferred(input: &str, groups: &[SearchGroupV3]) -> Vec<String> {
     if !CORE_PREF_HINTS.iter().any(|hint| input.contains(hint)) {
         return Vec::new();
     }
-    if groups.iter().any(|group| !group.preferred.is_empty()) {
+    if groups
+        .iter()
+        .any(|group| !group.preferred.is_empty() || !group.preferred_metadata.is_empty())
+    {
         return Vec::new();
     }
     vec!["原文包含偏好表达，但未能生成可选加分条件；未自动改写，请检查解析结果。".into()]
@@ -772,13 +963,35 @@ pub fn guard_intent(input: &str, intent: &mut SearchIntentV2) -> Vec<String> {
 /// 对用户明确写出的单位/构图约束做轻量覆盖检查。
 /// 这不是替模型补条件，而是防止「条件被悄悄吃掉」：保留已解析结果，同时给出可理解 warning。
 pub fn warn_missing_explicit_metadata(input: &str, intent: &SearchIntentV2) -> Vec<String> {
-    let lower = input.to_ascii_lowercase();
-    let has_key = |key: &str| {
+    warn_missing_explicit_metadata_by(input, |key| {
         intent
             .groups
             .iter()
-            .any(|g| g.metadata.iter().any(|m| m.key == key))
-    };
+            .any(|group| group.metadata.iter().any(|filter| filter.key == key))
+    })
+}
+
+fn warn_missing_explicit_metadata_v3(
+    input: &str,
+    required: &SearchIntentV2,
+    intent: &SearchIntentV3,
+) -> Vec<String> {
+    warn_missing_explicit_metadata_by(input, |key| {
+        required
+            .groups
+            .iter()
+            .any(|group| group.metadata.iter().any(|filter| filter.key == key))
+            || intent.groups.iter().any(|group| {
+                group
+                    .preferred_metadata
+                    .iter()
+                    .any(|preferred| preferred.filter.key == key)
+            })
+    })
+}
+
+fn warn_missing_explicit_metadata_by(input: &str, has_key: impl Fn(&str) -> bool) -> Vec<String> {
+    let lower = input.to_ascii_lowercase();
     let mut warnings = Vec::new();
     if (lower.contains("kb")
         || lower.contains("mb")
@@ -1357,6 +1570,23 @@ pub fn build_plan_from_v3(
                 });
             }
         }
+        for preferred in &g.preferred_metadata {
+            if let Err(e) = search_query::compile_metadata(&preferred.filter) {
+                warnings.push(format!(
+                    "已忽略无效的元数据加分项（{} {}）：{e}",
+                    preferred.filter.key, preferred.filter.op
+                ));
+                continue;
+            }
+            should.push(ShouldClause {
+                cond: LeafCond::Metadata {
+                    filter: preferred.filter.clone(),
+                },
+                weight: snap_to_allowed_weight(preferred.weight.unwrap_or(1.0)),
+                label: format!("{}（加分项）", preferred.filter.key),
+                evidence: preferred.evidence.clone(),
+            });
+        }
     }
 
     if should.len() > MAX_SHOULD_CLAUSES {
@@ -1654,6 +1884,7 @@ pub fn v2_group_to_v3(g: &SearchGroupV2) -> SearchGroupV3 {
             .collect(),
         text_terms: g.text_terms.clone(),
         metadata: g.metadata.clone(),
+        preferred_metadata: Vec::new(),
         untagged_only: g.untagged_only,
         preferred: Vec::new(),
     }
@@ -1693,6 +1924,7 @@ pub fn keyword_intent_v3(text: &str) -> SearchIntentV3 {
                 scope: "all".into(),
             }],
             metadata: vec![],
+            preferred_metadata: vec![],
             untagged_only: false,
             preferred: Vec::new(),
         }],
@@ -1706,8 +1938,8 @@ pub fn keyword_intent_v3(text: &str) -> SearchIntentV3 {
 // 不持有 DB 锁；text 已由命令层校验长度。
 //
 // W6-2（§W6-2）三层降级：① strict 正常解析 → ② lenient 剔除非法项保留其余 + warning
-// → ③ 关键词兜底（永不失败）。唯一例外：配置类错误（鉴权/连不上/超时）仍真报错
-// —— 配置问题必须让用户知道，而不是假装搜到了。
+// → ③ 关键词兜底（仅适用于已收到但无法使用的模型内容；服务请求错误在 request_intent 中返回）
+// —— 已收到模型内容但无法解析时才使用关键词；服务请求失败必须如实反馈。
 // ═══════════════ C-3：库能力注入（只告知，不改写） ═══════════════
 
 /// 库能力摘要缓存（60s TTL，全局单库）。措辞必须是陈述事实而非禁令。
@@ -1870,6 +2102,32 @@ pub fn request_intent(
     dict: &[String],
     capabilities: &str,
 ) -> AppResult<(SearchIntentV3, Vec<String>)> {
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + ai_cloud::AI_SEARCH_TOTAL_TIMEOUT;
+    request_intent_with_control(
+        cfg,
+        text,
+        facets,
+        dict,
+        capabilities,
+        &cancel,
+        deadline,
+        &|_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the single request snapshot and its cancellation/progress controls.
+pub fn request_intent_with_control(
+    cfg: &AiSettings,
+    text: &str,
+    facets: &[FacetPromptContext],
+    dict: &[String],
+    capabilities: &str,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    on_stage: &dyn Fn(AiSearchStage),
+) -> AppResult<(SearchIntentV3, Vec<String>)> {
+    ensure_search_active(cancel, deadline)?;
     let started = std::time::Instant::now();
     let profile = cfg
         .active()
@@ -1886,47 +2144,48 @@ pub fn request_intent(
     );
 
     let schema = intent_schema(facets);
-    // 用户可在设置页覆盖搜索 system prompt（非空优先；空 = 内置默认）
-    let system = if cfg.system_prompt_search.trim().is_empty() {
-        build_system_prompt(facets)
-    } else {
-        cfg.system_prompt_search.clone()
-    };
+    // SearchIntentV2 是机器协议；旧版用户覆盖字段只为读取兼容，不参与请求。
+    let system = build_system_prompt(facets);
     let user = build_user_prompt(dict, facets, text, capabilities);
 
-    // ① 网络请求（协议级降级 Structured → JsonObject → Plain 由 request_text_json 内部处理）。
-    // 配置类错误（鉴权/连不上/超时）真报错；其他服务异常降级为关键词搜索（不打扰）。
-    let (_tier, raw) = match ai_cloud::request_text_json(
+    // ① 请求层只对明确不支持的输出格式尝试下一协议层级；其余服务错误如实返回。
+    // 只有 HTTP 成功后收到的空、非 JSON 或不合规模型内容才进入内容降级。
+    let map_request_stage = |stage| match stage {
+        ai_cloud::AiRequestStage::Queued => on_stage(AiSearchStage::Queued),
+        ai_cloud::AiRequestStage::Requesting => on_stage(AiSearchStage::Requesting),
+    };
+    let (tier, raw) = match ai_cloud::request_text_json_with_control(
         profile,
         &system,
         &user,
         Some(schema.clone()),
         TextJsonTier::Structured,
+        cancel,
+        deadline,
+        &map_request_stage,
     ) {
         Ok(v) => v,
-        Err(e) if is_config_error(&e) => {
-            tracing::warn!(
-                operation = "super_search_ai",
-                stage = "config_error",
-                error_code = e.code(),
-                error = %e,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "AI 搜索解析配置错误"
-            );
-            return Err(e);
-        }
         Err(e) => {
             tracing::warn!(
                 operation = "super_search_ai",
-                stage = "keyword_fallback",
+                stage = "request_error",
                 error_code = e.code(),
-                error = %e,
                 duration_ms = started.elapsed().as_millis() as u64,
-                "AI 搜索解析失败，已降级为关键词"
+                "AI 搜索解析请求失败"
             );
-            return Ok(keyword_fallback_v3(text));
+            return Err(e);
         }
     };
+    tracing::info!(
+        operation = "super_search_ai",
+        stage = "response_received",
+        tier = ?tier,
+        response_chars = raw.chars().count(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "AI 搜索解析响应已收到"
+    );
+    ensure_search_active(cancel, deadline)?;
+    on_stage(AiSearchStage::Validating);
     if ai_cloud::is_degenerate_text(&raw) {
         // 持续乱码/复读：属模型能力问题而非配置问题 → 关键词兜底
         tracing::warn!(
@@ -1992,7 +2251,7 @@ pub fn degrade_parse(
 }
 
 /// S3：V3 解析层（V3→V2→关键词 三层降级）。
-/// ① strict V3：parse SearchIntentV3（含 preferred）→ 每组跑 guard_preferred（evidence 守卫）
+/// ① strict V3：parse SearchIntentV3（含 preferred/preferredMetadata）→ 每组跑软条件 evidence 守卫
 ///    → V3 侧清洗（concepts/preferred 都过 clean_concepts_v3）→ 转 V2 视图跑
 ///    sanitize_all_preserving_preferred + guard_intent + validate_intent（复用既有确定性守卫）
 ///    → 通过则保留 preferred 返回 V3。模型把偏好放进 concepts 的纠偏在 request_intent
@@ -2025,7 +2284,6 @@ pub fn degrade_parse_v3(
         clean_concepts_v3(&mut g.preferred, &mut warnings, &mut total);
     }
     clean_concepts_v3(&mut intent.exclusions, &mut warnings, &mut total);
-    warnings.extend(warn_missing_preferred(text, &intent.groups));
     if total > 20 {
         warnings.push(format!(
             "条件概念较多（{total} 个），已按置信度优先截取 20 个。"
@@ -2035,18 +2293,28 @@ pub fn degrade_parse_v3(
         warnings.push("未能理解搜索条件，已按关键词搜索。".into());
         return (keyword_intent_v3(text), warnings);
     }
+    // 防止算法颜色的可选表达被模型误放进 required metadata。
+    warnings.extend(repair_misplaced_preferred_hue(text, &mut intent.groups));
+    for group in &mut intent.groups {
+        warnings.extend(guard_preferred_metadata(text, group));
+    }
+    warnings.extend(warn_missing_preferred(text, &intent.groups));
     // V2 视图确定性守卫（assetType / OR 合并 / 组去重 / metadata 白名单编译）
     let mut v2_view = v3_to_v2_view(&intent);
     // V2 视图看不到 preferred；纯“最好有 X”查询虽然 filter 为空，仍必须保留
     // 这个占位 group，才能把 preferred 继续带到 SearchPlanV3.should。没有任何
     // preferred 时仍使用普通空组清理，避免畸形空 JSON 退化成全库查询。
-    if intent.groups.iter().any(|g| !g.preferred.is_empty()) {
+    if intent
+        .groups
+        .iter()
+        .any(|g| !g.preferred.is_empty() || !g.preferred_metadata.is_empty())
+    {
         warnings.extend(sanitize_all_preserving_preferred(&mut v2_view, facets));
     } else {
         warnings.extend(sanitize_all(&mut v2_view, facets));
     }
     warnings.extend(guard_intent(text, &mut v2_view));
-    warnings.extend(warn_missing_explicit_metadata(text, &v2_view));
+    warnings.extend(warn_missing_explicit_metadata_v3(text, &v2_view, &intent));
     if v2_view.groups.is_empty() {
         warnings.push("未能理解搜索条件，已按关键词搜索。".into());
         return (keyword_intent_v3(text), warnings);
@@ -2166,29 +2434,6 @@ fn clean_concepts_v3(
         *total += 1;
     }
     *concepts = kept;
-}
-
-/// W6-2：配置类错误判定（鉴权 / 连不上 / 超时）—— 这类错误必须真报错，不做降级。
-pub fn is_config_error(e: &AppError) -> bool {
-    let m = e.to_string().to_lowercase();
-    [
-        "401",
-        "403",
-        "api key",
-        "apikey",
-        "unauthorized",
-        "authentication",
-        "鉴权",
-        "无法连接",
-        "连接失败",
-        "error sending request",
-        "timeout",
-        "timed out",
-        "超时",
-        "请求失败",
-    ]
-    .iter()
-    .any(|k| m.contains(k))
 }
 
 /// W6-2 第 3 层：关键词兜底 intent —— 整句进 textTerms(scope=all)，永不失败。
@@ -2336,18 +2581,15 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     let last_year = y - 1;
     let stop = SEARCH_CONCEPT_STOPWORDS.join("、");
     let mut p = String::new();
-    p.push_str(
-        "你是「茶包素材库」的搜索条件解析器，不是聊天助手。输入一句自然语言，输出严格 JSON。\n",
-    );
+    p.push_str("你是「茶馆」的搜索条件解析器，不是聊天助手。输入一句自然语言，输出严格 JSON。\n");
     p.push_str("结构：组内 AND、组间 OR。根对象字段 groups/exclusions/sortBy/sortDir。\n");
-    p.push_str("每个 group 必填 assetType(all|image|video)/concepts/textTerms/metadata。\n");
+    p.push_str("每个 group 必填 assetType(all|image|video)/concepts/textTerms/metadata/preferredMetadata。metadata 是必须条件；preferredMetadata 是只影响排序的可选元数据条件。\n");
     p.push_str(&format!("硬规则：\n1. 每个 concept 是原子化规范名词或短名词短语（中文 1-6 字），禁止「晚上拍的树」「画面中有很多人」这类句子片段。\n2. 连接/方位/语法词不作 concept。共享停用词：{stop}。\n"));
     p.push_str("3. 同义概念只输出一次：如「多人、人群」按词典二选一，不同时输出。\n");
-    p.push_str("3.1 人物统一走 people：男子/女子/老人/年轻人/男孩/女孩等人物词必须映射到 people 的原子属性；多人/单人/双人/人群/无人也属于 people。禁止把人物、人数、性别、年龄或穿着写成 subject。\n");
-    p.push_str("3.2 subject 中的人只写「人」；具体性别、年龄、穿着、人数和动作必须拆成 people 的多个 concept。拆词只改变标签名称，不改变原句的必须/优先性质：例如「年轻女性」→ people:[青年,女性]；「最好要年轻女性」→ concepts:[]、preferred:[青年,女性]；「要女性，最好年轻」→ concepts:[女性]、preferred:[青年]；「必须是年轻女性」→ concepts:[青年,女性]、preferred:[]。\n");
-    p.push_str("3.3 有树、看到建筑等视觉对象走 subject；在树林里、在城市街道等空间地点走 scene。不得把同一个物体词同时写入 subject 和 scene。\n");
+    p.push_str("3.1 分类只依据本次用户消息中的「分面说明」选择；不得从 key、旧分类惯例或示例推断固定业务含义。说明不足以判断时 facetHint 置 null。\n");
+    p.push_str("3.2 role 是兼容字段，不决定分类，也不覆盖分面说明；只填写简短通用描述，不适用时填写空字符串。\n");
     p.push_str("4. assetType 只有用户明确说 图片/照片/相片/图像（image）或 视频/录像/片段/短片（video）时才填；「拍的」不算。\n");
-    p.push_str("5. 「晚上拍的」解析为「夜间」或「夜景」概念，不保留整句。\n");
+    p.push_str("5. 时间、天气、光照等概念只按当前分面说明、词典和可用元数据处理；不得预设标签名或分类 key。\n");
     p.push_str("6. 同一个词只允许出现一次：凡是能映射为标签（concepts）或元数据（metadata）的词，绝不再写进 textTerms；禁止对同一概念既出标签又出全文（如「草地」已进 concepts，就不得再出 textTerms「草地」）。\n");
     p.push_str("7. 只有明确文件名片段、引号原文、专有名词或确实无法映射成任何标签/元数据的具体内容才进 textTerms；scope 取 content（搜描述或文件名），不得把整句放进 all 或 description。连接词、语气词、「拍了/画面/素材」这类泛词一律不进 textTerms。\n");
     p.push_str("8. 没有明确「或/或者/任一」时只输出一个 group；「或/或者/任一」连接的每个完整子句各输出一个 group，组内概念保持 AND。\n");
@@ -2371,9 +2613,9 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("- 用户说「带…的」「关于…的」「跟…有关」→ contains。\n");
     p.push_str("- 用户明显打错字或用了近义词 → 仍用 alias。系统会在零结果时建议相近词。\n");
     p.push_str("- 不要主动用 prefix 或 fuzzy —— 那是零结果时的兜底，不是首选。\n");
-    p.push_str("颜色是算法计算的文件属性，用 metadata（dominant_hue 0-359：红色 min=345 max=15 表示跨 0°；橙 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345；dominant_sat/dominant_lum 0-100；灰/黑/白用 dominant_sat lte 10），不写进 tags。\n");
+    p.push_str("颜色是算法计算的文件属性，不写进 tags。必须颜色条件放 metadata；用户用「最好/优先/尽量/更好/倾向/偏好/希望」表达的颜色只放 preferredMetadata（只加分、不淘汰），并填写 evidence 原文和 weight。不得把颜色偏好放进 required metadata。颜色范围：dominant_hue 0-359（红色 min=345 max=15 表示跨 0°；橙 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345）；dominant_sat/dominant_lum 0-100；灰/黑/白用 dominant_sat lte 10。\n");
     p.push_str(
-        "元数据条件（metadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守：\n",
+        "元数据条件（metadata 和 preferredMetadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守；metadata 是必须满足的硬条件，preferredMetadata 是只影响排序的软偏好：\n",
     );
     p.push_str("- file_size：文件大小，单位字节（1MB=1048576）。op 用 gt/gte/lt/lte/between。示例「10~105MB」→ {\"key\":\"file_size\",\"op\":\"between\",\"min\":10485760,\"max\":110100480}。\n");
     p.push_str("- file_size 注意：写区间必须换算成字节，禁止输出「5..10」这类 MB 原值（会查不到结果）。换算演示：5~10MB → min=5242880, max=10485760；50~100MB → min=52428800, max=104857600。\n");
@@ -2392,14 +2634,11 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str(&format!("元数据输出示例 B：输入「今年拍的照片」（今年={y}）→ assetType image，metadata:[{{\"key\":\"taken_at\",\"op\":\"between\",\"value\":null,\"values\":null,\"min\":\"{this_year_start}\",\"max\":\"{this_year_end}\"}}]。\n"));
     p.push_str("元数据输出示例 C：输入「4K横图」→ assetType image，metadata:[{\"key\":\"width\",\"op\":\"gte\",\"value\":3840},{\"key\":\"aspect_ratio\",\"op\":\"gte\",\"value\":1}]。\n");
     p.push_str("元数据输出示例 D：输入「没打标签的视频」→ assetType video、untaggedOnly:true、concepts/textTerms/metadata 均为空。\n");
-    // §9.2 回归基准：本轮截图用例
-    p.push_str("示例 1：输入「晚上拍的然后有树还有多人」→ 期望：\n");
-    p.push_str("{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"夜间\",\"role\":\"lighting\",\"facetHint\":\"lighting\",\"confidence\":0.95},{\"text\":\"树木\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.95},{\"text\":\"多人\",\"role\":\"people\",\"facetHint\":\"people\",\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[],\"untaggedOnly\":false,\"preferred\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n");
+    p.push_str("元数据偏好示例：输入「单人女性，背景有路灯，不要男性，最好主要是绿色」→ 单人、女性、路灯进入 concepts，男性进入 exclusions；metadata 为空；preferredMetadata:[{\"key\":\"dominant_hue\",\"op\":\"between\",\"value\":null,\"values\":null,\"min\":70,\"max\":155,\"evidence\":\"最好主要是绿色\",\"weight\":1.0}]。绿色只能加分，不能筛掉非绿色素材。\n");
+    p.push_str("示例 1：输入「草地，最好有蓝天」时，草地是必须条件，蓝天是同组 preferred；不为任何概念预设分类 key。\n");
+    p.push_str("示例 2：输入「傍晚的树或者白天的建筑」→ 两个 group，分别保留各自的 AND 条件，再以 OR 连接；分类由当前分面说明决定。\n");
     p.push_str(
-        "示例 2：输入「晚上拍的树或者白天拍的建筑」→ 两个 group：(夜间∧树) OR (白天∧建筑)。\n",
-    );
-    p.push_str(
-        "示例 3：输入「不要夜景的人像」→ 一个含 subject「人」的 group + exclusions 含 lighting「夜景」。\n",
+        "示例 3：输入「不要夜景」→ 将「夜景」放入全局 exclusions；分类由当前分面说明决定。\n",
     );
     p.push_str("示例 4：输入「IMG_1097」→ groups 里 textTerms=[{\"text\":\"IMG_1097\",\"scope\":\"fileName\"}]。\n");
     // W6-4（§W6-4）：显式约束句 —— 分面 key 只能从这里选，不要发明新 key。
@@ -2409,7 +2648,7 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
         p.push_str("当前库没有可用分类（facetHint 一律给 null，不要发明分类）。\n");
     } else {
         p.push_str(&format!(
-            "分类 key（facetHint 只能填下面这些，不要发明新 key）：{}\n",
+            "可用分类 key（facetHint 只能填下面这些；选择时只按本次用户消息中的分面说明判断，不要推断 key 的业务含义）：{}\n",
             keys.join("、")
         ));
     }
@@ -2517,6 +2756,26 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
         }]);
         base
     };
+    let preferred_metadata_item = {
+        let mut base = metadata_item.clone();
+        base["properties"]["evidence"] = serde_json::json!({
+            "anyOf": [
+                {"type": "string", "minLength": 1, "maxLength": 40},
+                {"type": "null"}
+            ]
+        });
+        base["properties"]["weight"] = serde_json::json!({
+            "anyOf": [
+                {"type": "number", "enum": [0.5, 1.0, 2.0]},
+                {"type": "null"}
+            ]
+        });
+        if let Some(required) = base["required"].as_array_mut() {
+            required.push(serde_json::json!("evidence"));
+            required.push(serde_json::json!("weight"));
+        }
+        base
+    };
     let group = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -2525,10 +2784,11 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
             "concepts": {"type": "array", "maxItems": 20, "items": concept},
             "textTerms": {"type": "array", "maxItems": 10, "items": text_term},
             "metadata": {"type": "array", "maxItems": 20, "items": metadata_item},
+            "preferredMetadata": {"type": "array", "maxItems": 12, "items": preferred_metadata_item},
             "untaggedOnly": {"type": "boolean"},
             "preferred": {"type": "array", "maxItems": 12, "items": preferred_concept}
         },
-        "required": ["assetType", "concepts", "textTerms", "metadata", "untaggedOnly", "preferred"]
+        "required": ["assetType", "concepts", "textTerms", "metadata", "preferredMetadata", "untaggedOnly", "preferred"]
     });
     serde_json::json!({
         "type": "object",
@@ -2598,6 +2858,12 @@ pub fn build_explanation_v3(intent: &SearchIntentV3) -> String {
         for m in &g.metadata {
             inner.push(format!("{} {}", m.key, m.op));
         }
+        for preferred in &g.preferred_metadata {
+            inner.push(format!(
+                "{} {}（可加分）",
+                preferred.filter.key, preferred.filter.op
+            ));
+        }
         for c in &g.preferred {
             inner.push(format!("「{}」(可加分)", c.text));
         }
@@ -2623,6 +2889,115 @@ pub fn build_explanation_v3(intent: &SearchIntentV3) -> String {
 mod tests {
     use super::*;
     use crate::db::init_memory;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn mock_http_response(
+        status: u16,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            request
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn search_request_propagates_rate_limit_instead_of_keyword_fallback() {
+        let (base_url, server) =
+            mock_http_response(429, r#"{"error":{"message":"RPM limit exceeded"}}"#);
+        let profile_id = "super-search-429-test";
+        let settings = crate::db::settings::AiSettings {
+            active_profile: profile_id.into(),
+            profiles: vec![crate::db::settings::ApiProfile {
+                id: profile_id.into(),
+                name: "mock".into(),
+                api_mode: "openai".into(),
+                kind: "cloud".into(),
+                base_url,
+                api_key: String::new(),
+                model: "mock-model".into(),
+                max_concurrency: 0,
+                requests_per_minute: 0,
+                requests_per_hour: 0,
+            }],
+            ..Default::default()
+        };
+
+        let error = request_intent(&settings, "找绿色照片", &[], &[], "")
+            .expect_err("429 应作为服务失败返回，不应伪装为关键词搜索成功");
+        assert_eq!(error.code(), "AI_RATE_LIMITED");
+        let request = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&request).contains("POST /chat/completions"));
+    }
+
+    #[test]
+    fn search_request_reports_truncated_output_instead_of_keyword_fallback() {
+        let (base_url, server) = mock_http_response(
+            200,
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\\\"groups\\\":"}}]}"#,
+        );
+        let profile_id = "super-search-truncated-test";
+        let settings = crate::db::settings::AiSettings {
+            active_profile: profile_id.into(),
+            profiles: vec![crate::db::settings::ApiProfile {
+                id: profile_id.into(),
+                name: "mock".into(),
+                api_mode: "openai".into(),
+                kind: "cloud".into(),
+                base_url,
+                api_key: String::new(),
+                model: "mock-model".into(),
+                max_concurrency: 0,
+                requests_per_minute: 0,
+                requests_per_hour: 0,
+            }],
+            ..Default::default()
+        };
+
+        let error = request_intent(&settings, "女孩照片", &[], &[], "")
+            .expect_err("finish_reason=length 必须阻止关键词兜底");
+        assert_eq!(error.code(), "AI_OUTPUT_TRUNCATED");
+        assert!(String::from_utf8_lossy(&server.join().unwrap()).contains("POST /chat/completions"));
+    }
 
     fn mk_concept(text: &str, hint: Option<&str>, conf: f32) -> SearchConceptV2 {
         SearchConceptV2 {
@@ -3205,13 +3580,12 @@ mod tests {
         let conn = init_memory().unwrap();
         crate::db::ensure_default_taxonomy(&conn).unwrap();
         let tag_id = crate::db::tags::find_or_create_canonical(&conn, "subject", "蒲公英")
-            .expect("确认新词应写入「其他」");
+            .expect("确认新词应写入对应分面");
         let facets = crate::db::tag_facets::build_prompt_context(&conn, "all").unwrap();
         let dict = collect_tag_dictionary(&conn, &facets).unwrap();
 
         assert!(
-            dict.iter()
-                .any(|line| line.contains("其他 / 蒲公英") && line.contains("term: 蒲公英")),
+            dict.iter().any(|line| line == "蒲公英 | term: 蒲公英"),
             "新词确认后应进入下一次搜索词典：{dict:?}"
         );
         match resolve_concept(&conn, &mk_concept("蒲公英", Some("subject"), 0.95), false).unwrap()
@@ -3219,7 +3593,7 @@ mod tests {
             ConceptOutcome::Tag(tag) => {
                 assert_eq!(tag.tag_id, tag_id);
                 assert_eq!(tag.facet_key, "subject");
-                assert_eq!(tag.path, "其他 / 蒲公英");
+                assert_eq!(tag.path, "蒲公英");
             }
             _ => panic!("已确认新词应直接解析为标签"),
         }
@@ -3276,13 +3650,18 @@ mod tests {
         assert!(p.contains("元数据输出示例 B"));
         assert!(p.contains("元数据输出示例 C"));
         assert!(p.contains("元数据输出示例 D"));
+        assert!(
+            p.contains("preferredMetadata"),
+            "模型需区分元数据软偏好与硬过滤"
+        );
+        assert!(p.contains("绿色只能加分，不能筛掉非绿色素材"));
         // 分辨率档位 → 像素；横竖图 → aspect_ratio；优先互斥；禁止编造 tags_count
         assert!(p.contains("3840"), "4K 应教学为 width gte 3840");
         assert!(p.contains("互斥铁律"), "preferred/concepts 互斥必须强调");
         assert!(p.contains("最好要年轻女性"), "必须覆盖组合偏好的回归示例");
         assert!(
-            p.contains("要女性，最好年轻"),
-            "必须覆盖硬条件+偏好的回归示例"
+            p.contains("concepts=[草地]、preferred=[近景,自然光]"),
+            "必须覆盖同一组的硬条件与偏好结构"
         );
         assert!(p.contains("tags_count"), "必须明令禁止编造 tags_count");
         // 相对日期：注入真实当前年份，且不再出现「当年」占位字样
@@ -3293,6 +3672,27 @@ mod tests {
             !p.contains("当年8月1日"),
             "taken_at 示例值必须是真实日期，不得是占位中文"
         );
+    }
+
+    #[test]
+    fn search_prompt_uses_editable_facet_descriptions_without_key_semantics() {
+        let facets = [FacetPromptContext {
+            key: "brand_info".into(),
+            display_name: "品牌信息".into(),
+            description: "记录画面中可读出的品牌标识，不记录场景".into(),
+            ..Default::default()
+        }];
+        let system = build_system_prompt(&facets);
+        let user = build_user_prompt(&[], &facets, "找有品牌的照片", "");
+
+        assert!(system.contains("brand_info"));
+        assert!(system.contains("不要推断 key 的业务含义"));
+        assert!(!system.contains("人物统一走 people"));
+        assert!(!system.contains("people"));
+        assert!(!system.contains("subject"));
+        assert!(!system.contains("scene"));
+        assert!(user.contains("记录画面中可读出的品牌标识，不记录场景"));
+        assert!(user.contains("找有品牌的照片"));
     }
 
     #[test]
@@ -3563,29 +3963,6 @@ mod tests {
             !is_keyword_fallback(&i, text),
             "围栏剥除后应正常解析；warnings={w:?}"
         );
-    }
-
-    /// W6-2 例外：配置类错误（鉴权/连不上/超时）仍应判定为真报错（命令层不降级）
-    #[test]
-    fn search_config_error_still_errors() {
-        for msg in [
-            "云端请求失败: 401 Unauthorized",
-            "云端请求失败: 403 Forbidden",
-            "无法连接本地服务 ...: Connection refused",
-            "请求失败: request timed out",
-            "云端请求失败: error sending request for url ...",
-        ] {
-            let e = AppError::msg(msg);
-            assert!(is_config_error(&e), "应判定为配置错误: {msg}");
-        }
-        for msg in [
-            "AI 未返回可解析的 JSON",
-            "非法排序字段：foo",
-            "分组数量超出上限",
-        ] {
-            let e = AppError::msg(msg);
-            assert!(!is_config_error(&e), "不应判定为配置错误: {msg}");
-        }
     }
 
     /// W6-3：部分剔除规则 —— 非法 sortBy/sortDir/assetType → 默认；未知 hint → 全分面
@@ -3863,6 +4240,50 @@ mod tests {
         assert_eq!(intent.groups[0].preferred.len(), 1);
         assert!(!is_keyword_fallback_v3(&intent, "最好有蓝天"));
         assert!(warnings.is_empty(), "合法纯偏好不应告警：{warnings:?}");
+    }
+
+    #[test]
+    fn v3_color_preference_stays_soft_and_legacy_hard_output_is_repaired() {
+        let preferred_json = r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[],"preferredMetadata":[{"key":"dominant_hue","op":"between","value":null,"values":null,"min":70,"max":155,"evidence":"最好主要是绿色","weight":1.0}],"untaggedOnly":false,"preferred":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (preferred, preferred_warnings) =
+            degrade_parse_v3(preferred_json, "最好主要是绿色", &[]);
+        assert_eq!(preferred.groups[0].metadata.len(), 0);
+        assert_eq!(preferred.groups[0].preferred_metadata.len(), 1);
+        assert!(!is_keyword_fallback_v3(&preferred, "最好主要是绿色"));
+        assert!(
+            preferred_warnings.is_empty(),
+            "合法软颜色条件不告警：{preferred_warnings:?}"
+        );
+
+        // 兼容旧模型错误地把颜色偏好写进必筛 metadata 的输出。
+        let misplaced_json = r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[{"key":"dominant_hue","op":"between","value":null,"values":null,"min":70,"max":155}],"preferredMetadata":[],"untaggedOnly":false,"preferred":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (repaired, repair_warnings) = degrade_parse_v3(misplaced_json, "最好主要是绿色", &[]);
+        assert!(repaired.groups[0].metadata.is_empty());
+        assert_eq!(repaired.groups[0].preferred_metadata.len(), 1);
+        assert!(repair_warnings
+            .iter()
+            .any(|warning| warning.contains("从必筛改为加分项")));
+        assert!(!is_keyword_fallback_v3(&repaired, "最好主要是绿色"));
+    }
+
+    #[test]
+    fn explicit_color_requirement_is_not_downgraded_by_another_color_preference() {
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[{"key":"dominant_hue","op":"between","value":null,"values":null,"min":70,"max":155}],"preferredMetadata":[{"key":"dominant_hue","op":"between","value":null,"values":null,"min":225,"max":295,"evidence":"最好有蓝色","weight":1.0}],"untaggedOnly":false,"preferred":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, warnings) = degrade_parse_v3(raw, "绿色素材，最好有蓝色", &[]);
+        assert_eq!(
+            intent.groups[0].metadata.len(),
+            1,
+            "明确要求的绿色须保留为硬条件"
+        );
+        assert_eq!(
+            intent.groups[0].preferred_metadata.len(),
+            1,
+            "蓝色仍是软偏好"
+        );
+        assert!(
+            warnings.is_empty(),
+            "两个不同语义的颜色条件均合法：{warnings:?}"
+        );
     }
 
     #[test]
@@ -4379,6 +4800,17 @@ mod tests {
                 "加分项 schema 缺 {field}"
             );
         }
+        let preferred_metadata = &g["properties"]["preferredMetadata"];
+        assert!(
+            preferred_metadata.is_object(),
+            "group schema 必须声明 preferredMetadata"
+        );
+        for field in ["key", "op", "min", "max", "evidence", "weight"] {
+            assert!(
+                preferred_metadata["items"]["properties"][field].is_object(),
+                "软元数据 schema 缺 {field}"
+            );
+        }
     }
 
     /// S3：V3 概念清洗复用 V2 规则（句子化/停用词/空文本剔除），同时保留 V3 特有字段。
@@ -4473,6 +4905,7 @@ mod tests {
                 )],
                 text_terms: vec![],
                 metadata: vec![],
+                preferred_metadata: vec![],
                 untagged_only: false,
             }],
             exclusions: vec![c3("夜景", "scene", Necessity::Required, None, None)],
@@ -4539,6 +4972,7 @@ mod tests {
                 preferred,
                 text_terms: vec![],
                 metadata: vec![],
+                preferred_metadata: vec![],
                 untagged_only: false,
             }],
             exclusions: vec![],
@@ -4600,6 +5034,7 @@ mod tests {
                 preferred: vec![],
                 text_terms: vec![],
                 metadata: vec![],
+                preferred_metadata: vec![],
                 untagged_only: false,
             }],
             exclusions: vec![],
@@ -4643,6 +5078,7 @@ mod tests {
                 preferred: vec![],
                 text_terms: vec![],
                 metadata: vec![],
+                preferred_metadata: vec![],
                 untagged_only: false,
             }],
             exclusions: vec![],

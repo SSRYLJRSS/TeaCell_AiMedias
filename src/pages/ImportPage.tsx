@@ -10,7 +10,7 @@ import ProgressBar from "@/components/common/ProgressBar";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
 import { displayBasename } from "@/utils/pathDisplay";
-import { openFileExternal } from "@/api/import";
+import { newImportTaskId, openFileExternal } from "@/api/import";
 import {
   cancelImport,
   importFiles,
@@ -45,10 +45,38 @@ const FILE_FILTERS = [
   },
 ];
 
+async function ensureImportLibraryRoot(setError: (message: string) => void): Promise<boolean> {
+  let settings = useSettingsStore.getState();
+  if (!settings.loaded || settings.loadError) {
+    await settings.load();
+    settings = useSettingsStore.getState();
+  }
+  if (settings.loadError) {
+    setError(`设置读取失败：${settings.loadError}`);
+    return false;
+  }
+  if (!settings.settings?.libraryRoot.trim()) {
+    setError("请先在设置中配置并保存总库位置，再选择或导入文件。");
+    return false;
+  }
+  return true;
+}
+
+function waitForNextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+    } else {
+      window.setTimeout(resolve, 0);
+    }
+  });
+}
+
 export default function ImportPage() {
   const refreshLibrary = useLibraryStore((s) => s.refresh);
   const libraryRoot = useSettingsStore((s) => s.settings?.libraryRoot ?? "");
   const settingsLoaded = useSettingsStore((s) => s.loaded);
+  const settingsLoadError = useSettingsStore((s) => s.loadError);
   const loadSettings = useSettingsStore((s) => s.load);
 
   const [plan, setPlan] = useState<ImportPlan | null>(null);
@@ -63,6 +91,7 @@ export default function ImportPage() {
   const [scanWarnings, setScanWarnings] = useState<string[]>([]);
   const [showScanWarnings, setShowScanWarnings] = useState(false);
   const [running, setRunning] = useState(false);
+  const [startingMessage, setStartingMessage] = useState("正在准备入库");
   const importTask = useTaskStore((s) => latestImportTask(s.tasks));
   const activeImportTask = importTask && !importTask.done ? importTask : undefined;
   const importBusy = running || Boolean(activeImportTask);
@@ -88,8 +117,14 @@ export default function ImportPage() {
       if (paths.length === 0 || importBusy) return;
       setError(null);
       setResult(null);
+      if (!(await ensureImportLibraryRoot(setError))) return;
+      const taskId = newImportTaskId();
+      setStartingMessage("正在检查文件与缩略图");
+      setRunning(true);
       try {
-        const scanned = await inspectImport(paths);
+        // 让左侧唯一进度区先绘制“检查中”，避免紧接着的 IPC 启动让反馈挤到首批缩略图之后。
+        await waitForNextFrame();
+        const scanned = await inspectImport(paths, taskId);
         if (scanned.warnings.length > 0) {
           setScanWarnings((prev) => [...new Set([...prev, ...scanned.warnings])]);
         }
@@ -105,6 +140,8 @@ export default function ImportPage() {
         mergePlan(scanned);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRunning(false);
       }
     },
     [importBusy, mergePlan],
@@ -150,6 +187,7 @@ export default function ImportPage() {
 
   const choose = async () => {
     if (importBusy) return;
+    if (!(await ensureImportLibraryRoot(setError))) return;
     const picked = await pickFiles({ multiple: true, filters: FILE_FILTERS });
     if (Array.isArray(picked)) void stage(picked);
     else if (typeof picked === "string") void stage([picked]);
@@ -158,6 +196,7 @@ export default function ImportPage() {
   /** 添加文件夹：目录选择器，同样走 stage(paths) */
   const chooseFolder = async () => {
     if (importBusy) return;
+    if (!(await ensureImportLibraryRoot(setError))) return;
     const picked = await pickDir({ directory: true, multiple: true });
     if (picked && Array.isArray(picked)) void stage(picked);
     else if (typeof picked === "string") void stage([picked]);
@@ -179,16 +218,19 @@ export default function ImportPage() {
   /** 手动确认入库 */
   const run = async () => {
     if (!plan || plan.items.length === 0 || importBusy) return;
+    if (!(await ensureImportLibraryRoot(setError))) return;
     if (plan.items.some((item) => item.previewStatus === "unsupported")) {
       setScanReview(plan);
       return;
     }
     setRunning(true);
+    setStartingMessage("正在准备入库");
     setError(null);
     setResult(null);
     try {
       const r = await importFiles(
         plan.items.map((i) => i.path),
+        newImportTaskId(),
         { collection: collection.trim() || undefined, renamePattern: renamePattern.trim() || undefined },
       );
       setResult(r);
@@ -294,15 +336,39 @@ export default function ImportPage() {
               )}
             </div>
           )}
+          {importBusy && (!plan || plan.items.length === 0) && (
+            <Button
+              className="mb-3 w-full"
+              onClick={() => {
+                markImportCancelling();
+                void cancelImport();
+              }}
+            >
+              取消检查
+            </Button>
+          )}
           <ImportProgressPanel
             task={running && !activeImportTask ? undefined : importTask}
             starting={running && !activeImportTask}
+            startingMessage={startingMessage}
           />
         </div>
       </aside>
 
       {/* 右侧：拖拽区 / 清单 + 失败明细（完成计数只在左侧进度面板展示） */}
       <div className="flex min-w-0 flex-1 flex-col p-6">
+        {(!settingsLoaded || settingsLoadError || !libraryRoot.trim()) && (
+          <div className="mb-3 flex max-w-2xl flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-secondary)]" role="status">
+            <p className="min-w-0 flex-1">
+              {!settingsLoaded ? "正在读取设置，请稍候。" : settingsLoadError ? `设置读取失败：${settingsLoadError}` : "请先在设置中配置并保存总库位置，再选择或导入文件。"}
+            </p>
+            {settingsLoadError ? (
+              <Button onClick={() => void loadSettings()}>重试</Button>
+            ) : !libraryRoot.trim() ? (
+              <Button variant="primary" onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}>前往设置</Button>
+            ) : null}
+          </div>
+        )}
         {/* W5f-f2：导入失败明细 —— 首行摘要 + 可展开全量清单 */}
         {result && result.errors.length > 0 && (
           <div className="mb-3 max-w-lg text-xs text-[var(--color-danger)]">
@@ -359,10 +425,10 @@ export default function ImportPage() {
             )}
           </div>
         )}
-        {error && !running && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
+        {error && !running && !error.startsWith("请先在设置中配置并保存总库位置") && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
 
         {plan?.items.some((item) => item.previewStatus === "limited") && (
-          <div className="mb-3 max-w-3xl rounded-md border border-[var(--color-status)] bg-[var(--color-surface)] px-3 py-2 text-xs text-[var(--color-status)]">
+          <div className="mb-3 w-full min-w-0 rounded-md border border-[var(--color-status)] bg-[var(--color-surface)] px-3 py-2 text-xs text-[var(--color-status)]">
             有 {plan.items.filter((item) => item.previewStatus === "limited").length} 个特殊格式已解析出缩略图，可以导入；但后续高清预览、元数据或 AI 功能可能受限。
           </div>
         )}
@@ -414,17 +480,19 @@ function summarizePlan(items: ImportPlanItem[], warnings: string[] = []): Import
 }
 
 /** 左侧入库进度：阶段、总体百分比、当前文件与真实结果计数都在同一处展示。 */
-function ImportProgressPanel({ task, starting }: { task?: TaskItem; starting: boolean }) {
+function ImportProgressPanel({ task, starting, startingMessage }: { task?: TaskItem; starting: boolean; startingMessage: string }) {
   const detail = task?.importProgress;
   const idle = !task && !starting;
   const indeterminate = starting || Boolean(task && task.overall == null && !task.done);
   const percent = task?.overall == null ? null : Math.round(task.overall * 100);
-  const phase = detail ? importPhaseLabel(detail.phase) : "正在准备入库";
+  const phase = detail ? importPhaseLabel(detail.phase) : startingMessage;
   const phaseText = task?.detail?.startsWith("取消中") ? task.detail : phase;
   const showResults = detail?.phase === "previewing" || detail?.phase === "done";
   const phaseProgress =
     detail?.phase === "scanning"
       ? `已发现 ${detail.phaseCurrent} 项`
+      : detail?.phase === "checking"
+        ? `已检查 ${detail.phaseCurrent}/${detail.phaseTotal ?? "?"} 项`
       : detail?.phaseTotal != null && detail.phaseTotal > 0
         ? `当前阶段 ${detail.phaseCurrent}/${detail.phaseTotal}`
         : null;
@@ -439,7 +507,7 @@ function ImportProgressPanel({ task, starting }: { task?: TaskItem; starting: bo
           {idle ? "等待入库" : indeterminate || percent == null ? "准备中" : `${percent}%`}
         </span>
       </div>
-      <ProgressBar value={task?.overall ?? 0} indeterminate={indeterminate} className="mt-2" />
+      {(!task?.done || percent != null) && <ProgressBar value={task?.overall ?? 0} indeterminate={indeterminate} className="mt-2" />}
       {!idle && (
         <p className={clsx("mt-2 text-xs", hasErrors ? "text-[var(--color-status)]" : "text-[var(--color-text)]")} aria-live="polite">
           {phaseText}

@@ -107,7 +107,7 @@ fn main() {
     let root = PathBuf::from(env_or("QA_ROOT", "F:/testdata"));
     let limit: usize = env_or("QA_LIMIT", "6").parse().unwrap_or(6);
 
-    println!("=== 茶包素材 · 测试素材解码验证 ===");
+    println!("=== 茶馆 · 测试素材解码验证 ===");
     println!("根目录 : {}", root.display());
     println!("每类上限: {limit}\n");
     println!(

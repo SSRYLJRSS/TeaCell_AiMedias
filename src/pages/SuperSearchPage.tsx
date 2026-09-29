@@ -73,6 +73,8 @@ export default function SuperSearchPage() {
   };
   // 兜底：查看器打开期间经标题栏齿轮等跨页离开时，复位全局 viewerOpen，避免 BottomBar 被永久隐藏
   useEffect(() => () => useLibraryStore.getState().setViewerOpen(false), []);
+  // 页面卸载时使在途解析失效，并通知后端停止后续请求/解析。
+  useEffect(() => () => { void useSuperSearchStore.getState().cancelAiSearch(); }, []);
   // U-7③：空结果时列出「把结果砍到 0」的归零条件（C-2 诊断），可单条移除。
   // §3.7 不变式 9：归零条件带 zone + planRevision（两区同下标不混淆；代次过期不渲染删除按钮）
   const [zeroing, setZeroing] = useState<{ zone: "filter" | "mustNot"; path: number[]; label: string }[]>([]);

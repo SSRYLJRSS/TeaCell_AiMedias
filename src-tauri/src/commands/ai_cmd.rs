@@ -88,10 +88,15 @@ pub async fn ai_start_batch(
 ) -> AppResult<AiBatch> {
     let db = std::sync::Arc::clone(&state.db);
     let registry = std::sync::Arc::clone(&state.ai_cancel);
+    let ai_config_guard = std::sync::Arc::clone(&state.ai_config_guard);
     let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     let cancel = Arc::new(AtomicBool::new(false));
 
     tauri::async_runtime::spawn_blocking(move || {
+        // 与设置及分类保存共用配置锁，保证业务说明和分类说明来自同一快照。
+        let config_guard = ai_config_guard
+            .lock()
+            .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
         // Resolve usage metadata under a short DB guard, release it, then read the
         // system keyring before taking any subsequent DB guard.
         let tagging_profile = crate::services::credentials::usage_profile_with_system_credential(
@@ -102,7 +107,7 @@ pub async fn ai_start_batch(
             AppError::msg("尚未绑定打标服务，请先在打标页选择在线或本地模型")
         })?;
         // 预检与配置读取：短锁作用域，读完即放
-        let all = {
+        let (all, facets, facets_video) = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             let batch = ai::get_batch(&conn, batch_id)?;
             // v2.12：仅执行中拒绝；done/cancelled 允许续跑剩余 pending 建议
@@ -122,6 +127,11 @@ pub async fn ai_start_batch(
             let mut s = settings::get_settings(&conn)?;
             // 用已在 DB/keyring 锁外解析出的连接快照；本作用域不做凭据 IO。
             ai_connections::apply_profile(&mut s.ai, tagging_profile.clone());
+            let facets = crate::db::tag_facets::build_prompt_context(&conn, "image")?;
+            let facets_video = crate::db::tag_facets::build_prompt_context(&conn, "video")?;
+            crate::services::ai_cloud::validate_tagging_facet_descriptions(
+                facets.iter().chain(facets_video.iter()),
+            )?;
             let profile_is_local = s
                 .ai
                 .active()
@@ -177,7 +187,7 @@ pub async fn ai_start_batch(
                     }
                 }
             }
-            s
+            (s, facets, facets_video)
         };
         let proxy = all.model_download_proxy.clone();
         let cfg = all.ai;
@@ -188,20 +198,11 @@ pub async fn ai_start_batch(
             // Windows 应用托管的默认 Ollama 允许按需启动；其它本机兼容服务绝不接管。
             ollama_runtime::ensure_ready(&runtime, &proxy)?;
         }
-        // W2-1：提示词上下文直接从 tag_facets 读（V20 合表后不再需要 configs 参数；短锁立即释放）
-        // F4：按媒体类型各取一份 —— 图片批次只带 all+image 分面，视频批次 only all+video，
-        //     「只适用于视频」的分面不再污染图片提示词（mixed 批次两条都传给执行层按条目取）。
-        let (facets, facets_video) = {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            let facets = crate::db::tag_facets::build_prompt_context(&conn, "image")?;
-            let facets_video = crate::db::tag_facets::build_prompt_context(&conn, "video")?;
-            (facets, facets_video)
-        };
         registry
             .lock()
-            .map_err(|_| AppError::msg("锁中毒"))?
+            .map_err(|_| AppError::msg("取消注册表锁中毒"))?
             .insert(batch_id, Arc::clone(&cancel));
-
+        drop(config_guard);
         let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, &facets_video, limit, &cancel, |p: AiProgress| {
             let _ = app.emit("ai://progress", p);
         });

@@ -8,6 +8,9 @@ import SuperSearchPage from "@/pages/SuperSearchPage";
 import AiTaggingPage from "@/pages/AiTaggingPage";
 import SettingsPage from "@/pages/SettingsPage";
 import PageErrorBoundary from "@/components/common/PageErrorBoundary";
+import Modal from "@/components/common/Modal";
+import Button from "@/components/common/Button";
+import { getHelpPageUrl, openHelpPage } from "@/api/settings";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { selectNativeWindowControls, usePlatformStore } from "@/stores/platformStore";
@@ -38,6 +41,13 @@ export default function App() {
   // 进入设置前的页面，供设置页「返回」恢复（PRD v2.4）
   const [prevPage, setPrevPage] = useState<PageKey>("library");
   const [startupTimedOut, setStartupTimedOut] = useState(false);
+  const [showTutorialPrompt, setShowTutorialPrompt] = useState(false);
+  const [tutorialBusy, setTutorialBusy] = useState(false);
+  const [tutorialError, setTutorialError] = useState<string | null>(null);
+  const [tutorialSaveFailed, setTutorialSaveFailed] = useState(false);
+  const [tutorialUrl, setTutorialUrl] = useState("");
+  const [tutorialCopied, setTutorialCopied] = useState(false);
+  const tutorialPromptChecked = useRef(false);
   const pageRef = useRef<PageKey>("library");
   useEffect(() => {
     pageRef.current = page;
@@ -77,7 +87,9 @@ export default function App() {
 
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）
   const settingsLoaded = useSettingsStore((s) => s.loaded);
+  const settings = useSettingsStore((s) => s.settings);
   const loadSettings = useSettingsStore((s) => s.load);
+  const saveSettings = useSettingsStore((s) => s.save);
   const platformStatus = usePlatformStore((s) => s.status);
   const nativeWindowControls = usePlatformStore(selectNativeWindowControls);
   const loadPlatform = usePlatformStore((s) => s.load);
@@ -85,6 +97,62 @@ export default function App() {
     markStartup("react_first_render"); // §4.1：React 首帧打点（首次挂载即首帧）
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
+
+  useEffect(() => {
+    if (!settingsLoaded || !settings || tutorialPromptChecked.current) return;
+    tutorialPromptChecked.current = true;
+    if (settings.tutorialPromptHandled === false) setShowTutorialPrompt(true);
+  }, [settingsLoaded, settings]);
+
+  const finishTutorialPrompt = async () => {
+    const current = useSettingsStore.getState().settings;
+    if (!current) return;
+    setTutorialBusy(true);
+    setTutorialError(null);
+    setTutorialSaveFailed(false);
+    try {
+      await saveSettings({ ...current, tutorialPromptHandled: true });
+      setShowTutorialPrompt(false);
+    } catch (error) {
+      setTutorialError(error instanceof Error ? error.message : String(error));
+      setTutorialSaveFailed(true);
+    } finally {
+      setTutorialBusy(false);
+    }
+  };
+
+  const continueAfterTutorialSaveFailure = () => {
+    setShowTutorialPrompt(false);
+    setTutorialError(null);
+    setTutorialSaveFailed(false);
+  };
+
+  const openTutorial = async () => {
+    setTutorialBusy(true);
+    setTutorialError(null);
+    try {
+      await openHelpPage();
+      await finishTutorialPrompt();
+    } catch (error) {
+      setTutorialError(`无法自动打开新手教程：${error instanceof Error ? error.message : String(error)}`);
+      try {
+        setTutorialUrl(await getHelpPageUrl());
+      } catch {
+        setTutorialError("无法自动打开教程，也无法读取文档地址。请稍后在设置中手动打开使用帮助。");
+      }
+      setTutorialBusy(false);
+    }
+  };
+
+  const copyTutorialUrl = async () => {
+    if (!tutorialUrl) return;
+    try {
+      await navigator.clipboard.writeText(tutorialUrl);
+      setTutorialCopied(true);
+    } catch {
+      setTutorialError("自动复制失败。请选中下方完整地址并复制到浏览器地址栏打开。");
+    }
+  };
 
   // 静态平台能力与设置并行加载；状态订阅也让路径显示等纯 UI 选择器在加载后刷新。
   // 失败时 platformStore 保守禁用平台专属操作，并在界面提供显式重试。
@@ -155,6 +223,55 @@ export default function App() {
       {!viewerOpen && (
         <BottomBar current={page} onNavigate={navigate} onOpenSuperSearch={() => navigate("superSearch")} />
       )}
+
+      <Modal
+        open={showTutorialPrompt}
+        title="使用教程"
+        onClose={() => void finishTutorialPrompt()}
+        footer={
+          <>
+            <Button disabled={tutorialBusy} onClick={() => void finishTutorialPrompt()}>
+              以后再看
+            </Button>
+            {tutorialSaveFailed ? (
+              <Button variant="primary" disabled={tutorialBusy} onClick={continueAfterTutorialSaveFailure}>
+                继续使用
+              </Button>
+            ) : tutorialError ? (
+              <Button variant="primary" disabled={tutorialBusy} onClick={() => void finishTutorialPrompt()}>
+                {tutorialCopied ? "已复制，关闭" : "关闭"}
+              </Button>
+            ) : (
+              <Button variant="primary" disabled={tutorialBusy} onClick={() => void openTutorial()}>
+                {tutorialBusy ? "正在打开…" : "查看新手教程"}
+              </Button>
+            )}
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <p>欢迎使用茶馆，是否查看使用教程？</p>
+          {tutorialError && <p role="alert" className="text-xs text-[var(--color-danger)]">{tutorialError}</p>}
+          {tutorialUrl && (
+            <div className="flex flex-col gap-2">
+              <label htmlFor="tutorial-help-url" className="text-xs text-[var(--color-text-secondary)]">
+                自动打开失败时，可复制此地址到浏览器：
+              </label>
+              <textarea
+                id="tutorial-help-url"
+                readOnly
+                rows={3}
+                value={tutorialUrl}
+                onFocus={(event) => event.currentTarget.select()}
+                className="ui-control w-full resize-y rounded-md px-2 py-1.5 text-xs"
+              />
+              <Button onClick={() => void copyTutorialUrl()}>
+                {tutorialCopied ? "已复制文档地址" : "复制文档地址"}
+              </Button>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   );
 }

@@ -1,5 +1,5 @@
 /** 设置页（指导书 §2.2/§6.1-§6.7）：
- *  左侧分组导航（含 AI 与模型三个子页）+ 右侧分组内容；保存按钮在最后一项之后。
+ *  左侧分组导航（含 AI 与模型三个子页）+ 右侧分组内容；配置项修改后自动保存。
  *  IA：素材库与入库 → AI 与模型（服务管理/超级搜索/自动打标）→ 标签与分类 → 外观与浏览 → 存储与维护 → 诊断与支持 → 关于。
  *  AI 子页内使用「在线服务/本地服务」二选一，只渲染当前模式字段。
  */
@@ -11,7 +11,7 @@ import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { displayBasename } from "@/utils/pathDisplay";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { backupDb, clearThumbnailCache, exportDiagnostics, getDataDir, openDataDir, openHelpPage, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
+import { backupDb, clearThumbnailCache, exportDiagnostics, getAuthorPageUrl, getDataDir, getFeedbackPageUrl, getLicensePageUrl, getProjectPageUrl, openAuthorPage, openDataDir, openFeedbackPage, openHelpPage, openLicensePage, openLogsDir, openProjectPage, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
@@ -23,7 +23,7 @@ import {
   type RefillProgress,
   type PaletteStatus,
 } from "@/api/assets";
-import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/connections";
+import { listAiConnections, getAiUsageBindings, getSuperSearchServiceResolution, setAiUsageBinding, type AiConnection, type SuperSearchServiceResolution } from "@/api/connections";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
@@ -79,14 +79,14 @@ const GROUPS: {
 
 /** 初始分组：素材库与入库（第一项） */
 const DEFAULT_ROUTE: SettingsRoute = "library";
+const SETTINGS_AUTOSAVE_DELAY_MS = 500;
 
 export default function SettingsPage({ onBack }: { onBack?: () => void }) {
-  const { settings, loaded, loading, saving, load, save, loadError } = useSettingsStore(
+  const { settings, loaded, loading, load, save, loadError } = useSettingsStore(
     useShallow((s) => ({
       settings: s.settings,
       loaded: s.loaded,
       loading: s.loading,
-      saving: s.saving,
       load: s.load,
       save: s.save,
       loadError: s.loadError,
@@ -97,9 +97,55 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [dataDir, setDataDir] = useState("");
   const [dataDirError, setDataDirError] = useState(false);
   const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [autosaveStatus, setAutosaveStatus] = useState<"idle" | "pending" | "saving" | "saved" | "error">("idle");
+  const [autosaveError, setAutosaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [failedExternalUrl, setFailedExternalUrl] = useState<string | null>(null);
+  const draftRef = useRef<Settings | null>(null);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autosaveVersionRef = useRef(0);
+  const autosaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const persistAutosaveRef = useRef<(snapshot: Settings, version: number | null) => Promise<void>>(() => Promise.resolve());
+  const mountedRef = useRef(true);
+
+  const persistAutosave = useCallback((snapshot: Settings, version: number | null) => {
+    const operation = autosaveQueueRef.current.catch(() => undefined).then(async () => {
+      // 被更新的草稿取代时，跳过尚未开始的旧版本写入。
+      if (version !== null && version !== autosaveVersionRef.current) return;
+      if (mountedRef.current) {
+        setAutosaveStatus("saving");
+        setAutosaveError(null);
+      }
+      await save(snapshot);
+      if (mountedRef.current && (version === null || version === autosaveVersionRef.current)) {
+        setAutosaveStatus("saved");
+      }
+    }).catch((cause: unknown) => {
+      if (mountedRef.current && (version === null || version === autosaveVersionRef.current)) {
+        setAutosaveStatus("error");
+        setAutosaveError(cause instanceof Error ? cause.message : String(cause));
+      }
+    });
+    autosaveQueueRef.current = operation;
+    return operation;
+  }, [save]);
+  persistAutosaveRef.current = persistAutosave;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (!autosaveTimerRef.current) return;
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+      const pending = draftRef.current;
+      const persisted = useSettingsStore.getState().settings;
+      if (pending && JSON.stringify(pending) !== JSON.stringify(persisted)) {
+        void persistAutosaveRef.current(pending, null);
+      }
+    };
+  }, []);
 
   // A3：安装包缓存（「存储与维护」分组展示占用/清理）
   const [installerInfo, setInstallerInfo] = useState<{ path: string; size: number } | null>(null);
@@ -329,7 +375,13 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   }, [loaded, load]);
 
   useEffect(() => {
-    if (settings && !draft) setDraft(structuredClone(settings));
+    if (settings && !draft) {
+      const initial = structuredClone(settings);
+      const preview = useSettingsStore.getState().previewAppearance;
+      if (preview) initial.appearance = structuredClone(preview);
+      draftRef.current = initial;
+      setDraft(initial);
+    }
   }, [settings, draft]);
 
   useEffect(() => {
@@ -403,10 +455,20 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   }
 
   const dirty = (next: Settings) => {
+    const current = draftRef.current ?? draft;
+    if (JSON.stringify(current) === JSON.stringify(next)) return;
+    draftRef.current = next;
     setDraft(next);
-    setSaved(false);
+    setAutosaveStatus("pending");
+    setAutosaveError(null);
+    const version = ++autosaveVersionRef.current;
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = setTimeout(() => {
+      autosaveTimerRef.current = null;
+      const latest = draftRef.current;
+      if (latest) void persistAutosaveRef.current(latest, version);
+    }, SETTINGS_AUTOSAVE_DELAY_MS);
   };
-  const isDirty = !!settings && JSON.stringify(draft) !== JSON.stringify(settings);
   const patchAi = (patch: Partial<Settings["ai"]>) => dirty({ ...draft, ai: { ...draft.ai, ...patch } });
 
   // W3：aiFacetConfigs 草稿路径已删（V20 合表后分面语义在 tag_facets.input_mode，
@@ -415,7 +477,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   // FB2-01/02（§8.4）：素材框外观 —— draft.appearance 兜底默认；改动同时写 draft 与 previewAppearance（即时预览）
   const draftAppearance = draft.appearance ?? DEFAULT_APPEARANCE;
   const pushPreview = (appearance: Settings["appearance"]) => {
-    useSettingsStore.getState().commitAppearanceDebounced(appearance);
+    useSettingsStore.getState().setPreviewAppearance(appearance);
   };
   const patchGrid = (grid: Settings["appearance"]["grid"]) => {
     const next: Settings = { ...draft, appearance: { ...draftAppearance, grid } };
@@ -443,16 +505,6 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     try {
       await clearThumbnailCache("hd");
       setNotice("高清缩略图缓存已清除");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const onSave = async () => {
-    setError(null);
-    try {
-      await save(draft);
-      setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -487,6 +539,19 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       await openHelpPage();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onOpenExternalPage = async (open: () => Promise<void>, getUrl: () => Promise<string>) => {
+    setFailedExternalUrl(null);
+    try {
+      await open();
+    } catch {
+      try {
+        setFailedExternalUrl(await getUrl());
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     }
   };
 
@@ -549,6 +614,18 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       {/* 右侧分组内容（§13 FB-07：取消 max-w-xl 小框，宽屏充分利用） */}
       <div className="relative min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-[1040px] flex-col gap-6 px-6 py-6">
+          {route !== "about" && (
+            <div className="flex min-h-4 justify-end text-xs text-[var(--color-text-secondary)]" role="status" aria-live="polite">
+              {autosaveStatus === "pending" && "更改将在短暂间隔后自动保存…"}
+              {autosaveStatus === "saving" && "正在自动保存…"}
+              {autosaveStatus === "saved" && "已自动保存"}
+              {autosaveStatus === "error" && (
+                <span className="text-[var(--color-danger)]">自动保存失败：{autosaveError}。修改设置后会重试。</span>
+              )}
+            </div>
+          )}
+          {notice && <p className="text-xs text-[var(--color-text-secondary)]" role="status">{notice}</p>}
+          {error && <p className="text-xs text-[var(--color-danger)]" role="alert">{error}</p>}
           {route === "library" && (
             <>
             <PageHeader title="素材库与入库" description="设置总库位置，以及 RAW/JPG 等同源文件的显示和打标行为。" />
@@ -633,7 +710,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               <PageHeader title="标签与分类" description="管理 AI 自动打标、手工填写和已停用的分类；分类行内可直接进入编辑或词条设置。" />
               {/* §9.2/§9.5：分面结构 + AI 行为 + 分类词条在同一个分面详情内完成；
                    说明标题置于容器外，描边容器只承载可编辑的分类行。 */}
-              <FacetManagePanel draft={draft} onPatchAi={patchAi} />
+              <FacetManagePanel />
             </div>
           )}
 
@@ -641,7 +718,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
             <>
               <PageHeader title="外观与浏览" description="调整主题、素材框、悬停预览和主色色条的显示方式。" />
               <Group title="基础外观">
-              <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览，保存后记住">
+              <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览并自动保存">
                 <select
                   value={draft.theme}
                   onChange={(e) => {
@@ -662,7 +739,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
             <Group title="素材框">
               <Field label="统一比例" hint="素材库与导入页使用相同的缩略图比例。">
                 <select
-                  value={draft.appearance?.grid.cellAspect ?? "1:1"}
+                  value={draft.appearance?.grid.cellAspect ?? "4:3"}
                   onChange={(e) => {
                     const next: Settings = {
                       ...draft,
@@ -763,12 +840,17 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
             {/* FB2-08（§14.11）+ FB3-10（§12.2）+ FB4-03（§4.5）：算法主色色条设置。
                 总开关关闭时位置/样式行不渲染；状态行（色条数据）即使总开关关闭也显示。 */}
             <Group title="主色色条">
-              <Field label="显示算法主色色条" hint="从图片或视频封面中提取几种主要颜色，仅在本机计算，不调用 AI">
+              <Field label="显示主色色条" hint="只控制色条展示，不影响色板数据、色板计算或颜色搜索；关闭后仍保留数据与各位置设置。">
                 <Toggle
                   checked={draftAppearance.colorStrip.enabled}
                   onChange={(v) => patchColorStrip({ enabled: v })}
                 />
               </Field>
+              {draftAppearance.colorStrip.enabled &&
+                !draftAppearance.colorStrip.showInLibraryGrid &&
+                !draftAppearance.colorStrip.showInViewer && (
+                  <p className="px-4 text-xs text-[var(--color-text-secondary)]">已开启色条，但尚未选择显示位置。</p>
+                )}
               {/* FB4-03：色板状态行 + 生成缺失色条（不随总开关隐藏；让用户先知道库里是否有可用色板） */}
               <Field label="色条数据" hint="只处理尚未生成或数据损坏的素材，不重复计算已有有效色板">
                 <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -836,7 +918,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   </button>
                   {showColorDetails && (
                     <div className="mt-1 flex flex-col gap-1">
-                <Field label="素材库卡片显示" hint="在素材缩略图卡片底部显示色条">
+                <Field label="素材库卡片显示" hint="仅控制素材卡片上的显示位置，受上方总开关控制。">
                     <Toggle
                       checked={draftAppearance.colorStrip.showInLibraryGrid}
                       onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
@@ -1125,15 +1207,30 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
 
           {route === "about" && (
             <>
-            <PageHeader title="关于" description="查看当前版本与许可证信息。" />
+            <PageHeader title="关于" description="查看应用信息、项目地址与作者主页。" />
             <Group title="应用信息">
-              <Field label="版本" hint="茶包素材 BagerTea AiMdeias V2 · 本地素材库">
-                <span className="text-sm text-[var(--color-text-secondary)]">v1.0.1（演示构建）</span>
+              <Field label="茶馆AI素材管理" hint="本地图片与视频素材管理">
+                <span className="text-sm text-[var(--color-text-secondary)]">V1.0公测版</span>
               </Field>
-              <Field label="许可证" hint="本软件使用的开源组件许可证信息。">
-                <span className="text-xs text-[var(--color-text-secondary)]">本地私有工具 · 部分组件 Apache-2.0 / MIT</span>
+              <Field label="项目地址" hint="查看源代码、版本与项目说明。">
+                <Button onClick={() => void onOpenExternalPage(openProjectPage, getProjectPageUrl)}>
+                  GitHub · SSRYLJRSS/BagerTea_AiMdeias
+                </Button>
+              </Field>
+              <Field label="关于作者" hint="打开作者的小红书主页。">
+                <Button onClick={() => void onOpenExternalPage(openAuthorPage, getAuthorPageUrl)}>
+                  小红书主页
+                </Button>
+              </Field>
+              <Field label="许可证" hint="本项目按仓库根目录的许可证文件发布。">
+                <Button onClick={() => void onOpenExternalPage(openLicensePage, getLicensePageUrl)}>MIT License</Button>
               </Field>
             </Group>
+            {failedExternalUrl && (
+              <p className="select-all break-all px-4 pb-3 text-xs text-[var(--color-text-secondary)]" role="status">
+                浏览器未能打开，请复制此地址后手动访问：{failedExternalUrl}
+              </p>
+            )}
             </>
           )}
 
@@ -1175,24 +1272,19 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 <Button onClick={() => void onOpenHelp()}>打开使用帮助</Button>
               </Field>
               <Field label="反馈" hint="提交功能建议或问题反馈">
-                <span className="text-xs text-[var(--color-text-secondary)]">请通过素材库中的反馈入口提交</span>
+                <Button onClick={() => void onOpenExternalPage(openFeedbackPage, getFeedbackPageUrl)}>
+                  在 GitHub 提交问题
+                </Button>
               </Field>
+              {failedExternalUrl && (
+                <p className="select-all break-all px-4 pb-3 text-xs text-[var(--color-text-secondary)]" role="status">
+                  浏览器未能打开，请复制此地址后手动访问：{failedExternalUrl}
+                </p>
+              )}
             </Group>
             </>
           )}
 
-          {/* 保存按钮统一在最后一项设置之后（sticky 底部，§13 保存栏清晰状态） */}
-          <div className="sticky bottom-0 -mx-6 -mb-6 flex flex-wrap items-center gap-3 border-t border-[var(--color-border)] bg-[var(--color-bg)]/95 px-6 py-3 backdrop-blur">
-            <Button variant="primary" disabled={saving || !isDirty || !!loadError} onClick={onSave}>
-              {saving ? "保存中…" : "保存设置"}
-            </Button>
-            {isDirty && !saved && (
-              <span className="text-xs font-medium text-[var(--color-danger)]">有未保存的更改</span>
-            )}
-            {saved && !isDirty && <span className="text-xs text-[var(--color-text-secondary)]">已保存</span>}
-            {notice && <span className="text-xs text-[var(--color-text-secondary)]">{notice}</span>}
-            {error && <span className="text-xs text-[var(--color-danger)]">{error}</span>}
-          </div>
         </div>
       </div>
     </div>
@@ -1221,7 +1313,7 @@ function AiPurposePanel({
       <div className="px-4 py-3">
         <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
           {isSuperSearch
-            ? "通过所选服务理解搜索意图并匹配素材；使用在线服务时，素材会发送给服务提供方。"
+            ? "默认自动选择已配置的在线 AI 服务；也可在下方手动指定服务。使用在线服务时，搜索内容会发送给服务提供方。"
             : "通过所选服务分析素材并建议标签；使用在线服务时，素材会发送给服务提供方。"}
         </p>
       </div>
@@ -1229,6 +1321,7 @@ function AiPurposePanel({
       {/* §8.2 此功能使用的服务：与另一功能可共用或独立选择；修改一个不影响另一个 */}
       <UsageBindingLine
         usage={usage === "ai.superSearch" ? "super_search" : "tagging"}
+        defaultProfile={draft.ai.profiles.find((profile) => profile.id === draft.ai.activeProfile)}
         notify={notify}
         fail={fail}
       />
@@ -1739,28 +1832,36 @@ function ResetDataPanel({
 }
 
 /** §6.2 用途绑定行：该用途当前绑定哪个连接档案；独立下拉，修改不影响另一用途。
- *  连接档案保存在 ai_connections 表（API Key 走系统凭据）；无绑定 = 回退默认档案。 */
+ *  连接档案保存在 ai_connections 表（API Key 走系统凭据）；超级搜索无绑定时自动选择在线服务。 */
 function UsageBindingLine({
   usage,
+  defaultProfile,
   notify,
   fail,
 }: {
   usage: "super_search" | "tagging";
+  defaultProfile?: { name: string; model: string };
   notify: (m: string) => void;
   fail: (m: string) => void;
 }) {
-  const [connections, setConnections] = useState<{ id: string; name: string; hasKey: boolean }[]>([]);
+  const [connections, setConnections] = useState<AiConnection[]>([]);
   const [binding, setBinding] = useState<string | null>(null);
+  const [superSearchResolution, setSuperSearchResolution] = useState<SuperSearchServiceResolution | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     let active = true;
-    Promise.all([listAiConnections(), getAiUsageBindings()])
-      .then(([conns, binds]) => {
+    Promise.all([
+      listAiConnections(),
+      getAiUsageBindings(),
+      usage === "super_search" ? getSuperSearchServiceResolution() : Promise.resolve(null),
+    ])
+      .then(([conns, binds, resolution]) => {
         if (!active) return;
         setConnections(conns);
         setBinding(binds[usage] ?? null);
+        setSuperSearchResolution(resolution);
       })
       .catch(() => {
         /* 非 Tauri / 表未存在：静默降级为「跟随默认档案」 */
@@ -1777,7 +1878,10 @@ function UsageBindingLine({
     try {
       await setAiUsageBinding(usage, next);
       setBinding(next);
-      notify(next ? "已选择此服务" : "已回退到跟随默认服务");
+      if (usage === "super_search") {
+        setSuperSearchResolution(await getSuperSearchServiceResolution());
+      }
+      notify(next ? "已选择此服务" : usage === "super_search" ? "已恢复自动选择在线服务" : "已回退到跟随默认服务");
     } catch (e) {
       fail(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1786,10 +1890,29 @@ function UsageBindingLine({
   };
 
   if (!loaded) return null;
+  const selectedConnection = connections.find((connection) => connection.id === binding);
+  const effectiveService = usage === "super_search"
+    ? superSearchResolution?.ready
+      ? `${superSearchResolution.name} · ${superSearchResolution.model}（${superSearchResolution.deployment === "cloud" ? "在线" : "本地"}）`
+      : superSearchResolution?.message ?? "正在读取服务状态…"
+    : binding
+      ? selectedConnection
+        ? `${selectedConnection.name} · ${selectedConnection.model}`
+        : "已绑定服务不可用"
+      : defaultProfile
+        ? `${defaultProfile.name} · ${defaultProfile.model}`
+        : "尚未配置默认服务";
+  const serviceHint = usage === "super_search"
+    ? binding
+      ? `当前实际使用：${effectiveService}。绑定只影响此功能。`
+      : `未手动绑定；${superSearchResolution?.ready ? `自动选择在线服务，当前使用：${effectiveService}。` : effectiveService}`
+    : binding
+      ? `当前实际使用：${effectiveService}。绑定只影响此功能。`
+      : `当前实际使用默认服务：${effectiveService}。你可以为此功能单独选择服务。`;
   return (
     <Field
       label="此功能使用的服务"
-      hint="选择后该功能使用此服务；选择「跟随默认服务」则与另一功能共用默认配置"
+      hint={serviceHint}
     >
       <select
         value={binding ?? ""}
@@ -1797,10 +1920,14 @@ function UsageBindingLine({
         onChange={(e) => void onSelect(e.target.value)}
         className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
       >
-        <option value="">跟随默认服务</option>
+        <option value="">
+          {usage === "super_search"
+            ? "自动选择在线服务"
+            : `跟随默认服务（${defaultProfile ? `${defaultProfile.name} · ${defaultProfile.model}` : "未配置"}）`}
+        </option>
         {connections.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name}{c.hasKey ? "（已配置密钥）" : "（未配置密钥）"}
+          <option key={c.id} value={c.id} disabled={!c.enabled}>
+            {c.name} · {c.model}（{c.deployment === "cloud" ? "在线" : "本地"}{c.enabled ? "" : "，已停用"}{c.hasKey ? "，已配置密钥" : "，未配置密钥"}）
           </option>
         ))}
       </select>

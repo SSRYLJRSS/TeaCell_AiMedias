@@ -1,4 +1,4 @@
-# 茶包素材 BagerTea AiMedias
+# 茶馆AI素材管理
 
 本地优先的图片与视频素材管理桌面应用。项目使用 Tauri 2、Rust、SQLite FTS5、React 19、TypeScript、Zustand 和 Tailwind CSS v4。
 

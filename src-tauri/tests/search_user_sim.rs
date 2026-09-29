@@ -45,6 +45,14 @@ fn set_size(conn: &Connection, id: i64, size: i64) {
     .unwrap();
 }
 
+fn set_hue(conn: &Connection, id: i64, hue: i64) {
+    conn.execute(
+        "UPDATE assets SET dominant_hue = ?1 WHERE id = ?2",
+        params![hue, id],
+    )
+    .unwrap();
+}
+
 fn tag_in(conn: &Connection, facet: &str, name: &str) -> i64 {
     tags::create_in_facet(conn, name, None, Some(facet))
         .expect("建标签失败")
@@ -294,6 +302,101 @@ fn sim_relevance_pagination_reports_real_total() {
     );
 }
 
+/// 固定模型 JSON + 合成库验证 D2 用户句的硬条件、偏好排序和排除语义，
+/// 并确认列表、总数、全选 ID 与逐条件诊断共用同一 SearchPlan。
+#[test]
+fn sim_ai_preferred_and_exclusion_semantics_share_one_plan() {
+    let c = setup();
+    let people_single = tag_in(&c, "people", "单人");
+    let people_female = tag_in(&c, "people", "女性");
+    let people_male = tag_in(&c, "people", "男性");
+    let streetlight = tag_in(&c, "scene", "路灯");
+    let preferred_a = add(&c, "A-green-female.jpg");
+    assign(&c, preferred_a, people_single);
+    assign(&c, preferred_a, people_female);
+    assign(&c, preferred_a, streetlight);
+    set_hue(&c, preferred_a, 100);
+
+    let required_b = add(&c, "B-other-color-female.jpg");
+    assign(&c, required_b, people_single);
+    assign(&c, required_b, people_female);
+    assign(&c, required_b, streetlight);
+    set_hue(&c, required_b, 210);
+
+    let excluded_c = add(&c, "C-male.jpg");
+    assign(&c, excluded_c, people_single);
+    assign(&c, excluded_c, people_male);
+    assign(&c, excluded_c, streetlight);
+    set_hue(&c, excluded_c, 100);
+
+    let missing_required_d = add(&c, "D-no-streetlight.jpg");
+    assign(&c, missing_required_d, people_single);
+    assign(&c, missing_required_d, people_female);
+
+    let unknown_gender_e = add(&c, "E-unmarked-person.jpg");
+    assign(&c, unknown_gender_e, streetlight);
+    set_hue(&c, unknown_gender_e, 100);
+
+    let query = "单人女性，背景有路灯，不要男性，最好主要是绿色";
+    let model_json = r#"{
+      "groups": [{
+        "assetType": "all",
+        "concepts": [
+          {"text":"单人","role":"people","facetHint":"people","confidence":0.99},
+          {"text":"女性","role":"people","facetHint":"people","confidence":0.99},
+          {"text":"路灯","role":"scene","facetHint":"scene","confidence":0.99}
+        ],
+        "textTerms": [], "metadata": [], "preferredMetadata": [{"key":"dominant_hue","op":"between","value":null,"values":null,"min":70,"max":155,"evidence":"最好主要是绿色","weight":1.0}], "untaggedOnly": false,
+        "preferred": []
+      }],
+      "exclusions": [{"text":"男性","role":"people","facetHint":"people","confidence":0.99}],
+      "sortBy": null, "sortDir": null
+    }"#;
+    let facets = db::tag_facets::build_prompt_context(&c, "all").unwrap();
+    let (intent, parse_warnings) = ai::degrade_parse_v3(model_json, query, &facets);
+    assert!(
+        !ai::is_keyword_fallback_v3(&intent, query),
+        "模型 fixture 不应退化为全文关键词：{parse_warnings:?}"
+    );
+    assert!(
+        parse_warnings.is_empty(),
+        "固定模型 fixture 应完整通过协议守卫：{parse_warnings:?}"
+    );
+    let (plan, _, build_warnings) = ai::build_plan_from_v3(&c, &intent).unwrap();
+    assert!(
+        build_warnings.is_empty(),
+        "所有测试标签均存在：{build_warnings:?}"
+    );
+    assert!(plan.filter.is_some(), "单人、女性和路灯必须进入 filter");
+    assert!(
+        plan.must_not.is_some(),
+        "男性须以正向条件进入 mustNot，由计划层取反"
+    );
+    assert_eq!(plan.should.len(), 1, "绿色只作为偏好，不得成为硬筛选");
+
+    let page = search_plan::run_plan_page(&c, &plan, 0, Some(20)).unwrap();
+    let selected = search_plan::run_plan_ids(&c, &plan).unwrap();
+    let diagnostics = search_plan::diagnose_search_plan(&c, &plan, 41).unwrap();
+    let ids: Vec<i64> = page.items.iter().map(|asset| asset.id).collect();
+    assert_eq!(ids, vec![preferred_a, required_b]);
+    assert_eq!(page.total, 2);
+    assert_eq!(selected.ids, ids, "全选顺序与列表一致");
+    assert_eq!(selected.total, page.total);
+    assert_eq!(diagnostics.should[0].total_count, page.total);
+    assert_eq!(diagnostics.should[0].hit_count, 1);
+    assert_eq!(
+        diagnostics
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.zone == "mustNot")
+            .count(),
+        1
+    );
+    assert!(!ids.contains(&excluded_c));
+    assert!(!ids.contains(&missing_required_d));
+    assert!(!ids.contains(&unknown_gender_e));
+}
+
 // ═══════════════ ⑤ 诊断：归零条件必须能被识别（前端 zeroing 的数据前提） ═══════════════
 
 /// 用户视角：搜出 0 结果时，页面应列出「把结果砍到 0」的条件（zeroingActions）。
@@ -412,6 +515,7 @@ fn intent_v3(
             concepts,
             text_terms: vec![],
             metadata: vec![],
+            preferred_metadata: vec![],
             untagged_only: false,
             preferred,
         }],

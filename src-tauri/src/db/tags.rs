@@ -532,15 +532,6 @@ fn ensure_named_tag(
     Ok(create_in_facet(conn, name, parent_id, Some(facet_key))?.id)
 }
 
-fn core_other_parent(conn: &Connection, facet_key: &str) -> AppResult<i64> {
-    let parent_id = ensure_named_tag(conn, facet_key, None, "其他")?;
-    conn.execute(
-        "UPDATE tags SET is_system = 1, is_preset = 1 WHERE id = ?1",
-        [parent_id],
-    )?;
-    Ok(parent_id)
-}
-
 fn seed_core_taxonomy_inner(conn: &Connection) -> AppResult<()> {
     for (group_index, (facet_key, group_name, leaves)) in CORE_TAXONOMY.iter().enumerate() {
         let parent_id = ensure_named_tag(conn, facet_key, None, group_name)?;
@@ -619,7 +610,7 @@ pub fn seed_core_taxonomy_if_empty(conn: &Connection) -> AppResult<()> {
 }
 
 /// 新协议使用的规范标签创建：分面是独立实体，标签直接归属分面。
-/// 核心分面的新词优先落到「其他」父类；普通/自建分面保持根级创建。
+/// 对核心分面先按现有词条和别名查重；新词在分面根级创建，不隐式归入「其他」。
 /// F3-a/F5：查重已收口在 create_in_facet（find_by_term mode=Alias）。
 pub fn find_or_create_canonical(conn: &Connection, facet_key: &str, name: &str) -> AppResult<i64> {
     let normalized = normalize_name(name);
@@ -633,8 +624,6 @@ pub fn find_or_create_canonical(conn: &Connection, facet_key: &str, name: &str) 
                 return Ok(hit.tag_id);
             }
         }
-        let parent_id = core_other_parent(conn, facet_key)?;
-        return find_or_create_child(conn, parent_id, name);
     }
     Ok(create_in_facet(conn, name, None, Some(facet_key))?.id)
 }
@@ -2386,5 +2375,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(alias_count, 2);
+    }
+
+    #[test]
+    fn accepted_new_core_facet_tag_is_not_forced_under_other() {
+        let c = terms_db();
+        let tag_id = find_or_create_canonical(&c, "subject", "用户确认的新术语").unwrap();
+        let (facet_key, parent_id): (String, Option<i64>) = c
+            .query_row(
+                "SELECT facet_key, parent_id FROM tags WHERE id = ?1",
+                [tag_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(facet_key, "subject");
+        assert_eq!(parent_id, None, "新词不得由系统按固定规则塞入「其他」");
     }
 }

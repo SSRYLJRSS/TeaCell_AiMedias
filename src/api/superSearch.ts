@@ -1,9 +1,19 @@
 /** 素材相关命令封装（commands/assets_cmd.rs）→ 超级搜索查询（P4 表达式构建器） */
-import { invoke } from "./client";
+import { invoke, on } from "./client";
 import { listAssets, listAssetIds } from "./assets";
 import type { AssetFilter, AssetPage, ResolvedSearchQuery } from "@/types/asset";
 import type { QueryExpr } from "@/types/queryExpr";
 import type { AiSearchParseResult, PlanAssetPage, PlanDiagnostics, PlanIdsResult, SearchPlanV3, SearchWarning } from "@/types/superSearch";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+
+export type AiSearchPhase = "queued" | "requesting" | "validating" | "completed" | "failed" | "cancelled" | "cancelling";
+
+export interface AiSearchProgress {
+  requestId: string;
+  phase: AiSearchPhase;
+  elapsedMs: number;
+  errorCode: string | null;
+}
 
 /** 列表页结果：plan 路径 warnings 为 SearchWarning[]，无 plan 旧链路为 string[]（store 归一化）。 */
 export type SuperListPage = Omit<AssetPage, "warnings"> & { warnings?: (string | SearchWarning)[] };
@@ -56,10 +66,18 @@ export function listSuperAssetIds(q: ResolvedSearchQuery, expr?: QueryExpr): Pro
   return listAssetIds(queryToFilter(q, 0, undefined, expr));
 }
 
-/** FB5-05（§9.5）：AI 自然语言 → SearchIntentV2 + 后端生成的 QueryExpr（唯一执行事实源）。
+/** FB5-05（§9.5）：AI 自然语言 → SearchIntentV3 + 后端生成的 QueryExpr（唯一执行事实源）。
  *  已删除未使用的 currentQuery 参数——append 由前端明确合并 expr。 */
-export function aiParseSearchQuery(text: string): Promise<AiSearchParseResult> {
-  return invoke<AiSearchParseResult>("ai_parse_search_query", { text });
+export function aiParseSearchQuery(text: string, requestId: string): Promise<AiSearchParseResult> {
+  return invoke<AiSearchParseResult>("ai_parse_search_query", { text, requestId });
+}
+
+export function cancelAiSearch(requestId: string): Promise<void> {
+  return invoke<void>("cancel_ai_search", { requestId });
+}
+
+export function onAiSearchProgress(handler: (progress: AiSearchProgress) => void): Promise<UnlistenFn> {
+  return on<AiSearchProgress>("super-search://progress", handler);
 }
 
 /** C-2/U-6/§4.5：对 SearchPlanV3 做 AST 命中诊断（validate → prune 后）。

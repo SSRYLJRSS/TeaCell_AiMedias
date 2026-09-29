@@ -7,6 +7,14 @@ use crate::error::{AppError, AppResult};
 use crate::services::backup_restore;
 use crate::state::AppState;
 
+const HELP_PAGE_URL: &str =
+    "https://my.feishu.cn/wiki/RGLmw1ExbiNcVvkk240cXJxjnmf?from=from_copylink";
+const AGNES_API_KEY_DOCS_URL: &str = "https://platform.agnes-ai.com/";
+const PROJECT_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias";
+const FEEDBACK_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias/issues/new";
+const LICENSE_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias/blob/main/LICENSE";
+const AUTHOR_URL: &str = "https://www.xiaohongshu.com/user/profile/68294317000000000e01ca6d";
+
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> AppResult<Settings> {
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -15,7 +23,29 @@ pub fn get_settings(state: State<AppState>) -> AppResult<Settings> {
 
 #[tauri::command]
 pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
+    let _config_guard = state
+        .ai_config_guard
+        .lock()
+        .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+    let has_running_ai_batch = !state
+        .ai_cancel
+        .lock()
+        .map_err(|_| AppError::msg("AI 任务锁中毒"))?
+        .is_empty();
+    if has_running_ai_batch {
+        let current = settings::get_settings(&conn)?;
+        let prompt_changed =
+            s.ai.confidence_min_suggest.to_bits() != current.ai.confidence_min_suggest.to_bits();
+        let video_config_changed = s.ai.video_tagging != current.ai.video_tagging
+            || s.ai.video_tagging_mode != current.ai.video_tagging_mode
+            || s.ai.video_frame_count != current.ai.video_frame_count;
+        if prompt_changed || video_config_changed {
+            return Err(AppError::conflict(
+                "AI 打标任务运行期间不能修改置信度或视频打标配置，请等待任务结束后重试。",
+            ));
+        }
+    }
     settings::save_settings(&conn, &s)?;
     drop(conn);
     if let Err(e) = crate::observability::set_log_level(&s.log_level) {
@@ -57,11 +87,78 @@ pub fn open_logs_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult
 pub fn open_help_page(app: tauri::AppHandle) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
     app.opener()
-        .open_url(
-            "https://my.feishu.cn/wiki/RGLmw1ExbiNcVvkk240cXJxjnmf?from=from_copylink",
-            None::<&str>,
-        )
+        .open_url(HELP_PAGE_URL, None::<&str>)
         .map_err(|e| AppError::msg(format!("打开使用帮助失败: {e}")))
+}
+
+/// 返回与系统默认浏览器打开动作相同的使用帮助地址，供失败时手动复制。
+#[tauri::command]
+pub fn get_help_page_url() -> String {
+    HELP_PAGE_URL.to_string()
+}
+
+/// 打开固定的公开项目主页。
+#[tauri::command]
+pub fn open_project_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(PROJECT_URL, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开项目主页失败: {e}")))
+}
+
+#[tauri::command]
+pub fn get_project_page_url() -> String {
+    PROJECT_URL.to_string()
+}
+
+#[tauri::command]
+pub fn open_license_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(LICENSE_URL, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开许可证页面失败: {e}")))
+}
+
+#[tauri::command]
+pub fn get_license_page_url() -> String {
+    LICENSE_URL.to_string()
+}
+
+/// 打开作者的小红书主页（使用稳定主页地址，不带分享令牌）。
+#[tauri::command]
+pub fn open_author_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(AUTHOR_URL, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开作者主页失败: {e}")))
+}
+
+#[tauri::command]
+pub fn get_author_page_url() -> String {
+    AUTHOR_URL.to_string()
+}
+
+/// 打开固定的 GitHub 新建问题页面。
+#[tauri::command]
+pub fn open_feedback_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(FEEDBACK_URL, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开反馈页面失败: {e}")))
+}
+
+#[tauri::command]
+pub fn get_feedback_page_url() -> String {
+    FEEDBACK_URL.to_string()
+}
+
+/// 在系统默认浏览器打开 Agnes 官方 API Key 申请与接入说明。
+#[tauri::command]
+pub fn open_agnes_api_key_docs(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(AGNES_API_KEY_DOCS_URL, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开 Agnes API Key 说明失败: {e}")))
 }
 
 /// 分类重置应用数据（设置页「存储与维护 → 重置数据」勾选传入）。

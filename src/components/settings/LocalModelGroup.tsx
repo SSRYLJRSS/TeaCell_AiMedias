@@ -1,7 +1,7 @@
 /** 设置页「本地模型」向导卡片（方案 A3 + 改造方案：下载源自选 + 延迟检测）：
- * 小白动线全程两个按钮；写配置只改 draft（单一数据源，保存设置才落库，与 A2 约定一致）。
+ * 小白动线全程两个按钮；配置写入设置草稿后由设置页统一自动保存。
  * 改造点：阶段1 增加「下载源下拉 + 测速 + 自定义源表单」，进度 label 取实际源；
- * 自定义源即时落库（后端直接写 settings），此处同步回填 draft 防「保存设置」回滚。 */
+ * 自定义源即时落库（后端直接写 settings），此处同步回填草稿防自动保存回滚。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Button from "@/components/common/Button";
 import ProgressBar from "@/components/common/ProgressBar";
@@ -65,7 +65,7 @@ const CANDIDATE_MIRRORS: { label: string; url: string }[] = [
 interface Props {
     draft: Settings;
     onPatchAi: (patch: Partial<Settings["ai"]>) => void;
-    /** 顶层设置补丁（改造方案：自定义源即时落库后回填 draft，防止保存回滚） */
+    /** 顶层设置补丁（自定义源即时落库后回填草稿，防止自动保存回滚） */
     onPatchSettings: (patch: Partial<Settings>) => void;
     /** 将向导选中的模型同步到实际 AI 连接；批次执行不读取 settings.ai.profiles。 */
     onModelSelected?: (model: string) => Promise<void>;
@@ -248,7 +248,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, onM
 
     const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-    // ---- 源选择：选中即写 draft（保存设置才落库）；下载中禁用 ----
+    // ---- 源选择：选中即写 draft，设置页自动保存；下载中禁用 ----
     const pickSource = (id: string) => {
         setSourceId(id);
         onPatchAi({ ollamaSourceId: id });
@@ -290,7 +290,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, onM
         try {
             const src = await ollamaAddCustomSource(label, url);
             setSources((prev) => [...prev, src]);
-            // 回填 draft（后端已即时落库；不更新 draft 则「保存设置」会用旧 draft 覆盖掉新源）
+            // 回填 draft（后端已即时落库；不更新草稿则自动保存会用旧值覆盖新源）
             onPatchSettings({ customDownloadSources: [...(draft.customDownloadSources ?? []), toCustom(src)] });
             setSourceId(src.id);
             onPatchAi({ ollamaSourceId: src.id });
@@ -371,7 +371,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, onM
         }
     };
 
-    /** 确保存在本地档案并写入模型、置为激活（只改 draft，保存设置才生效） */
+    /** 确保存在本地档案并写入模型、置为激活（改草稿后由设置页自动保存） */
     const ensureLocalProfile = (model: string) => {
         const existing = draft.ai.profiles.find((p) => p.kind === "local");
         if (existing) {
@@ -804,7 +804,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, onM
             </div>
 
             <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-                模型文件约 1.0–6.6GB（取决于模型规格），默认保存在用户目录的 .ollama 文件夹。可在上方「已安装模型」中删除不需要的模型以释放磁盘空间。下载较慢时，可配置下方代理，或使用离线导入。修改后需点击页面底部「保存设置」生效。
+                模型文件约 1.0–6.6GB（取决于模型规格），默认保存在用户目录的 .ollama 文件夹。可在上方「已安装模型」中删除不需要的模型以释放磁盘空间。下载较慢时，可配置下方代理，或使用离线导入。设置项修改后会自动保存。
             </p>
 
             {/* 模型下载代理（加速项 A：拉起 serve 时注入 HTTPS_PROXY） */}

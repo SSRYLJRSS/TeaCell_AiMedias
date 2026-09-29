@@ -51,6 +51,7 @@ const emptyStore = {
   loading: false,
   loadError: null,
   saving: false,
+  previewAppearance: null,
 };
 
 beforeEach(() => {
@@ -136,6 +137,22 @@ describe("settingsStore save 回读对账（FB-03 §9.5）", () => {
     // 以回读（DB 事实源）为准
     expect(useSettingsStore.getState().settings?.ai.videoTagging).toBe(true);
     expect(useSettingsStore.getState().saving).toBe(false);
+  });
+
+  it("自动保存合入待持久化外观预览，并在写入完成后清除临时预览", async () => {
+    const base = mkSettings();
+    const preview = structuredClone(base.appearance);
+    preview.grid.cellAspect = "4:3";
+    useSettingsStore.setState({ settings: base, loaded: true, previewAppearance: preview });
+    vi.mocked(getSettings).mockResolvedValue({ ...base, logLevel: "debug", appearance: preview });
+
+    await useSettingsStore.getState().save({ ...base, logLevel: "debug" });
+
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({
+      logLevel: "debug",
+      appearance: expect.objectContaining({ grid: expect.objectContaining({ cellAspect: "4:3" }) }),
+    }));
+    expect(useSettingsStore.getState().previewAppearance).toBeNull();
   });
 
   it("回读失败不阻断保存成功（沿用提交值），saving 复位", async () => {

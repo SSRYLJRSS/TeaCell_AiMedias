@@ -11,7 +11,7 @@ export default function StartupSkeleton() {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 bg-[var(--color-bg)]">
       <img src={appLogo} alt="" className="h-10 w-10 select-none" draggable={false} />
-      <p className="text-sm font-medium text-[var(--color-text)]">茶包素材</p>
+      <p className="text-sm font-medium text-[var(--color-text)]">茶馆</p>
       <p className="text-xs text-[var(--color-text-secondary)]">正在准备素材库</p>
       {/* 不定进度条：CSS 关键帧左右移动，不承诺百分比 */}
       <div className="mt-1 h-1 w-40 overflow-hidden rounded-full bg-[var(--color-surface-hover)]">

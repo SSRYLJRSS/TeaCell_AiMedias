@@ -7,6 +7,20 @@ import { DEFAULT_BATCH_LIMIT, DEFAULT_CACHE_MB, DEFAULT_LOCAL_BATCH_LIMIT, DEFAU
 import { CELL_STEPS } from "@/types/settings";
 
 describe("normalizeSettings", () => {
+  it("丢弃旧版全局提示词覆盖字段", () => {
+    const settings = normalizeSettings({
+      ai: { systemPromptTagging: "旧打标覆盖", systemPromptSearch: "旧搜索覆盖" },
+    });
+    expect(settings.ai.systemPromptTagging).toBeUndefined();
+    expect(settings.ai.systemPromptSearch).toBeUndefined();
+  });
+
+  it("新设置及旧设置缺少首次教程标记时均会邀请，已处理标记仍保留", () => {
+    expect(normalizeSettings({}).tutorialPromptHandled).toBe(false);
+    expect(normalizeSettings({ tutorialPromptHandled: false }).tutorialPromptHandled).toBe(false);
+    expect(normalizeSettings({ tutorialPromptHandled: true }).tutorialPromptHandled).toBe(true);
+  });
+
   it("对完全缺失的输入返回全默认值", () => {
     const s = normalizeSettings(undefined);
     expect(s.theme).toBe("system");
@@ -109,7 +123,7 @@ describe("normalizeSettings", () => {
     const s = normalizeSettings(undefined);
     expect(s.appearance.grid.libraryCellStep).toBe(3);
     expect(s.appearance.grid.importCellStep).toBe(1);
-    expect(s.appearance.grid.cellAspect).toBe("1:1");
+    expect(s.appearance.grid.cellAspect).toBe("4:3");
     expect(s.appearance.grid.cellFit).toBe("cover");
     expect(s.appearance.grid.matchDominantColor).toBe(false);
     expect(s.appearance.hoverPreview.enabled).toBe(true);
@@ -119,7 +133,7 @@ describe("normalizeSettings", () => {
     expect(s.appearance.colorStrip.count).toBe(6);
   });
 
-  it("FB2-01：非法 cellAspect → 回落 1:1；cellStep 越界 → 钳制", () => {
+  it("FB2-01：非法 cellAspect → 回落 4:3；cellStep 越界 → 钳制", () => {
     const s = normalizeSettings({
       appearance: {
         grid: { libraryCellStep: 99, importCellStep: -3, cellAspect: "oops", cellFit: "stretch" },
@@ -127,7 +141,7 @@ describe("normalizeSettings", () => {
     });
     expect(s.appearance.grid.libraryCellStep).toBe(7);
     expect(s.appearance.grid.importCellStep).toBe(0);
-    expect(s.appearance.grid.cellAspect).toBe("1:1");
+    expect(s.appearance.grid.cellAspect).toBe("4:3");
     expect(s.appearance.grid.cellFit).toBe("cover");
   });
 

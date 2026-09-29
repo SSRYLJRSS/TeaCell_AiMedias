@@ -143,7 +143,7 @@ export default function AssetGridView({
   const cellWidth = layoutReady
     ? Math.max(1, (width - GAP * (columns - 1)) / columns)
     : cell;
-  const [rw, rh] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const [rw, rh] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["4:3"];
   // FB2-08（FX-07 隐藏坑）：色条在媒体容器之外，开启后每张卡片实际高度多出 stripPx，
   // 不补进 rowHeight 虚拟滚动会逐行累积错位（滚动时卡片重叠/大片空白）。
   const stripPx =

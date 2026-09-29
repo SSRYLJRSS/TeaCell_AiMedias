@@ -71,6 +71,42 @@ describe("ModelCombobox（FB5-04 §3.6）", () => {
     expect(screen.getByRole("option", { name: "new-model" })).toBeInTheDocument();
   });
 
+  it("连接来源变化时清空旧列表并忽略旧连接的在途响应", async () => {
+    let resolveOld!: (v: string[]) => void;
+    const oldPromise = new Promise<string[]>((resolve) => {
+      resolveOld = resolve;
+    });
+    const firstDiscover = vi.fn().mockReturnValue(oldPromise);
+    const nextDiscover = vi.fn().mockResolvedValue(["model-for-new-provider"]);
+    const props = { value: "", onChange: noop };
+    const { rerender } = render(
+      <ModelCombobox {...props} sourceRevision={1} onDiscover={firstDiscover} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "读取模型列表" }));
+
+    rerender(<ModelCombobox {...props} sourceRevision={2} onDiscover={nextDiscover} />);
+    expect(screen.queryByRole("listbox", { name: "模型列表" })).not.toBeInTheDocument();
+    resolveOld(["stale-provider-model"]);
+    await waitFor(() => expect(screen.queryByText(/stale-provider-model/)).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "读取模型列表" }));
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "model-for-new-provider" })).toBeInTheDocument(),
+    );
+  });
+
+  it("远端发现被禁用时仍允许手动输入模型名称", () => {
+    const onChange = vi.fn();
+    render(
+      <ModelCombobox value="" onChange={onChange} onDiscover={vi.fn()} discoverDisabled />,
+    );
+    const input = screen.getByRole("combobox", { name: "模型" });
+    expect(input).toBeEnabled();
+    expect(screen.getByRole("button", { name: "读取模型列表" })).toBeDisabled();
+    fireEvent.change(input, { target: { value: "manual-model" } });
+    expect(onChange).toHaveBeenCalledWith("manual-model");
+  });
+
   it("获取失败显示可读原因，输入框仍可手填", async () => {
     const onChange = vi.fn();
     const discover = vi.fn().mockRejectedValue(new Error("该服务未提供模型列表，请手动输入"));

@@ -1,4 +1,4 @@
-//! 茶包素材 BagerTea AiMdeias V2 —— Tauri 应用入口
+//! 茶馆AI素材管理 —— Tauri 应用入口
 //! T03：核心服务 + M1 commands 注册（网盘已移除，见 §6.8）
 //! 指导书 阶段 1 §5.2：setup 关键路径只保留「建目录 → 开库 → 迁移 → 注册状态/命令/协议」；
 //! 缩略图 LRU、旧标签整理、历史任务状态修复全部移入具名后台线程（不阻塞窗口显示）。
@@ -280,6 +280,7 @@ pub fn run() {
             commands::clear_all_video_proxies,
             // 超级搜索
             commands::ai_parse_search_query,
+            commands::cancel_ai_search,
             // C-2：AST 命中诊断（U-6 界面数据前提）
             commands::diagnose_search_plan_cmd,
             // Phase 2 §4.1：plan 列表分页 + 全选 ID（B2 同源）
@@ -296,6 +297,7 @@ pub fn run() {
             commands::list_tag_facets,
             commands::list_all_tag_facets,
             commands::create_tag_facet,
+            commands::save_tag_facet,
             // W2-2/W2-3：合并编辑 + 级联删除（分面契约）
             commands::update_tag_facet,
             commands::delete_tag_facet,
@@ -386,6 +388,16 @@ pub fn run() {
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）
             commands::open_logs_dir,
             commands::open_help_page,
+            commands::get_help_page_url,
+            commands::open_project_page,
+            commands::get_project_page_url,
+            commands::open_license_page,
+            commands::get_license_page_url,
+            commands::open_author_page,
+            commands::get_author_page_url,
+            commands::open_feedback_page,
+            commands::get_feedback_page_url,
+            commands::open_agnes_api_key_docs,
             // 前端异常与关键事件回传统一 tracing 文件
             commands::log_frontend,
             commands::export_diagnostics,
@@ -399,6 +411,7 @@ pub fn run() {
             commands::delete_ai_connection,
             commands::set_ai_usage_binding,
             commands::get_ai_usage_bindings,
+            commands::get_super_search_service_resolution,
             commands::get_legacy_active_profile,
             commands::test_ai_connection,
             commands::discover_ai_models,

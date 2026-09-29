@@ -183,6 +183,150 @@ pub fn usage_profile_with_credential<B: CredentialBackend>(
     Ok(Some(profile))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperSearchProfileSource {
+    ExplicitBinding,
+    AutomaticOnline,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSuperSearchProfile {
+    pub profile: crate::db::settings::ApiProfile,
+    pub connection_id: String,
+    pub name: String,
+    pub model: String,
+    pub deployment: String,
+    pub source: SuperSearchProfileSource,
+}
+
+/// Resolve the actual super-search connection. An explicit binding wins; otherwise
+/// only enabled cloud connections are considered. The legacy active profile and
+/// unbound local connections are deliberately outside this policy.
+pub fn resolve_super_search_profile_with_credential<B: CredentialBackend>(
+    db: &Database,
+    backend: &B,
+) -> AppResult<ResolvedSuperSearchProfile> {
+    let _operations = lock_operations()?;
+    let (binding_id, connections) = {
+        let conn = db.lock()?;
+        (
+            crate::db::ai_connections::binding_id(&conn, "super_search")?,
+            crate::db::ai_connections::list(&conn)?,
+        )
+    };
+
+    if let Some(binding_id) = binding_id {
+        let connection = connections
+            .into_iter()
+            .find(|connection| connection.id == binding_id)
+            .ok_or_else(|| AppError::not_found("超级搜索绑定的 AI 服务不存在，请重新选择服务"))?;
+        if !connection.enabled {
+            return Err(AppError::conflict(
+                "超级搜索绑定的 AI 服务已停用，请启用该服务或重新选择",
+            ));
+        }
+        if connection.base_url.trim().is_empty() || connection.model.trim().is_empty() {
+            return Err(AppError::invalid_arg(
+                "超级搜索绑定的 AI 服务缺少服务地址或模型，请先完善连接配置",
+            ));
+        }
+        let mut profile = crate::db::ai_connections::profile_from_connection(&connection);
+        if let Some(reference) = connection.api_key_ref.as_deref() {
+            profile.api_key = backend
+                .get(reference)?
+                .filter(|secret| !secret.trim().is_empty())
+                .ok_or_else(|| {
+                    AppError::not_found("超级搜索绑定的 AI 服务密钥不可用，请重新保存密钥")
+                })?;
+        }
+        return Ok(resolved_super_search_profile(
+            connection,
+            profile,
+            SuperSearchProfileSource::ExplicitBinding,
+        ));
+    }
+
+    let mut cloud_connections: Vec<_> = connections
+        .into_iter()
+        .filter(|connection| connection.enabled && connection.deployment == "cloud")
+        .collect();
+    cloud_connections.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if cloud_connections.is_empty() {
+        return Err(AppError::not_found(
+            "尚未配置可用的在线 AI 服务。请先添加在线服务，或在超级搜索设置中手动选择本机服务。",
+        ));
+    }
+
+    let mut keyless_candidate = None;
+    let mut missing_credential = false;
+    for connection in cloud_connections {
+        if connection.base_url.trim().is_empty() || connection.model.trim().is_empty() {
+            continue;
+        }
+        match connection.api_key_ref.as_deref() {
+            Some(reference) => match backend.get(reference)? {
+                Some(secret) if !secret.trim().is_empty() => {
+                    let mut profile =
+                        crate::db::ai_connections::profile_from_connection(&connection);
+                    profile.api_key = secret;
+                    return Ok(resolved_super_search_profile(
+                        connection,
+                        profile,
+                        SuperSearchProfileSource::AutomaticOnline,
+                    ));
+                }
+                _ => missing_credential = true,
+            },
+            None => {
+                if keyless_candidate.is_none() {
+                    keyless_candidate = Some(connection);
+                }
+            }
+        }
+    }
+    if let Some(connection) = keyless_candidate {
+        let profile = crate::db::ai_connections::profile_from_connection(&connection);
+        return Ok(resolved_super_search_profile(
+            connection,
+            profile,
+            SuperSearchProfileSource::AutomaticOnline,
+        ));
+    }
+    if missing_credential {
+        return Err(AppError::not_found(
+            "已配置在线 AI 服务，但密钥不可用。请在 AI 服务管理中重新保存密钥后重试。",
+        ));
+    }
+    Err(AppError::not_found(
+        "未找到配置完整的在线 AI 服务，请检查服务地址和模型名称。",
+    ))
+}
+
+pub fn resolve_super_search_profile_with_system_credential(
+    db: &Database,
+) -> AppResult<ResolvedSuperSearchProfile> {
+    resolve_super_search_profile_with_credential(db, &SystemCredentialBackend)
+}
+
+fn resolved_super_search_profile(
+    connection: crate::db::ai_connections::AiConnection,
+    profile: crate::db::settings::ApiProfile,
+    source: SuperSearchProfileSource,
+) -> ResolvedSuperSearchProfile {
+    ResolvedSuperSearchProfile {
+        profile,
+        connection_id: connection.id,
+        name: connection.name,
+        model: connection.model,
+        deployment: connection.deployment,
+        source,
+    }
+}
+
 pub fn connection_with_system_credential(
     db: &Database,
     connection_id: &str,
@@ -421,6 +565,105 @@ mod tests {
         .unwrap();
         ai_connections::bind_usage(&conn, "tagging", "test-bound").unwrap();
         Arc::new(Database::new(conn))
+    }
+
+    fn add_test_connection(
+        db: &Arc<Database>,
+        id: &str,
+        deployment: &str,
+        api_key_ref: Option<&str>,
+    ) {
+        let conn = db.lock().unwrap();
+        ai_connections::upsert(
+            &conn,
+            id,
+            id,
+            deployment,
+            "openai_chat",
+            "https://example.invalid/v1",
+            "test-model",
+            api_key_ref,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unbound_super_search_never_falls_back_to_a_local_connection() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "a-local", "local", None);
+        add_test_connection(&db, "z-cloud", "cloud", Some("z-cloud"));
+        let backend = MemoryBackend::default();
+        backend.save("z-cloud", "sk-cloud").unwrap();
+
+        let resolved = resolve_super_search_profile_with_credential(&db, &backend).unwrap();
+        assert_eq!(resolved.connection_id, "z-cloud");
+        assert_eq!(resolved.profile.api_key, "sk-cloud");
+        assert_eq!(resolved.source, SuperSearchProfileSource::AutomaticOnline);
+    }
+
+    #[test]
+    fn unbound_super_search_with_only_local_service_requires_online_setup() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "local-only", "local", None);
+        let error = resolve_super_search_profile_with_credential(&db, &MemoryBackend::default())
+            .expect_err("未绑定时不能自动使用本地服务");
+        assert_eq!(error.code(), "NOT_FOUND");
+        assert!(error.to_string().contains("在线 AI 服务"));
+    }
+
+    #[test]
+    fn explicit_local_binding_is_respected_and_disabled_binding_fails_closed() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "cloud", "cloud", None);
+        add_test_connection(&db, "local", "local", None);
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "super_search", "local").unwrap();
+        }
+        let backend = MemoryBackend::default();
+        let resolved = resolve_super_search_profile_with_credential(&db, &backend).unwrap();
+        assert_eq!(resolved.connection_id, "local");
+        assert_eq!(resolved.source, SuperSearchProfileSource::ExplicitBinding);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("UPDATE ai_connections SET enabled=0 WHERE id='local'", [])
+                .unwrap();
+        }
+        let error = resolve_super_search_profile_with_credential(&db, &backend)
+            .expect_err("显式绑定失效时不能切换到其他服务");
+        assert_eq!(error.code(), "CONFLICT");
+    }
+
+    #[test]
+    fn explicit_binding_with_missing_key_does_not_fall_back_to_cloud() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "bound", "cloud", Some("bound"));
+        add_test_connection(&db, "other", "cloud", Some("other"));
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "super_search", "bound").unwrap();
+        }
+        let backend = MemoryBackend::default();
+        backend.save("other", "sk-other").unwrap();
+
+        let error = resolve_super_search_profile_with_credential(&db, &backend)
+            .expect_err("密钥缺失时不能改用另一条连接");
+        assert_eq!(error.code(), "NOT_FOUND");
+        assert!(error.to_string().contains("密钥不可用"));
+    }
+
+    #[test]
+    fn automatic_online_resolution_skips_connections_with_missing_key_refs() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "a-missing", "cloud", Some("a-missing"));
+        add_test_connection(&db, "z-configured", "cloud", Some("z-configured"));
+        let backend = MemoryBackend::default();
+        backend.save("z-configured", "sk-configured").unwrap();
+
+        let resolved = resolve_super_search_profile_with_credential(&db, &backend).unwrap();
+        assert_eq!(resolved.connection_id, "z-configured");
+        assert_eq!(resolved.profile.api_key, "sk-configured");
     }
 
     // These tests use the real OS credential store rather than an in-memory mock. Serialize them

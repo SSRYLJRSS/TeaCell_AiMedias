@@ -32,10 +32,10 @@ export interface AiSettings {
   batchLimit: number;
   /** 本机服务每轮处理数量（1~20） */
   localBatchLimit?: number;
-  /** AI 打标提示词覆盖（空 = 用内置默认） */
-  systemPromptTagging: string;
-  /** 超级搜索提示词覆盖（空 = 用内置默认） */
-  systemPromptSearch: string;
+  /** @deprecated 旧配置读取兼容字段；normalizeSettings 会丢弃，应用不再保存或使用。 */
+  systemPromptTagging?: string;
+  /** @deprecated 旧配置读取兼容字段；normalizeSettings 会丢弃，应用不再保存或使用。 */
+  systemPromptSearch?: string;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
   ollamaSourceId: string;
   /** AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30 */
@@ -75,6 +75,8 @@ export interface Settings {
   customDownloadSources: CustomSource[];
   /** Ollama 模型下载代理（拉起 serve 时注入 HTTPS_PROXY；空 = 不用代理） */
   modelDownloadProxy: string;
+  /** 教程邀请已处理；旧设置缺少字段时由归一层按未处理处理。 */
+  tutorialPromptHandled?: boolean;
   /** FB2-01/02/03/08：外观与交互设置（素材网格档位/比例、悬停预览、色条） */
   appearance: Appearance;
 }
@@ -93,7 +95,7 @@ export interface GridAppearance {
   libraryCellStep: number;
   /** FB2-01 入库网格格子档位，默认 1（=120px） */
   importCellStep: number;
-  /** FB2-02 统一容器比例（决策 4：一个设置管两页），默认 "1:1" */
+  /** FB2-02 统一容器比例（决策 4：一个设置管两页），默认 "4:3" */
   cellAspect: CellAspect;
   /** FB2-02 填充方式（不提供拉伸/形变），默认 "cover" */
   cellFit: CellFit;

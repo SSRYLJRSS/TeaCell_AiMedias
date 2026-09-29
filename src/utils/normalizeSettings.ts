@@ -89,8 +89,6 @@ function normalizeAi(raw: unknown): AiSettings {
     ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
     videoTaggingMode: asEnum(r.videoTaggingMode, ["cover", "frames"] as const, "cover"),
     videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
-    systemPromptTagging: asStr(r.systemPromptTagging, ""),
-    systemPromptSearch: asStr(r.systemPromptSearch, ""),
     // 所有 AI 标签都进入人工确认；这里仅保留入库前的最低置信度阈值。
     confidenceMinSuggest: (() => {
       const n = asNum(r.confidenceMinSuggest, DEFAULT_CONF_MIN_SUGGEST);
@@ -134,7 +132,7 @@ function normalizeGrid(raw: unknown): GridAppearance {
   return {
     libraryCellStep: clampInt(r.libraryCellStep, 0, CELL_STEPS.length - 1, 3),
     importCellStep: clampInt(r.importCellStep, 0, CELL_STEPS.length - 1, 1),
-    cellAspect: asEnum(r.cellAspect, CELL_ASPECTS, "1:1"),
+    cellAspect: asEnum(r.cellAspect, CELL_ASPECTS, "4:3"),
     cellFit: asEnum(r.cellFit, ["cover", "contain", "smart"] as const, "cover"),
     matchDominantColor: asBool(r.matchDominantColor, false),
   };
@@ -204,6 +202,7 @@ export function normalizeSettings(raw: unknown): Settings {
       ? r.customDownloadSources.map(normalizeCustomSource).filter((s) => s.id !== "")
       : [],
     modelDownloadProxy: asStr(r.modelDownloadProxy, ""),
+    tutorialPromptHandled: asBool(r.tutorialPromptHandled, false),
     appearance: normalizeAppearance(r.appearance),
   };
 }

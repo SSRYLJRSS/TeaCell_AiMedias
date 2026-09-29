@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod dedup;
 pub mod exif_meta;
 pub mod export_local;
+pub mod facets;
 pub mod heic_decode;
 pub mod imaging;
 pub mod importer;

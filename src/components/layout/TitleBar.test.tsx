@@ -1,7 +1,7 @@
 /**
  * TitleBar 标题栏测试（指导书 §3.3 / §12.1）：
  *  - 左侧 logo 本身作为设置入口，不再显示独立齿轮按钮；
- *  - 软件名不显示（删除「茶包素材 BagerTea V2」文本）；
+ *  - 软件名不显示（应用名由窗口标题栏显示，不在左侧重复渲染）；
  *  - 右侧只显示最小化、最大化/还原、关闭三个按钮；
  *  - logo 设置入口/窗口控制按钮不携带 data-tauri-drag-region（点击即拖拽的回归门禁）；
  *  - 点击 logo 设置入口派发 app:navigate=settings；
@@ -43,8 +43,7 @@ beforeEach(() => {
 describe("TitleBar（指导书 §3.3）", () => {
   it("软件名不显示，logo 本身作为设置入口并提供悬停提示", () => {
     const { container } = render(<TitleBar />);
-    expect(screen.queryByText(/茶包素材 BagerTea V2/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/BagerTea V2/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("茶馆")).not.toBeInTheDocument();
 
     const settings = screen.getByRole("button", { name: "设置" });
     expect(settings).toHaveAttribute("title", "设置");

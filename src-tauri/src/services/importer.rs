@@ -9,6 +9,8 @@
 use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use walkdir::WalkDir;
@@ -27,9 +29,13 @@ use crate::utils::{mime, path};
 pub enum ImportPhase {
     Queued,
     Scanning,
+    Checking,
     Hashing,
     Processing,
     Previewing,
+    Review,
+    Cancelled,
+    Failed,
     Done,
 }
 
@@ -38,9 +44,13 @@ impl ImportPhase {
         match self {
             ImportPhase::Queued => "queued",
             ImportPhase::Scanning => "scanning",
+            ImportPhase::Checking => "checking",
             ImportPhase::Hashing => "hashing",
             ImportPhase::Processing => "processing",
             ImportPhase::Previewing => "previewing",
+            ImportPhase::Review => "review",
+            ImportPhase::Cancelled => "cancelled",
+            ImportPhase::Failed => "failed",
             ImportPhase::Done => "done",
         }
     }
@@ -91,13 +101,23 @@ fn next_task_id() -> String {
 /// 展开输入路径为候选文件列表（目录递归 + 类型过滤）。
 /// on_scan 每发现一个候选文件上报一次当前计数（供 scanning 阶段进度展示）。
 /// 无法读取的路径进入 warnings，不再由 flatten() 静默丢弃。
-fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> (Vec<PathBuf>, Vec<String>) {
+fn collect_files_with_cancel<F: Fn(i64) + Sync>(
+    paths: &[String],
+    cancel: &AtomicBool,
+    on_scan: F,
+) -> AppResult<(Vec<PathBuf>, Vec<String>)> {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for p in paths {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AppError::cancelled("文件检查已取消"));
+        }
         let pb = PathBuf::from(p);
         if pb.is_dir() {
             for entry in WalkDir::new(&pb).follow_links(false) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(AppError::cancelled("文件检查已取消"));
+                }
                 match entry {
                     Ok(e) => {
                         if e.file_type().is_file() && is_supported(e.path()) {
@@ -128,7 +148,13 @@ fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> (Vec<PathBuf
             warnings.push(format!("{}: 路径不存在或不受支持", pb.display()));
         }
     }
-    (out, warnings)
+    Ok((out, warnings))
+}
+
+#[cfg(test)]
+fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> (Vec<PathBuf>, Vec<String>) {
+    let cancel = AtomicBool::new(false);
+    collect_files_with_cancel(paths, &cancel, on_scan).expect("未取消的文件扫描不应返回取消错误")
 }
 
 fn is_supported(p: &Path) -> bool {
@@ -533,6 +559,122 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     cancel: &AtomicBool,
     progress: F,
 ) -> AppResult<ImportResult> {
+    import_paths_with_task_id(db, thumbs, paths, opts, cancel, next_task_id(), progress)
+}
+
+/// 导入统一要求用户已配置、存在且可写的托管总库位置；探测文件是随机临时文件并立即清理。
+pub fn validate_library_root(root: &str) -> AppResult<PathBuf> {
+    let raw = root.trim();
+    if raw.is_empty() {
+        return Err(AppError::coded(
+            crate::error::AppErrorCode::LibraryRootRequired,
+            "请先在设置中配置并保存总库位置",
+        ));
+    }
+    let path = PathBuf::from(raw);
+    let metadata = std::fs::metadata(&path).map_err(|_| {
+        AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "总库位置不存在或无法访问，请在设置中重新选择可用目录",
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "总库位置必须是一个已存在的目录",
+        ));
+    }
+    static PROBE_SEQ: AtomicI64 = AtomicI64::new(0);
+    let probe = path.join(format!(
+        ".bagertea-write-check-{}-{}",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|_| {
+            AppError::coded(
+                crate::error::AppErrorCode::InvalidLibraryRoot,
+                "总库目录不可写，请检查目录权限或磁盘状态",
+            )
+        })?;
+    let write_result = file.write_all(b"probe");
+    drop(file);
+    let cleanup_result = std::fs::remove_file(&probe);
+    if write_result.is_err() || cleanup_result.is_err() {
+        return Err(AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "无法验证总库目录写入权限或清理临时检查文件，请检查磁盘状态",
+        ));
+    }
+    Ok(path)
+}
+
+/// 使用已有的检查任务 ID 继续入库，让检查、前置校验和入库阶段共用左侧进度栏。
+pub fn import_paths_with_task_id<F: Fn(ImportProgress) + Sync>(
+    db: &Database,
+    thumbs: &ThumbnailService,
+    paths: &[String],
+    opts: &ImportOptions,
+    cancel: &AtomicBool,
+    task_id: String,
+    progress: F,
+) -> AppResult<ImportResult> {
+    import_paths_inner(
+        db,
+        thumbs,
+        ImportInput::Paths(paths),
+        opts,
+        cancel,
+        task_id,
+        progress,
+    )
+}
+
+/// 正式入库前由 command 完成了后端预检时，直接复用其候选清单，避免再次展开目录/文件列表。
+pub fn import_preflight_plan_with_task_id<F: Fn(ImportProgress) + Sync>(
+    db: &Database,
+    thumbs: &ThumbnailService,
+    plan: ImportPlan,
+    opts: &ImportOptions,
+    cancel: &AtomicBool,
+    task_id: String,
+    progress: F,
+) -> AppResult<ImportResult> {
+    import_paths_inner(
+        db,
+        thumbs,
+        ImportInput::PreflightPlan(plan),
+        opts,
+        cancel,
+        task_id,
+        progress,
+    )
+}
+
+enum ImportInput<'a> {
+    Paths(&'a [String]),
+    PreflightPlan(ImportPlan),
+}
+
+fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
+    db: &Database,
+    thumbs: &ThumbnailService,
+    input: ImportInput<'_>,
+    opts: &ImportOptions,
+    cancel: &AtomicBool,
+    task_id: String,
+    progress: F,
+) -> AppResult<ImportResult> {
+    let library_root = opts.library_root.as_deref().ok_or_else(|| {
+        AppError::coded(
+            crate::error::AppErrorCode::LibraryRootRequired,
+            "请先在设置中配置并保存总库位置",
+        )
+    })?;
+    validate_library_root(library_root)?;
     // 快速失败：分库名非法直接拒绝整个批次（PRD R-32 禁路径穿越）
     if let Some(c) = &opts.collection {
         if !c.trim().is_empty() {
@@ -540,12 +682,14 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
         }
     }
     // 阶段 1 契约：后端只发阶段进度，task_id 隔离新旧任务事件。
-    let task_id = next_task_id();
     let started_at = std::time::Instant::now();
     tracing::info!(
         operation = "import",
         task_id = %task_id,
-        path_count = paths.len(),
+        path_count = match &input {
+            ImportInput::Paths(paths) => paths.len(),
+            ImportInput::PreflightPlan(plan) => plan.items.len(),
+        },
         managed = opts.library_root.is_some(),
         "导入任务开始"
     );
@@ -554,13 +698,40 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     queued.message = Some("准备入库".into());
     progress(queued);
     // scanning：目录递归收集候选文件（phaseTotal 未知 → 前端显示不确定进度）
-    let (files, scan_warnings) = collect_files(paths, |n| {
-        let mut sc = ImportProgress::new(&task_id, ImportPhase::Scanning);
-        sc.phase_current = n;
-        sc.phase_total = None;
-        sc.message = Some("正在扫描目录".into());
-        progress(sc);
-    });
+    let scan_started_at = std::time::Instant::now();
+    let reused_preflight = matches!(&input, ImportInput::PreflightPlan(_));
+    let (files, scan_warnings) = match input {
+        ImportInput::PreflightPlan(plan) => {
+            let files: Vec<PathBuf> = plan
+                .items
+                .into_iter()
+                .map(|item| PathBuf::from(item.path))
+                .collect();
+            tracing::debug!(
+                operation = "import",
+                task_id = %task_id,
+                candidate_count = files.len(),
+                "复用后端预检候选清单，跳过重复路径收集"
+            );
+            (files, plan.warnings)
+        }
+        ImportInput::Paths(paths) => collect_files_with_cancel(paths, cancel, |n| {
+            let mut sc = ImportProgress::new(&task_id, ImportPhase::Scanning);
+            sc.phase_current = n;
+            sc.phase_total = None;
+            sc.message = Some("正在扫描目录".into());
+            progress(sc);
+        })?,
+    };
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        stage = if reused_preflight { "candidate_reuse" } else { "candidate_scan" },
+        candidate_count = files.len(),
+        warning_count = scan_warnings.len(),
+        duration_ms = scan_started_at.elapsed().as_millis() as u64,
+        "入库候选清单准备完成"
+    );
     for warning in &scan_warnings {
         tracing::warn!(
             operation = "import",
@@ -594,6 +765,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
 
     // ① 并行 hash（hashing 阶段；取消在②③阶段间仍生效，此处每文件上报进度）
     let hash_done = AtomicI64::new(0);
+    let hash_started_at = std::time::Instant::now();
     let hashes: Vec<HashOutcome> = files
         .par_iter()
         .map(|f| {
@@ -618,9 +790,18 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             hash
         })
         .collect();
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        stage = "hash",
+        candidate_count = total,
+        duration_ms = hash_started_at.elapsed().as_millis() as u64,
+        "入库文件哈希完成"
+    );
 
     // ②a：锁外并行处理（复制 + 元数据提取），precheck 用短锁单次查询
     let proc_done = AtomicI64::new(0);
+    let process_started_at = std::time::Instant::now();
     let processed: Vec<ProcResult> = files
         .par_iter()
         .enumerate()
@@ -765,6 +946,14 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             })
         })
         .collect();
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        stage = "process_and_copy",
+        candidate_count = total,
+        duration_ms = process_started_at.elapsed().as_millis() as u64,
+        "导入文件处理与托管复制阶段完成"
+    );
 
     // 统计②a结果（区分取消与真实失败）
     for r in &processed {
@@ -897,6 +1086,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     // W5d：占位图是已解码像素的唯一搭车点，顺带收集 dHash 回写 assets.phash。
     let thumb_total = pending_thumbs.len() as i64;
     let thumb_done = AtomicI64::new(0);
+    let placeholder_started_at = std::time::Instant::now();
     let paths_out: Vec<(i64, PathBuf, Option<u64>)> = pending_thumbs
         .par_iter()
         .map(|(id, file, mime_type)| {
@@ -920,6 +1110,14 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             (*id, p, phash)
         })
         .collect();
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        stage = "placeholder",
+        candidate_count = thumb_total,
+        duration_ms = placeholder_started_at.elapsed().as_millis() as u64,
+        "导入占位图阶段完成"
+    );
 
     // 统一回写占位图路径（一个事务；跳过取消项的空路径）
     {
@@ -1027,7 +1225,46 @@ pub struct ImportPlan {
 
 /// 扫描路径展开为待入库清单（不落库，仅统计）
 pub fn inspect_paths(paths: &[String]) -> ImportPlan {
-    let (files, warnings) = collect_files(paths, |_| {});
+    let cancel = AtomicBool::new(false);
+    inspect_paths_with_control(paths, next_task_id(), &cancel, |_| {})
+        .expect("未取消的文件检查不应失败")
+}
+
+/// 带任务进度与取消检查的清单检查；只扫描用户所选路径，不写素材库。
+pub fn inspect_paths_with_control<F: Fn(ImportProgress) + Sync>(
+    paths: &[String],
+    task_id: String,
+    cancel: &AtomicBool,
+    progress: F,
+) -> AppResult<ImportPlan> {
+    let mut queued = ImportProgress::new(&task_id, ImportPhase::Queued);
+    queued.message = Some("正在检查所选文件".into());
+    progress(queued);
+    let scan_started_at = std::time::Instant::now();
+    let scan = collect_files_with_cancel(paths, cancel, |n| {
+        let mut scanning = ImportProgress::new(&task_id, ImportPhase::Scanning);
+        scanning.phase_current = n;
+        scanning.message = Some("正在扫描目录".into());
+        progress(scanning);
+    });
+    let (files, warnings) = match scan {
+        Ok(result) => result,
+        Err(error) => {
+            let mut cancelled = ImportProgress::new(&task_id, ImportPhase::Cancelled);
+            cancelled.message = Some("文件检查已取消".into());
+            progress(cancelled);
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        operation = "inspect_import",
+        task_id = %task_id,
+        stage = "candidate_scan",
+        candidate_count = files.len(),
+        warning_count = warnings.len(),
+        duration_ms = scan_started_at.elapsed().as_millis() as u64,
+        "待入库候选文件扫描完成"
+    );
     for warning in &warnings {
         tracing::warn!(
             operation = "inspect_import",
@@ -1043,7 +1280,23 @@ pub fn inspect_paths(paths: &[String]) -> ImportPlan {
         total_size: 0,
         warnings,
     };
-    for f in files {
+    let total = files.len() as i64;
+    let preview_started_at = std::time::Instant::now();
+    for (index, f) in files.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let mut cancelled = ImportProgress::new(&task_id, ImportPhase::Cancelled);
+            cancelled.message = Some("文件检查已取消".into());
+            progress(cancelled);
+            return Err(AppError::cancelled("文件检查已取消"));
+        }
+        let mut checking = ImportProgress::new(&task_id, ImportPhase::Checking);
+        checking.phase_current = index as i64 + 1;
+        checking.phase_total = Some(total);
+        checking.file = f
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        checking.message = Some("正在检查文件与缩略图".into());
+        progress(checking);
         let ext = f.extension().and_then(|e| e.to_str()).unwrap_or_default();
         let kind = mime::asset_type_from_ext(ext).unwrap_or("image");
         let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
@@ -1073,7 +1326,26 @@ pub fn inspect_paths(paths: &[String]) -> ImportPlan {
             preview_message,
         });
     }
-    plan
+    tracing::info!(
+        operation = "inspect_import",
+        task_id = %task_id,
+        stage = "preview_classification",
+        candidate_count = total,
+        duration_ms = preview_started_at.elapsed().as_millis() as u64,
+        "待入库预览检查完成"
+    );
+    if cancel.load(Ordering::Relaxed) {
+        let mut cancelled = ImportProgress::new(&task_id, ImportPhase::Cancelled);
+        cancelled.message = Some("文件检查已取消".into());
+        progress(cancelled);
+        return Err(AppError::cancelled("文件检查已取消"));
+    }
+    let mut review = ImportProgress::new(&task_id, ImportPhase::Review);
+    review.phase_current = total;
+    review.phase_total = Some(total);
+    review.message = Some(format!("检查完成，待确认入库（{} 项）", plan.items.len()));
+    progress(review);
+    Ok(plan)
 }
 
 /// 入库前只验证“能否生成快速缩略图”，不进入完整 RAW 显影。
@@ -1140,11 +1412,49 @@ pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: us
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, inspect_paths, precheck, render_name, ImportPreviewStatus};
+    use super::{
+        collect_files, inspect_paths, precheck, render_name, validate_library_root,
+        ImportPreviewStatus,
+    };
     use crate::utils::path;
+    use std::sync::atomic::AtomicBool;
 
     // 2026-07-27 12:00:00 UTC
     const MTIME: i64 = 1_785_225_600_000;
+
+    #[test]
+    fn library_root_must_exist_be_a_directory_and_be_writable() {
+        let root = tempfile::tempdir().unwrap();
+        let validated = validate_library_root(root.path().to_string_lossy().as_ref()).unwrap();
+        assert_eq!(validated, root.path());
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "探测文件必须清理"
+        );
+
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let error = validate_library_root(file.to_string_lossy().as_ref()).unwrap_err();
+        assert_eq!(error.code(), "INVALID_LIBRARY_ROOT");
+        let error = validate_library_root(" ").unwrap_err();
+        assert_eq!(error.code(), "LIBRARY_ROOT_REQUIRED");
+    }
+
+    #[test]
+    fn import_inspection_observes_cancellation_and_emits_terminal_phase() {
+        let root = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(true);
+        let phases = std::sync::Mutex::new(Vec::new());
+        let result = super::inspect_paths_with_control(
+            &[root.path().to_string_lossy().into_owned()],
+            "inspect-cancel".into(),
+            &cancel,
+            |progress| phases.lock().unwrap().push(progress.phase),
+        );
+        assert_eq!(result.unwrap_err().code(), "CANCELLED");
+        assert_eq!(*phases.lock().unwrap(), vec!["queued", "cancelled"]);
+    }
 
     #[test]
     fn default_template() {

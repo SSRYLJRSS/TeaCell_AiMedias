@@ -52,9 +52,13 @@ const IMPORT_PHASE_ORDER: ImportPhase[] = ["scanning", "hashing", "processing", 
 const PHASE_LABELS: Record<ImportPhase, string> = {
   queued: "排队中",
   scanning: "正在扫描目录",
+  checking: "正在检查文件与缩略图",
   hashing: "正在计算指纹",
   processing: "正在入库",
   previewing: "正在生成快速预览",
+  review: "检查完成，等待确认入库",
+  failed: "文件检查或入库失败",
+  cancelled: "操作已取消",
   done: "已完成",
 };
 
@@ -104,7 +108,7 @@ function scheduleLinger(id: string) {
 
 export function upsertImport(p: ImportProgress) {
   const overall = importOverall(p.phase, p.phaseCurrent, p.phaseTotal);
-  const done = p.phase === "done";
+  const done = p.phase === "done" || p.phase === "review" || p.phase === "failed" || p.phase === "cancelled";
   useTaskStore.setState((s) => {
     const others = s.tasks.filter(
       (t) => t.id !== p.taskId && !(t.kind === "import" && t.done),
@@ -116,7 +120,11 @@ export function upsertImport(p: ImportProgress) {
       overall,
       detail: p.message && !done ? p.message : importDetail(p),
       // 完成/失败时给出明确文案；失败不纯红，用文字+符号表达
-      error: done && p.failed > 0 ? `成功 ${p.imported} · 重复 ${p.duplicates} · 失败 ${p.failed}` : null,
+      error: p.phase === "failed" || p.phase === "cancelled"
+        ? p.message ?? PHASE_LABELS[p.phase]
+        : p.phase === "done" && p.failed > 0
+          ? `成功 ${p.imported} · 重复 ${p.duplicates} · 失败 ${p.failed}`
+          : null,
       done,
       importProgress: {
         phase: p.phase,

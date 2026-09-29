@@ -64,6 +64,15 @@ impl AiRateLimiter {
     /// 等待一个实际 HTTP 请求的额度。等待期间每 250ms 检查一次取消，
     /// 同时由已有请求结束时的 Condvar 唤醒，避免无意义忙等。
     pub fn acquire(&self, cancel: &AtomicBool) -> AppResult<RequestPermit<'_>> {
+        self.acquire_until(cancel, None)
+    }
+
+    /// 有截止时间的额度等待：搜索等有整体预算的调用必须同时在等待队列中超时。
+    pub fn acquire_until(
+        &self,
+        cancel: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> AppResult<RequestPermit<'_>> {
         let mut state = self
             .state
             .lock()
@@ -73,6 +82,9 @@ impl AiRateLimiter {
                 return Err(AppError::cancelled("已取消等待在线服务限流"));
             }
             let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(AppError::timeout("等待在线服务请求额度超过任务时限"));
+            }
             prune_requests(&mut state.requests, now);
             if self.can_acquire(&state, now) {
                 state.active = state.active.saturating_add(1);
@@ -80,7 +92,10 @@ impl AiRateLimiter {
                 return Ok(RequestPermit { limiter: self });
             }
 
-            let wait_for = self.wait_duration(&state, now).min(POLL_INTERVAL);
+            let mut wait_for = self.wait_duration(&state, now).min(POLL_INTERVAL);
+            if let Some(deadline) = deadline {
+                wait_for = wait_for.min(deadline.saturating_duration_since(now));
+            }
             state = self
                 .wake
                 .wait_timeout(state, wait_for)
@@ -210,6 +225,20 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code(), "CANCELLED");
+        drop(permit);
+    }
+
+    #[test]
+    fn deadline_expires_while_waiting_for_concurrency_permit() {
+        let limiter = AiRateLimiter::new(RateLimitConfig::from_values(1, 0, 0));
+        let cancel = AtomicBool::new(false);
+        let permit = limiter.acquire(&cancel).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let error = match limiter.acquire_until(&cancel, Some(deadline)) {
+            Ok(_) => panic!("超过总时限后不能继续等待额度"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "TIMEOUT");
         drop(permit);
     }
 }

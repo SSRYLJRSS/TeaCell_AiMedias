@@ -69,8 +69,8 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
   const ratingStars = asset.rating && asset.rating > 0 ? "★".repeat(Math.min(asset.rating, 5)) : "";
 
   // FB2-02：容器比例 + 内容填充（smart 需 contentAspect）
-  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["1:1"];
-  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["4:3"];
+  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["4:3"];
   const contentAspect =
     typeof asset.width === "number" &&
     typeof asset.height === "number" &&

@@ -7,7 +7,8 @@
  *  error（数据查询）与 aiError（AI 解析）分离；请求代际防旧响应覆盖新查询。 */
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { listSuperAssets, listSuperAssetIdsByPlan, aiParseSearchQuery } from "@/api/superSearch";
+import { listSuperAssets, listSuperAssetIdsByPlan, aiParseSearchQuery, cancelAiSearch as cancelAiSearchRequest } from "@/api/superSearch";
+import type { AiSearchPhase, AiSearchProgress } from "@/api/superSearch";
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
 import type { LeafCond, QueryExpr, TermMatch } from "@/types/queryExpr";
@@ -63,8 +64,20 @@ function invalidatePendingRequests() {
   listRequestSeq += 1;
 }
 
-function invalidateAiRequests() {
+function invalidateAiRequests(requestId?: string) {
   aiRequestSeq += 1;
+  if (requestId) void cancelAiSearchRequest(requestId).catch(() => undefined);
+}
+
+function idleAiProgress() {
+  return {
+    aiLoading: false,
+    aiRequestId: null,
+    aiPhase: null,
+    aiStartedAt: null,
+    aiElapsedMs: 0,
+    aiCancelPending: false,
+  };
 }
 
 function collectExprLeaves(expr: QueryExpr | undefined | null, predicate: (cond: LeafCond) => boolean): QueryExpr | undefined {
@@ -300,6 +313,11 @@ export interface SuperSearchState {
   aiError: string | null;
   aiInput: string;
   aiLoading: boolean;
+  aiRequestId: string | null;
+  aiPhase: AiSearchPhase | null;
+  aiStartedAt: number | null;
+  aiElapsedMs: number;
+  aiCancelPending: boolean;
   aiExplanation: string | null;
   warnings: string[];
   /** B7：执行层 warning 双通道之一 —— 生命周期跟每次 refresh（请求开始清空、响应写入）。
@@ -323,6 +341,9 @@ export interface SuperSearchState {
   clearAiResult: () => void;
   /** FB5-05（§9.6）+ §4.8：AI 解析并应用（replace 采纳 AI 的 plan/ranking；append 按 §4.8 逐字段合并） */
   applyAiSearch: (text: string, mode?: AiApplyMode) => Promise<void>;
+  handleAiProgress: (progress: AiSearchProgress) => void;
+  cancelAiSearch: () => Promise<void>;
+  tickAiElapsed: () => void;
   /** §3.7 不变式 6：按区删除单个条件（chips 删除用，禁止走 setQuery） */
   removeAtZonePath: (zone: "filter" | "mustNot" | "should", path: ExprPath | number) => void;
   /** 兼容旧签名：必须区删除（路由到 removeAtZonePath("filter", path)） */
@@ -376,6 +397,11 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   aiError: null,
   aiInput: "",
   aiLoading: false,
+  aiRequestId: null,
+  aiPhase: null,
+  aiStartedAt: null,
+  aiElapsedMs: 0,
+  aiCancelPending: false,
   aiExplanation: null,
   warnings: [],
   executionWarnings: [],
@@ -387,14 +413,14 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const next = { ...prev, ...patch };
     if (queryEqual(prev, next)) return;
     invalidatePendingRequests();
-    invalidateAiRequests();
+    invalidateAiRequests(get().aiRequestId ?? undefined);
     const curPlan = get().plan;
     // §3.7 不变式 8：排序/方向变化 = 只换 ranking，plan.filter/mustNot/should 原样保留
     // （否则重建会把 AI 的嵌套 filter 树拍平成扁平字段，丢掉结构）。
     const onlySort = Object.keys(patch).every((k) => k === "sortBy" || k === "sortDir");
     if (onlySort && curPlan) {
       const plan = { ...curPlan, ranking: fieldRanking(next.sortBy ?? "created_at", next.sortDir ?? "desc") };
-      set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1, aiLoading: false });
+      set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1, ...idleAiProgress() });
       useSelectionStore.getState().clear();
       scheduleRefresh(get().refresh);
       return;
@@ -409,7 +435,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       plan?.filter ?? undefined,
     );
     const resolvedTags = filterResolvedTagsByPlan(get().resolvedTags, plan);
-    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
+    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, ...idleAiProgress(), resolvedTags });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -419,14 +445,14 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const currentExpr = cur.expr;
     if ((!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr))) return;
     invalidatePendingRequests();
-    invalidateAiRequests();
+    invalidateAiRequests(cur.aiRequestId ?? undefined);
     // §3.7 不变式 1：只动 plan.filter；should/mustNot/ranking 原样保留
     const curPlan = cur.plan;
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
     const plan = maybeNullPlan(normalizeSearchPlan({ ...base, filter: expr ?? null }));
     const query = syncQueryFromExpr(cur.query, expr);
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, plan);
-    set({ query, expr: expr ?? undefined, plan, planRevision: cur.planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
+    set({ query, expr: expr ?? undefined, plan, planRevision: cur.planRevision + 1, warnings: [], aiExplanation: null, aiError: null, ...idleAiProgress(), resolvedTags });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -437,13 +463,13 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const curMustNot = curPlan?.mustNot ?? null;
     if ((!expr && !curMustNot) || (expr && curMustNot && serializeExpr(expr) === serializeExpr(curMustNot))) return;
     invalidatePendingRequests();
-    invalidateAiRequests();
+    invalidateAiRequests(cur.aiRequestId ?? undefined);
     // 无 plan 时从当前 filter 起一个最小 plan（纯排除条件也可独立成 plan）
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
     const plan = maybeNullPlan(normalizeSearchPlan({ ...base, mustNot: expr ?? null }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, plan);
     const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, plan?.filter ?? undefined);
-    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
+    set({ query, plan, expr: plan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, ...idleAiProgress() });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -456,12 +482,12 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const sameExpr = (!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr));
     if (queryEqual(prev, query) && sameExpr) return;
     invalidatePendingRequests();
-    invalidateAiRequests();
+    invalidateAiRequests(get().aiRequestId ?? undefined);
     // 换源：expr 优先作为 plan.filter；否则扁平条件重建 plan（should 不跨 replace 保留）
     const plan = expr
       ? { ...minimalPlanFrom({ expr, query }), filter: expr, ranking: fieldRanking(query.sortBy ?? "created_at", query.sortDir ?? "desc") }
       : resolvedQueryToPlan(query);
-    set({ query, expr: plan.filter ?? undefined, plan, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
+    set({ query, expr: plan.filter ?? undefined, plan, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, ...idleAiProgress(), resolvedTags: [] });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -469,22 +495,26 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   setAiInput: (v) => {
     if (v === get().aiInput) return;
     // 输入框是新的用户意图：旧解析即使稍后返回，也不能覆盖正在编辑的文本。
-    invalidateAiRequests();
-    set({ aiInput: v, aiError: null, aiExplanation: null, warnings: [], parseStatus: null, aiLoading: false });
+    invalidateAiRequests(get().aiRequestId ?? undefined);
+    set({ aiInput: v, aiError: null, aiExplanation: null, warnings: [], parseStatus: null, ...idleAiProgress() });
   },
   setAiResult: (explanation, warnings) =>
     set({ aiExplanation: explanation, warnings, parseStatus: warnings.length > 0 ? "partial" : "full" }),
   clearAiResult: () => {
-    invalidateAiRequests();
-    set({ aiExplanation: null, warnings: [], parseStatus: null, resolvedTags: [], aiError: null, aiLoading: false });
+    invalidateAiRequests(get().aiRequestId ?? undefined);
+    set({ aiExplanation: null, warnings: [], parseStatus: null, resolvedTags: [], aiError: null, ...idleAiProgress() });
   },
 
   applyAiSearch: async (text, mode = "replace") => {
+    const previousRequestId = get().aiRequestId;
+    if (previousRequestId) void cancelAiSearchRequest(previousRequestId).catch(() => undefined);
     const aiSeq = ++aiRequestSeq;
+    const requestId = `search-${Date.now()}-${aiSeq}`;
     const cur = get().query;
-    set({ aiLoading: true, aiError: null });
+    const startedAt = Date.now();
+    set({ aiLoading: true, aiRequestId: requestId, aiPhase: "queued", aiStartedAt: startedAt, aiElapsedMs: 0, aiCancelPending: false, aiError: null });
     try {
-      const result = await aiParseSearchQuery(text);
+      const result = await aiParseSearchQuery(text, requestId);
       if (aiSeq !== aiRequestSeq) return;
       // AI 结果即将替换执行计划：让在途列表响应失效，避免旧结果回写覆盖新计划。
       invalidatePendingRequests();
@@ -520,15 +550,51 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         warnings: aiWarnings,
         parseStatus: result.parseStatus,
         resolvedTags: nextResolvedTags,
-        aiLoading: false,
+        ...idleAiProgress(),
       });
       useSelectionStore.getState().clear();
       scheduleRefresh(get().refresh);
     } catch (e) {
       if (aiSeq !== aiRequestSeq) return;
       // §9.7：AI 解析失败只设 aiError；保留当前 query/expr/items/total，不触发 refresh
-      set({ aiLoading: false, aiError: e instanceof Error ? e.message : String(e) });
+      set({ ...idleAiProgress(), aiError: e instanceof Error ? e.message : String(e) });
     }
+  },
+
+  handleAiProgress: (progress) => {
+    const cur = get();
+    if (progress.requestId !== cur.aiRequestId) return;
+    if (progress.phase === "cancelled") {
+      set({ ...idleAiProgress(), aiPhase: "cancelled", aiElapsedMs: progress.elapsedMs });
+      return;
+    }
+    if (progress.phase === "failed") {
+      set({ aiLoading: false, aiPhase: "failed", aiElapsedMs: progress.elapsedMs, aiCancelPending: false });
+      return;
+    }
+    if (progress.phase === "completed") {
+      set({ aiLoading: false, aiPhase: "completed", aiElapsedMs: progress.elapsedMs, aiCancelPending: false });
+      return;
+    }
+    set({ aiPhase: progress.phase, aiElapsedMs: Math.max(cur.aiElapsedMs, progress.elapsedMs), aiCancelPending: progress.phase === "cancelling" });
+  },
+
+  cancelAiSearch: async () => {
+    const requestId = get().aiRequestId;
+    if (!requestId) return;
+    aiRequestSeq += 1;
+    set({ aiLoading: false, aiPhase: "cancelling", aiCancelPending: true });
+    try {
+      await cancelAiSearchRequest(requestId);
+    } catch {
+      // 本地代际已失效；即使取消命令暂时不可用，也不会应用该请求的迟到结果。
+      set({ aiCancelPending: false });
+    }
+  },
+
+  tickAiElapsed: () => {
+    const { aiStartedAt, aiRequestId } = get();
+    if (aiRequestId && aiStartedAt !== null) set({ aiElapsedMs: Date.now() - aiStartedAt });
   },
 
   removeAtZonePath: (zone, path) => {
@@ -638,10 +704,10 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     }
     const nextPlan = maybeNullPlan(normalizeSearchPlan({ ...plan, filter, mustNot, should, minimumShouldMatch: min }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, nextPlan);
-    invalidateAiRequests();
+    invalidateAiRequests(cur.aiRequestId ?? undefined);
     const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, nextPlan?.filter ?? undefined);
     invalidatePendingRequests();
-    set({ query, plan: nextPlan, expr: nextPlan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
+    set({ query, plan: nextPlan, expr: nextPlan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, ...idleAiProgress() });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -666,8 +732,8 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const query = syncQueryFromExpr({ ...defaultQuery(), sortBy: cur.query.sortBy, sortDir: cur.query.sortDir }, next?.filter ?? undefined);
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, next);
     invalidatePendingRequests();
-    invalidateAiRequests();
-    set({ query, plan: next, expr: next?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, aiLoading: false });
+    invalidateAiRequests(cur.aiRequestId ?? undefined);
+    set({ query, plan: next, expr: next?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags, ...idleAiProgress() });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -687,9 +753,9 @@ export const useSuperSearchStore = create<SuperSearchState>()(
 
   clearConditions: () => {
     invalidatePendingRequests();
-    invalidateAiRequests();
+    invalidateAiRequests(get().aiRequestId ?? undefined);
     const def = defaultQuery();
-    set({ query: def, expr: undefined, plan: null, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
+    set({ query: def, expr: undefined, plan: null, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, ...idleAiProgress(), resolvedTags: [] });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },

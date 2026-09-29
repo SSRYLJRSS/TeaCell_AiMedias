@@ -7,6 +7,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "@/App";
+import { getHelpPageUrl, openHelpPage, saveSettings } from "@/api/settings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -35,6 +36,7 @@ function mkSettings(): Settings {
     trashRetentionDays: 30,
     customDownloadSources: [],
     modelDownloadProxy: "",
+    tutorialPromptHandled: true,
     appearance: {
       grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
       hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
@@ -76,9 +78,12 @@ vi.mock("@/api/settings", () => ({
     libraryRoot: "",
     trashRetentionDays: 30,
     customDownloadSources: [],
-    modelDownloadProxy: "",
+      modelDownloadProxy: "",
+      tutorialPromptHandled: true,
   }),
   saveSettings: vi.fn().mockResolvedValue(undefined),
+  openHelpPage: vi.fn().mockResolvedValue(undefined),
+  getHelpPageUrl: vi.fn().mockResolvedValue("https://help.example/tutorial"),
 }));
 vi.mock("@/api/import", () => ({
   onImportProgress: vi.fn().mockRejectedValue(new Error("no tauri")),
@@ -207,6 +212,53 @@ describe("App 启动骨架（§3.2）", () => {
     render(<App />);
     expect(screen.getByText("正在准备素材库")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument(); // TitleBar 保留
+  });
+
+  it("新安装首次启动询问是否查看教程，并将选择持久化为已处理", async () => {
+    useSettingsStore.setState({
+      ...emptySettingsStore,
+      settings: { ...mkSettings(), tutorialPromptHandled: false },
+      loaded: true,
+    });
+    render(<App />);
+    expect(await screen.findByRole("dialog", { name: "使用教程" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "以后再看" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ tutorialPromptHandled: true }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "使用教程" })).not.toBeInTheDocument());
+  });
+
+  it("默认浏览器打开失败时展示可复制的使用帮助地址", async () => {
+    vi.mocked(openHelpPage).mockRejectedValueOnce(new Error("browser unavailable"));
+    vi.mocked(getHelpPageUrl).mockResolvedValueOnce("https://help.example/tutorial");
+    useSettingsStore.setState({
+      ...emptySettingsStore,
+      settings: { ...mkSettings(), tutorialPromptHandled: false },
+      loaded: true,
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "查看新手教程" }));
+    expect(await screen.findByDisplayValue("https://help.example/tutorial")).toBeInTheDocument();
+    expect(screen.getByText(/无法自动打开新手教程/)).toBeInTheDocument();
+  });
+
+  it("教程选择持久化失败时如实提示，仍允许继续使用且下次可再次邀请", async () => {
+    vi.mocked(saveSettings).mockRejectedValueOnce(new Error("设置文件不可写"));
+    useSettingsStore.setState({
+      ...emptySettingsStore,
+      settings: { ...mkSettings(), tutorialPromptHandled: false },
+      loaded: true,
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "以后再看" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("设置文件不可写");
+    fireEvent.click(screen.getByRole("button", { name: "继续使用" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "使用教程" })).not.toBeInTheDocument());
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ tutorialPromptHandled: true }));
   });
 
   it("全局阻止 WebView 原生右键菜单", () => {

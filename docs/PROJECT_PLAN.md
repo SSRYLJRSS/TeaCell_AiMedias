@@ -1,6 +1,6 @@
 # 项目计划
 
-> 更新日期：2026-09-25
+> 更新日期：2026-09-28
 >
 > 本文档记录当前阶段、交付状态和下一阶段范围。产品行为见 [PRD.md](PRD.md)，技术结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -71,6 +71,20 @@
 - 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。对应源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [三端 code-gate run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683) 已全部通过。
 - 工作分支 SHA `7474d48e7af2c4d48b922538d8956acd5496d9e7` 的首次手动 Windows smoke [run 36094987343 attempt 1](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36094987343) 在 `ViewerPage.test.tsx` 的“fallback 沉浸按 Esc 返回查看器”用例失败：Escape 后未在 waitFor 时限内恢复“返回素材库”按钮。相同 SHA 的 attempt 2 通过；本机单文件 14/14 和完整前端单测 709 passed/2 skipped 也通过，故原失败未能稳定复现。检查到键盘监听器在 passive `useEffect` 中随 `immersiveMode` 重绑，沉浸 portal 出现与新监听器生效之间存在事件空档。`0aa1039` 将监听器改为 `useLayoutEffect`，让处理器在提交后的绘制前更新；修复后本机该文件 14/14、全量前端单测 709/2、lint、typecheck 通过，且该 SHA 的 Windows smoke `36096765334` 与四 job code-gate `36096755139` 均全绿。结论：原始失败为一次真实但未复现的异步时序失败；修复针对代码中可确认的监听器空档，不把 attempt 2 当成覆盖 attempt 1 的证据。
 - 本次采用快进方式将集成基线纳入 `main`，保留全部原始提交，不 squash、不强推、不删除恢复分支，也不覆盖快照工作区中的用户改动。代码/工作流验证基线仍为 `b5c25b2`。未创建 PR、未改保护规则、未发布。分支与门禁状态见 §2.3；Required checks、候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过和主线合并都不等于可发布或平台支持等级已升级。
+
+### 2.5 安装测试问题修复状态（2026-09-28）
+
+用户反馈对应的 D1–D8 代码实现、自动化回归和契约文档已在独立工作区完成。复核 D2 时发现原用户句回归夹具把绿色建模成普通标签，未覆盖真实 `dominant_hue` 元数据路径；现已为 AI 协议增加 `preferredMetadata` 软条件，映射到既有 `SearchPlanV3.should`，并对旧模型误把“最好绿色”输出成硬色相筛选的响应做窄范围纠正，同时保护明确要求的颜色条件。软元数据筛选条件在界面使用自然语言 evidence 展示，避免向用户暴露内部字段与区间。协议、Rust/TypeScript 类型、Prompt、QA 和合成库回归已同步。复核用户产品名时发现当前工作树仍配置旧名；现已统一面向用户的应用标题、启动/教程/关于文案及 README 为“茶馆”，保留稳定的 Tauri identifier 与现有数据目录。前端 typecheck/lint/unit（730 passed、2 skipped）/tooling（15 passed）/build、Rust fmt/clippy/all-features tests、完整 smoke、Windows strict media check 均通过；本轮名称与展示修正后的 typecheck/lint、定向组件测试（9 passed）和生产构建也通过。最新 Windows x64 本地 MSI（110,731,264 bytes，SHA256 `A618ACB9CDB4F0951E3BAD8F71838C2EC3938186A2B5D86330C5DBDFFC0C1391`）和 NSIS（81,150,804 bytes，SHA256 `BE28A886C560FC6D92205441829D56A7A5500D9634B928BBEEFB9598588D6580`）已从当前工作树重建，产物名均为“茶馆”；两者均未签名，属于本地验证包，不是可分发候选包。未在当前用户配置安装，未提交或发布。
+
+D9 的 Windows 全新配置、保留数据升级、卸载重装和独立配置验收尚未执行：当前没有可用的隔离 Windows 用户账户或虚拟机，且应用使用系统已知用户数据目录，不能通过改环境变量隔离。系统浏览器/剪贴板、多尺寸/主题/键盘的桌面检查和真实素材旅程也尚未验收。没有安装或触碰当前用户数据；目标平台真机验收、真实素材验收和媒体依赖许可复核仍按 §2.2 阻止发布。该项是安装/产品环境验收限制，不代表 D1–D8 自动化实现未完成。
+
+### 2.6 新一轮安装测试优化状态（2026-09-29）
+
+本轮优化已在集成工作区完成源码修改和自动化验证，等待用户使用开发版走查；未生成安装包、未安装或发布。AI 打标进度已区分本次执行数量与批次累计，系统级 AI 协议固定、分类业务说明可编辑；导入确认流程复用后端预检候选清单，减少服务层重复展开路径；入库提示同宽；关于页、项目/许可证链接与 GitHub Issue 反馈入口已更新。
+
+后续复核补齐了关于页全名“茶馆AI素材管理”、选择器返回后先让左侧既有进度区绘制“正在检查文件与缩略图”，并在超级搜索服务绑定解析后再检查有效 AI 配置。当前本轮继续收紧服务选择：未绑定时只自动选择可用在线服务，绝不读取旧版默认档案或自动切换本机模型；超级搜索设置页显示后端实际解析结果，用户仍可显式绑定本机服务。关于页增加作者主页入口并复用外链失败后的可复制地址提示。分类管理明确为五个公开内置 AI 分类可编辑说明/显式规则、可停用恢复但不可删除；画面摘要与内部兼容 key 不开放管理；用户自建分类可编辑、停用、恢复和删除；旧 `purpose`/`technical` 数据按有无用户数据或自定义配置迁移保留。针对已实测到的 OpenAI 兼容 `finish_reason=length` 与 Anthropic `stop_reason=max_tokens`，请求层返回 `AI_OUTPUT_TRUNCATED`，显示可执行的重试建议并保留现有搜索条件/结果，不把不完整 JSON 降级成整句关键词。真实服务表现、真实素材结果与 200 张混合样本的桌面时序仍待用户走查。
+
+最新本机验证：`npm run typecheck`、`npm run lint`、`npm run test:unit`（736 passed、2 skipped）、`npm run test:tooling`（15/15）、`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-features`（523 个库测试与全部集成测试通过）及完整 `pwsh ./scripts/smoke.ps1` 均通过。smoke 的前端生产构建成功，主 JS chunk 为 678.50 kB（gzip 200.70 kB），仍提示超过 500 kB 的体积告警。Rust 链接器输出一条工具链 warning，但所有门禁退出码均为 0。设置页服务解析、作者链接和分类生命周期已通过自动化验证；用户桌面验收需先退出旧实例，再从最新集成工作树启动开发版，并用真实在线连接验证超级搜索。没有生成安装包、安装、发布、提交或推送。导入性能对照、诊断页黑色控制台窗口复现、真实服务/素材表现与桌面外链仍属于待验收项；本轮不等同于发布验收。
 
 ## 3. 里程碑
 

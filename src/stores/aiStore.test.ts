@@ -98,6 +98,7 @@ beforeEach(() => {
     running: false,
     cancelling: false,
     error: null,
+    runProgress: null,
     pendingAssetIds: [],
   });
   useSettingsStore.setState({ settings: mkSettings(), loaded: true, loadError: null, saving: false });
@@ -173,15 +174,30 @@ describe("aiStore 打标状态机", () => {
     expect(aiConfirmAll).not.toHaveBeenCalled();
   });
 
-  it("patchProgress：实时写回 processing + 节流重载建议", async () => {
-    useAiStore.setState({ currentBatchId: 1, batches: [mkBatch(1)] });
+  it("patchProgress：按批次记录本次执行进度，不覆盖批次累计值", async () => {
+    useAiStore.setState({
+      currentBatchId: 1,
+      running: true,
+      batches: [mkBatch(1, { processed: 7, total: 205 })],
+      runProgress: {
+        batchId: 1,
+        processed: 0,
+        total: 0,
+        currentAssetId: null,
+        batchProcessedAtStart: 7,
+        requestedLimit: 10,
+      },
+    });
     vi.mocked(aiListSuggestions).mockResolvedValue([mkSuggestion(101)]);
-    useAiStore.getState().patchProgress(3);
+    useAiStore.getState().patchProgress({ batchId: 1, processed: 3, total: 10, currentAssetId: 105 });
     const s = useAiStore.getState();
-    expect(s.batches[0].processed).toBe(3);
-    expect(s.batches[0].status).toBe("processing");
+    expect(s.batches[0].processed).toBe(7);
+    expect(s.runProgress).toMatchObject({ batchId: 1, processed: 3, total: 10, currentAssetId: 105 });
     // 首次 patch 应触发重载（>1s 节流窗口）
     expect(aiListSuggestions).toHaveBeenCalledTimes(1);
+
+    useAiStore.getState().patchProgress({ batchId: 2, processed: 1, total: 10, currentAssetId: 206 });
+    expect(useAiStore.getState().runProgress).toMatchObject({ batchId: 1, processed: 3, total: 10 });
   });
 
   it("cancel：仅当有 currentBatchId 才调后端", async () => {

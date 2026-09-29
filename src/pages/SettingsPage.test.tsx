@@ -12,7 +12,7 @@ import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { usePlatformStore } from "@/stores/platformStore";
 import { useTagStore } from "@/stores/tagStore";
-import { exportDiagnostics, getSettings, openHelpPage, resetAppData, saveSettings } from "@/api/settings";
+import { exportDiagnostics, getSettings, openAuthorPage, openFeedbackPage, openHelpPage, openLicensePage, openProjectPage, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
@@ -46,6 +46,14 @@ vi.mock("@/api/settings", () => ({
   openDataDir: vi.fn().mockResolvedValue(undefined),
   openLogsDir: vi.fn().mockResolvedValue(undefined),
   openHelpPage: vi.fn().mockResolvedValue(undefined),
+  openProjectPage: vi.fn().mockResolvedValue(undefined),
+  getProjectPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias"),
+  openLicensePage: vi.fn().mockResolvedValue(undefined),
+  getLicensePageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias/blob/main/LICENSE"),
+  openAuthorPage: vi.fn().mockResolvedValue(undefined),
+  getAuthorPageUrl: vi.fn().mockResolvedValue("https://www.xiaohongshu.com/user/profile/68294317000000000e01ca6d"),
+  openFeedbackPage: vi.fn().mockResolvedValue(undefined),
+  getFeedbackPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias/issues/new"),
   exportDiagnostics: vi.fn().mockResolvedValue({ path: "D:/diag.zip", logFiles: 2, bytes: 2048 }),
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
   resetAppData: vi.fn().mockResolvedValue({
@@ -119,6 +127,15 @@ vi.mock("@/api/connections", () => ({
     { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, credentialStatus: "configured", enabled: true },
   ]),
   getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: "c1" }),
+  getSuperSearchServiceResolution: vi.fn().mockResolvedValue({
+    ready: true,
+    source: "automaticOnline",
+    connectionId: "c1",
+    name: "通义",
+    model: "qwen-max",
+    deployment: "cloud",
+    message: null,
+  }),
   setAiUsageBinding: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -172,6 +189,7 @@ const emptyStore = {
   loading: false,
   loadError: null,
   saving: false,
+  previewAppearance: null,
 };
 
 beforeEach(() => {
@@ -210,16 +228,61 @@ beforeEach(() => {
 /** 切到「外观与浏览」路由并等待色板状态行渲染（FB4-03 状态在进入该路由时读取） */
 async function openGeneral() {
   render(<SettingsPage />);
-  await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
   fireEvent.click(screen.getByText("外观与浏览"));
   await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 }
+
+describe("SettingsPage 自动保存", () => {
+  it("初次加载、悬停和聚焦不写设置；真实修改后自动保存且不显示全局保存按钮", async () => {
+    useSettingsStore.setState(emptyStore);
+    render(<SettingsPage />);
+    await screen.findByText("总库位置");
+    expect(saveSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("诊断与支持"));
+    const level = await screen.findByLabelText("诊断日志级别");
+
+    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
+    vi.useFakeTimers();
+    fireEvent.mouseOver(level);
+    fireEvent.focus(level);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200);
+    });
+    expect(saveSettings).not.toHaveBeenCalled();
+
+    fireEvent.change(level, { target: { value: "debug" } });
+    expect(level).toHaveValue("debug");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(saveSettings).not.toHaveBeenCalled();
+    fireEvent.change(level, { target: { value: "trace" } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ logLevel: "trace" }));
+    expect(screen.getByText("已自动保存")).toBeInTheDocument();
+  });
+
+  it("离开设置页时立即提交尚在防抖窗口中的修改", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    const { unmount } = render(<SettingsPage />);
+    await screen.findByText("总库位置");
+    fireEvent.click(screen.getByText("诊断与支持"));
+    fireEvent.change(await screen.findByLabelText("诊断日志级别"), { target: { value: "debug" } });
+
+    unmount();
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ logLevel: "debug" })));
+  });
+});
 
 describe("SettingsPage §6.1 信息架构", () => {
   it("分组顺序：第一项是素材库与入库；含 AI 与模型/标签与分类/外观与浏览/存储与维护/诊断与支持/关于", async () => {
     useSettingsStore.setState({ settings: null, loaded: false, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     for (const g of ["素材库与入库", "AI 与模型", "标签与分类", "外观与浏览", "存储与维护", "诊断与支持", "关于"]) {
       expect(screen.getAllByText(g).length).toBeGreaterThan(0);
@@ -229,7 +292,7 @@ describe("SettingsPage §6.1 信息架构", () => {
   it("网盘分组与「本地打标」顶层组不存在（§6.8 网盘移除）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     expect(screen.queryByText(/网盘/)).not.toBeInTheDocument();
     expect(screen.queryByText("本地打标")).not.toBeInTheDocument();
@@ -238,7 +301,7 @@ describe("SettingsPage §6.1 信息架构", () => {
   it("诊断与支持提供使用帮助入口并调用后端默认浏览器命令", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("诊断与支持"));
     fireEvent.click(await screen.findByRole("button", { name: "打开使用帮助" }));
     await waitFor(() => expect(openHelpPage).toHaveBeenCalledTimes(1));
@@ -261,7 +324,7 @@ describe("SettingsPage §6.1 信息架构", () => {
   it("FB2-02 素材框：切到「外观与浏览」后存在「素材框」组与 7 项比例选项", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("外观与浏览"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
     // 7 项比例选项（1:1 / 4:3 / 3:2 / 16:9 / 3:4 / 2:3 / 9:16）
@@ -274,26 +337,26 @@ describe("SettingsPage §6.1 信息架构", () => {
   });
 
   // FB2-08（FX-07）+ FB3-10 + FB4-03：色条设置区块（「入库网格显示」已隐藏——永久 disabled 的噪音控件不保留）
-  it("色条区块：切「显示算法主色色条」Toggle 触发即时预览；总开关关闭后位置/样式行不渲染", async () => {
+  it("色条区块：切「显示主色色条」Toggle 触发即时预览；总开关关闭后位置/样式行不渲染", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("外观与浏览"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 
     // 默认 colorStrip.enabled=true → 细节折叠在（W4-5）；展开后位置/样式行都在
-    expect(screen.getByText("显示算法主色色条")).toBeInTheDocument();
+    expect(screen.getByText("显示主色色条")).toBeInTheDocument();
     fireEvent.click(screen.getByText("▸ 色条细节"));
     expect(screen.getByText("素材库卡片显示")).toBeInTheDocument();
     expect(screen.getByText("大图浏览显示")).toBeInTheDocument();
     expect(screen.queryByText("入库网格显示")).toBeNull();
     expect(screen.getByText("色条高度")).toBeInTheDocument();
 
-    // 点击总开关 → draft 关闭 + pushPreview（commitAppearanceDebounced）被调用。
-    // 使用假时钟并在本测试内完成防抖保存，避免模块级 timer 的回读请求泄漏到后续测试。
+    // 点击总开关 → draft 关闭 + 即时预览；设置页自身的自动保存负责唯一一次持久化。
+    // 使用假时钟并在本测试内完成自动保存，避免 timer 泄漏到后续测试。
     vi.useFakeTimers();
-    const previewSpy = vi.spyOn(useSettingsStore.getState(), "commitAppearanceDebounced");
-    const master = fieldSwitch("显示算法主色色条");
+    const previewSpy = vi.spyOn(useSettingsStore.getState(), "setPreviewAppearance");
+    const master = fieldSwitch("显示主色色条");
     fireEvent.click(master);
     expect(previewSpy).toHaveBeenCalledTimes(1);
     // 关闭后位置/样式行整体不渲染（条件渲染，不是 disabled）；状态行（色条数据）仍可见
@@ -302,22 +365,68 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.queryByText("色条高度")).toBeNull();
     expect(screen.getByText("色条数据")).toBeInTheDocument();
     // 再打开恢复渲染（折叠保持展开状态）
-    fireEvent.click(fieldSwitch("显示算法主色色条"));
+    fireEvent.click(fieldSwitch("显示主色色条"));
     expect(screen.getByText("素材库卡片显示")).toBeInTheDocument();
     expect(previewSpy).toHaveBeenCalledTimes(2);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(800);
+      await vi.advanceTimersByTimeAsync(500);
     });
     expect(vi.mocked(saveSettings)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(getSettings)).toHaveBeenCalledTimes(1);
     expect(useSettingsStore.getState().saving).toBe(false);
   });
 
+  it("关于页显示公测信息、项目/作者/许可证链接且不显示保存栏", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("关于"));
+    expect(await screen.findByText("V1.0公测版")).toBeInTheDocument();
+    expect(screen.getByText("茶馆AI素材管理")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "小红书主页" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "MIT License" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ }));
+    fireEvent.click(screen.getByRole("button", { name: "小红书主页" }));
+    fireEvent.click(screen.getByRole("button", { name: "MIT License" }));
+    await waitFor(() => expect(openProjectPage).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(openAuthorPage).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(vi.mocked(openLicensePage)).toHaveBeenCalledTimes(1));
+  });
+
+  it("诊断页可打开 GitHub 反馈入口，失败时显示可复制链接", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    vi.mocked(openFeedbackPage).mockRejectedValueOnce(new Error("open failed"));
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("诊断与支持"));
+    fireEvent.click(await screen.findByRole("button", { name: "在 GitHub 提交问题" }));
+    await waitFor(() => expect(screen.getByText(/issues\/new/)).toBeInTheDocument());
+    expect(openFeedbackPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("色条总开关只控制展示，不改变颜色数据或搜索；所有位置关闭时给出提示", async () => {
+    const settings = mkSettings();
+    settings.appearance.colorStrip.showInViewer = false;
+    useSettingsStore.setState({ settings, loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("外观与浏览"));
+    await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
+
+    expect(screen.getByText(/不影响色板数据、色板计算或颜色搜索/)).toBeInTheDocument();
+    expect(screen.getByText("已开启色条，但尚未选择显示位置。")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("▸ 色条细节"));
+    expect(screen.getByText("素材库卡片显示")).toBeInTheDocument();
+    expect(screen.getByText("大图浏览显示")).toBeInTheDocument();
+  });
+
   it("AI 子页「自动打标」只显示「此功能使用的服务」+ 功能参数，不再重复服务管理列表", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("AI 与模型"));
     fireEvent.click(screen.getAllByText("自动打标")[0]);
@@ -331,10 +440,22 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.getByLabelText("本机服务每批处理数量")).toHaveValue("5");
   });
 
+  it("超级搜索未单独绑定时显示自动选择的在线服务及实际模型，不跟随旧默认档案", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("AI 与模型"));
+    fireEvent.click(screen.getByText("超级搜索"));
+
+    expect(await screen.findByText(/自动选择在线服务，当前使用：通义 · qwen-max（在线）/)).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "自动选择在线服务" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox")).toHaveValue("");
+  });
+
   it("「服务管理」子页是唯一维护入口：服务位置二选一 + 服务列表", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("AI 与模型"));
     await waitFor(() => expect(screen.getAllByText("服务位置").length).toBeGreaterThan(0));
@@ -347,7 +468,7 @@ describe("SettingsPage §6.1 信息架构", () => {
   it("「服务管理」切到本机服务：显示本地说明与新增服务入口", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("AI 与模型"));
     await waitFor(() => expect(screen.getByRole("tab", { name: "本机服务" })).toBeInTheDocument());
@@ -360,7 +481,7 @@ describe("SettingsPage AI 打标审核流程", () => {
   it("不再展示自动写入、自动建词和置信度高级策略", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null, saving: false });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("AI 与模型"));
     fireEvent.click(screen.getAllByText("自动打标")[0]);
     await screen.findByText("此功能使用的服务");
@@ -373,14 +494,13 @@ describe("SettingsPage AI 打标审核流程", () => {
   it("诊断与支持页切换日志级别后，保存请求携带 debug 级别", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("诊断与支持"));
     const level = await screen.findByLabelText("诊断日志级别");
     fireEvent.change(level, { target: { value: "debug" } });
     expect(level).toHaveValue("debug");
 
-    fireEvent.click(screen.getByText("保存设置"));
     await waitFor(() =>
       expect(vi.mocked(saveSettings)).toHaveBeenCalledWith(
         expect.objectContaining({ logLevel: "debug" }),
@@ -399,7 +519,7 @@ describe("SettingsPage AI 打标审核流程", () => {
     });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("诊断与支持"));
     fireEvent.click(await screen.findByText("导出诊断包…"));
@@ -418,7 +538,7 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     render(<SettingsPage />);
 
     expect(screen.getByText(/加载设置中/)).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
   });
 
   it("加载失败显示错误，点击重试再次调用 load，成功后进入表单", async () => {
@@ -434,7 +554,7 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     expect(vi.mocked(getSettings)).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: /重试/ }));
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     expect(vi.mocked(getSettings)).toHaveBeenCalledTimes(2);
     expect(useSettingsStore.getState().settings).not.toBeNull();
   });
@@ -442,7 +562,7 @@ describe("SettingsPage 加载与 Hook 安全", () => {
   it("「存储与维护」分组可触发媒体元数据回填（只补缺失信息范围；FB3-11 新按钮名）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("存储与维护"));
     fireEvent.click(screen.getByRole("button", { name: "仅补充缺失信息" }));
@@ -456,7 +576,7 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     vi.mocked(rescanImageDimensions).mockResolvedValue({ total: 3, success: 3, failed: 0, skipped: 0 });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("存储与维护"));
     const btn = screen.getByRole("button", { name: "补充缺失的图片分辨率" });
@@ -472,7 +592,7 @@ describe("SettingsPage §13（FB-07）宽屏布局", () => {
   it("右侧内容不再用 max-w-xl 小框：存在 1040px 内容容器与加宽侧栏", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     const { container } = render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     // 内容容器使用 max-w-[1040px]（替代旧 max-w-xl）
     expect(container.querySelector(".max-w-\\[1040px\\]")).not.toBeNull();
     // 侧栏宽度进入 220~260px 范围
@@ -481,14 +601,13 @@ describe("SettingsPage §13（FB-07）宽屏布局", () => {
     expect((aside as HTMLElement).className).toMatch(/w-\[224px\]/);
   });
 
-  it("保存栏 sticky 底部并提供 未保存/已保存 状态", async () => {
+  it("不显示全局保存栏；未修改时不触发自动保存", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     const { container } = render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    // sticky 保存栏
-    expect(container.querySelector(".sticky.bottom-0")).not.toBeNull();
-    // 未做任何修改：不显示「有未保存的更改」
-    expect(screen.queryByText("有未保存的更改")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
+    expect(container.querySelector(".sticky.bottom-0")).toBeNull();
+    expect(saveSettings).not.toHaveBeenCalled();
   });
 });
 
@@ -599,7 +718,7 @@ describe("存储与维护 · 重置数据", () => {
   /** 切到「存储与维护」路由并等待重置面板渲染 */
   async function openData() {
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("存储与维护"));
     await waitFor(() => expect(screen.getByText("重置所选数据")).toBeInTheDocument());
   }
@@ -793,12 +912,12 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
   async function openTagsRoute() {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getAllByText("标签与分类").at(-1)!);
     fireEvent.click(await screen.findByText("用途"));
   }
 
-  it("无条目分面的「参与 AI」如实显示为关；勾选后补建条目并点亮「保存设置」", async () => {
+  it("无条目分面的「参与 AI」如实显示为关；勾选后补建条目", async () => {
     const { listAllTagFacets } = await import("@/api/tags");
     vi.mocked(listAllTagFacets).mockResolvedValue([activeFacet]);
     await openTagsRoute();
@@ -809,8 +928,7 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
 
     fireEvent.click(checkbox);
     expect(checkbox).toBeChecked();
-    // 草稿变脏 → 之前 bug 下这里保持禁用，用户以为「无法保存」
-    expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
   });
 
   it("无条目分面输入「给 AI 的识别规则」也会补建条目（不再静默丢弃）", async () => {
@@ -819,7 +937,7 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
     await openTagsRoute();
 
     fireEvent.change(await screen.findByLabelText("给 AI 的识别规则"), { target: { value: "只写稳定用途" } });
-    expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
   });
 });
 
@@ -869,7 +987,7 @@ describe("SettingsPage 标签数据保护", () => {
   it("标签设置不展示内部数据保护控件", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("标签与分类"));
 
     await screen.findByText("AI 自动打标分类");

@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 
+/// 内部固定的机器协议补充；不承载可配置的分类业务语义。
+pub const DEFAULT_TAGGING_PROMPT: &str = "严格遵守本次请求提供的分类、分类 key、选项数量与数值配置；仅输出规定 JSON 结构，不新增字段；分类业务含义以各分类说明为准；不得输出请求未提供的分类 key。";
+
 /// AI 分面配置（P1B：tag_facets 是唯一事实源，设置只保存 facetKey/hint/enabledForAi/displayName）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,11 +105,11 @@ pub struct AiSettings {
     /// 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto）
     #[serde(default = "default_ollama_source_id")]
     pub ollama_source_id: String,
-    /// AI 打标提示词覆盖（用户可自行修改；空 = 用内置默认）
-    #[serde(default)]
+    /// 旧版全局文本字段：只读兼容并强制归一为内部协议，不再返回/持久化。
+    #[serde(default = "default_tagging_prompt", skip_serializing)]
     pub system_prompt_tagging: String,
-    /// 超级搜索提示词覆盖（用户可自行修改；空 = 用内置默认）
-    #[serde(default)]
+    /// 旧版覆盖字段：只读兼容，运行时忽略且不再返回/持久化。
+    #[serde(default, skip_serializing)]
     pub system_prompt_search: String,
     /// AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30
     #[serde(default = "default_conf_min_suggest")]
@@ -139,6 +142,9 @@ impl AiSettings {
         if self.video_tagging_mode != "frames" {
             self.video_tagging_mode = "cover".into();
         }
+        // 旧版本允许自定义全局提示词。新契约只允许编辑分类说明，机器协议固定。
+        self.system_prompt_tagging = default_tagging_prompt();
+        self.system_prompt_search.clear();
         self.video_frame_count = self.video_frame_count.clamp(2, 8);
         // FB3-07：云端子批大小收敛到运行时实际范围 [10,50]（ai_cloud 执行层 clamp 同值）。
         // 历史 500（v2.5 胶片条方案遗留）运行时永远被 clamp 到 50，用户看到的值永不生效——
@@ -257,7 +263,7 @@ impl Default for AiSettings {
             batch_limit: default_batch_limit(),
             local_batch_limit: default_local_batch_limit(),
             ollama_source_id: default_ollama_source_id(),
-            system_prompt_tagging: String::new(),
+            system_prompt_tagging: DEFAULT_TAGGING_PROMPT.to_string(),
             system_prompt_search: String::new(),
             confidence_min_suggest: 0.30,
         }
@@ -283,7 +289,7 @@ pub struct GridAppearance {
     /// 入库网格格子档位，默认 1（=120px）
     #[serde(default = "default_import_cell_step")]
     pub import_cell_step: i64,
-    /// 统一容器比例（决策 4），默认 "1:1"
+    /// 统一容器比例（决策 4），默认 "4:3"；已有合法比例不迁移。
     #[serde(default = "default_cell_aspect")]
     pub cell_aspect: String,
     /// 填充方式 cover|contain|smart，默认 "cover"
@@ -301,7 +307,11 @@ fn default_import_cell_step() -> i64 {
     1
 }
 fn default_cell_aspect() -> String {
-    "1:1".into()
+    "4:3".into()
+}
+
+fn default_tagging_prompt() -> String {
+    DEFAULT_TAGGING_PROMPT.to_string()
 }
 fn default_cell_fit() -> String {
     "cover".into()
@@ -492,6 +502,13 @@ pub struct Settings {
     /// FB2-01/02/03/08：外观与交互设置
     #[serde(default)]
     pub appearance: Appearance,
+    /// 首次启动教程提示是否已处理。新配置及旧设置文件缺字段时均默认未处理。
+    #[serde(default = "default_tutorial_prompt_handled")]
+    pub tutorial_prompt_handled: bool,
+}
+
+fn default_tutorial_prompt_handled() -> bool {
+    false
 }
 
 fn default_theme() -> String {
@@ -521,6 +538,7 @@ impl Default for Settings {
             custom_download_sources: default_custom_sources(),
             model_download_proxy: String::new(),
             appearance: Appearance::default(),
+            tutorial_prompt_handled: false,
         }
     }
 }
@@ -874,7 +892,7 @@ mod tests {
             s.appearance.grid.library_cell_step,
             default_library_cell_step()
         );
-        assert_eq!(s.appearance.grid.cell_aspect, "1:1");
+        assert_eq!(s.appearance.grid.cell_aspect, "4:3");
         assert_eq!(s.appearance.grid.cell_fit, "cover");
         assert!(s.appearance.hover_preview.enabled, "hover 默认应开启");
         assert_eq!(s.appearance.hover_preview.preview_seconds, 3);
@@ -883,6 +901,29 @@ mod tests {
         assert_eq!(s.appearance.color_strip.height, "normal");
         assert!(!s.appearance.color_strip.show_in_library_grid);
         assert!(s.appearance.color_strip.show_in_viewer);
+    }
+
+    #[test]
+    fn legacy_global_prompts_are_ignored_and_not_serialized() {
+        let mut ai: AiSettings = serde_json::from_str(
+            r#"{"systemPromptTagging":"override tagging","systemPromptSearch":"override search"}"#,
+        )
+        .unwrap();
+        ai.normalize();
+        assert_eq!(ai.system_prompt_tagging, DEFAULT_TAGGING_PROMPT);
+        assert!(ai.system_prompt_search.is_empty());
+        let encoded = serde_json::to_string(&ai).unwrap();
+        assert!(!encoded.contains("systemPromptTagging"));
+        assert!(!encoded.contains("systemPromptSearch"));
+    }
+
+    #[test]
+    fn first_run_tutorial_defaults_to_unhandled_for_new_and_legacy_settings() {
+        assert!(!Settings::default().tutorial_prompt_handled);
+        let existing: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(!existing.tutorial_prompt_handled);
+        let handled: Settings = serde_json::from_str(r#"{"tutorialPromptHandled":true}"#).unwrap();
+        assert!(handled.tutorial_prompt_handled);
     }
 
     #[test]
@@ -895,7 +936,7 @@ mod tests {
         normalize_appearance(&mut s);
         let g = &s.appearance.grid;
         assert_eq!(g.library_cell_step, 7); // clamp 0..=7
-        assert_eq!(g.cell_aspect, "1:1");
+        assert_eq!(g.cell_aspect, "4:3");
         assert_eq!(g.cell_fit, "cover");
         assert_eq!(s.appearance.hover_preview.preview_seconds, 10);
         assert_eq!(s.appearance.color_strip.count, 6);

@@ -29,6 +29,16 @@ export interface AiConnection {
 
 export type AiUsage = "super_search" | "tagging";
 
+export interface SuperSearchServiceResolution {
+  ready: boolean;
+  source: "explicitBinding" | "automaticOnline";
+  connectionId: string | null;
+  name: string | null;
+  model: string | null;
+  deployment: AiDeployment | null;
+  message: string | null;
+}
+
 export function listAiConnections(): Promise<AiConnection[]> {
   return invoke<AiConnection[]>("list_ai_connections");
 }
@@ -71,6 +81,11 @@ export function setAiUsageBinding(usage: AiUsage, connectionId: string | null): 
 
 export function getAiUsageBindings(): Promise<Record<AiUsage, string | null>> {
   return invoke<Record<AiUsage, string | null>>("get_ai_usage_bindings");
+}
+
+/** 返回超级搜索实际解析的服务信息，不暴露 API Key 或服务地址。 */
+export function getSuperSearchServiceResolution(): Promise<SuperSearchServiceResolution> {
+  return invoke<SuperSearchServiceResolution>("get_super_search_service_resolution");
 }
 
 /** FB3-08：连接测试结果（后端从 keyring 取密钥，按协议分支测试；错误信息已脱敏） */

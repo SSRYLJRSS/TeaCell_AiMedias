@@ -1844,6 +1844,8 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
     migrate_remove_style_facet(conn)?;
+    // 用途/技术特征不再是产品预置分类；空默认行移除，有历史数据或自定义配置则保留为用户分类。
+    migrate_remove_legacy_manual_system_facets(conn)?;
     Ok(())
 }
 
@@ -2033,6 +2035,75 @@ fn migrate_remove_style_facet(conn: &Connection) -> AppResult<()> {
          ON CONFLICT(key) DO UPDATE SET value='1'",
         [],
     )?;
+    Ok(())
+}
+
+/// 将旧版内置的 purpose/technical 分类移出默认系统集合。
+/// 该修复通过 is_system 状态幂等：只处理仍标记为系统的旧行，不触碰用户后来创建的同 key 分类。
+fn migrate_remove_legacy_manual_system_facets(conn: &Connection) -> AppResult<()> {
+    for (key, display_name, description, max_items, sort_order) in [
+        ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
+        (
+            "technical",
+            "可用性/技术特征",
+            "透明背景、可裁切等非文件格式属性",
+            4,
+            90,
+        ),
+    ] {
+        let Some(facet) = crate::db::tag_facets::list_all(conn)?
+            .into_iter()
+            .find(|facet| facet.key == key && facet.is_system)
+        else {
+            continue;
+        };
+
+        let has_data: bool = conn.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM tags WHERE facet_key = ?1)
+                OR EXISTS(SELECT 1 FROM asset_facet_numbers WHERE facet_key = ?1)
+                OR EXISTS(SELECT 1 FROM ai_suggestion_items WHERE facet_key = ?1)
+                OR EXISTS(SELECT 1 FROM ai_suggestions WHERE
+                    CASE WHEN json_valid(suggested_tags)
+                         THEN json_type(suggested_tags, '$.' || ?1) IS NOT NULL ELSE 0 END
+                    OR CASE WHEN json_valid(confirmed_tags)
+                            THEN json_type(confirmed_tags, '$.' || ?1) IS NOT NULL ELSE 0 END)",
+            [key],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        let is_unchanged_default = facet.display_name == display_name
+            && facet.description == description
+            && facet.selection_mode == "multi"
+            && facet.max_items == Some(max_items)
+            && facet.sort_order == sort_order
+            && facet.status == "active"
+            && facet.applies_to == "all"
+            && facet.input_mode == "manual_only"
+            && facet.cfg_visible_in_navigation
+            && facet.cfg_manual_assignable
+            && !facet.cfg_ai_assignable
+            && facet.cfg_searchable
+            && facet.facet_kind == "tag"
+            && facet.num_min.is_none()
+            && facet.num_max.is_none()
+            && facet.num_unit.is_empty()
+            && facet.num_decimals == 0
+            && facet.num_step == 1.0;
+
+        if has_data || !is_unchanged_default {
+            conn.execute(
+                "UPDATE tag_facets SET is_system = 0, updated_at = ?1 WHERE key = ?2 AND is_system = 1",
+                rusqlite::params![chrono::Utc::now().timestamp_millis(), key],
+            )?;
+            tracing::info!(
+                facet_key = key,
+                "旧系统分类包含用户数据或自定义配置，已保留为用户分类"
+            );
+        } else {
+            crate::db::tag_facets::delete_facet_cascade(conn, key)?;
+            tracing::info!(facet_key = key, "已移除未使用的旧系统默认分类");
+        }
+    }
     Ok(())
 }
 
@@ -2754,6 +2825,23 @@ mod tests {
     #[test]
     fn v20_facet_merge_idempotent_and_maps_correctly() {
         let c = crate::db::init_memory().unwrap();
+        // 当前建库默认不再播种这两个分类；在此显式造出 V20 前的旧系统行，
+        // 继续覆盖旧库迁移行为，而不依赖新库带有已移除的默认分类。
+        insert_legacy_manual_system_facet(&c, "purpose", "用途", "稳定的发布或设计用途", 3, 30);
+        insert_legacy_manual_system_facet(
+            &c,
+            "technical",
+            "可用性/技术特征",
+            "透明背景、可裁切等非文件格式属性",
+            4,
+            90,
+        );
+        c.execute(
+            "UPDATE tag_facets SET cfg_ai_assignable=1, input_mode='ai_and_manual'
+              WHERE key IN ('purpose', 'technical')",
+            [],
+        )
+        .unwrap();
         // init_memory 已跑到最新版本（V20 已应用）。构造旧 JSON 侧再手动重跑 migrate_v20 验证幂等。
         // 注意 get_settings 会自动充实默认 ai_facet_configs（normalize_ai_facet_defaults），
         // save_settings 已 skip_serializing 该字段 → 直接写原始 JSON 才能模拟老库。
@@ -3129,8 +3217,39 @@ mod tests {
     }
 
     #[test]
-    fn manual_only_system_facets_migration_runs_once() {
+    fn legacy_manual_only_migration_remains_one_time_for_existing_rows() {
         let c = crate::db::init_memory().unwrap();
+        for (key, name, description, max_items, sort_order) in [
+            ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
+            (
+                "technical",
+                "可用性/技术特征",
+                "透明背景、可裁切等非文件格式属性",
+                4,
+                90,
+            ),
+        ] {
+            c.execute(
+                "INSERT INTO tag_facets
+                   (key, display_name, description, selection_mode, max_items, sort_order,
+                    is_system, status, applies_to, created_at, updated_at, cfg_ai_assignable, input_mode)
+                 VALUES (?1, ?2, ?3, 'multi', ?4, ?5, 1, 'active', 'all', 1, 1, 1, 'ai_and_manual')",
+                rusqlite::params![key, name, description, max_items, sort_order],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "DELETE FROM settings WHERE key='manual_only_system_facets_v1'",
+            [],
+        )
+        .unwrap();
+        for key in ["purpose", "technical"] {
+            assert_eq!(
+                crate::db::tag_facets::get(&c, key).unwrap().input_mode,
+                "ai_and_manual"
+            );
+        }
+        migrate_manual_only_system_facets(&c).unwrap();
         for key in ["purpose", "technical"] {
             let ai: i64 = c
                 .query_row(
@@ -3157,6 +3276,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ai, 1, "一次性迁移不得在后续启动覆盖用户设置");
+    }
+
+    fn insert_legacy_manual_system_facet(
+        conn: &Connection,
+        key: &str,
+        display_name: &str,
+        description: &str,
+        max_items: i64,
+        sort_order: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO tag_facets
+               (key, display_name, description, selection_mode, max_items, sort_order,
+                is_system, status, applies_to, created_at, updated_at,
+                cfg_visible_in_navigation, cfg_manual_assignable, cfg_ai_assignable,
+                cfg_searchable, facet_kind, input_mode)
+             VALUES (?1, ?2, ?3, 'multi', ?4, ?5, 1, 'active', 'all', 1, 1, 1, 1, 0, 1, 'tag', 'manual_only')",
+            rusqlite::params![key, display_name, description, max_items, sort_order],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_manual_system_facets_are_removed_or_preserved_as_user_facets_idempotently() {
+        let c = crate::db::init_memory().unwrap();
+        insert_legacy_manual_system_facet(&c, "purpose", "用途", "稳定的发布或设计用途", 3, 30);
+        insert_legacy_manual_system_facet(
+            &c,
+            "technical",
+            "技术特征（已自定义）",
+            "用户修改过的说明",
+            4,
+            90,
+        );
+        c.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('透明背景', '透明背景', '透明背景', 'technical', 0, 'active', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_remove_legacy_manual_system_facets(&c).unwrap();
+        assert!(crate::db::tag_facets::get(&c, "purpose").is_err());
+        let technical = crate::db::tag_facets::get(&c, "technical").unwrap();
+        assert!(!technical.is_system);
+        assert_eq!(technical.display_name, "技术特征（已自定义）");
+        assert_eq!(technical.description, "用户修改过的说明");
+        let tag_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE facet_key='technical'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 1, "迁移不得丢失用户已有标签");
+
+        // 相同 key 后续由用户新建后，重复启动迁移不能再影响它。
+        let purpose = crate::db::tag_facets::create(
+            &c,
+            "purpose",
+            "我的用途",
+            "自建说明",
+            "multi",
+            None,
+            "all",
+        )
+        .unwrap();
+        migrate_remove_legacy_manual_system_facets(&c).unwrap();
+        assert!(!crate::db::tag_facets::get(&c, "purpose").unwrap().is_system);
+        assert!(
+            !crate::db::tag_facets::get(&c, "technical")
+                .unwrap()
+                .is_system
+        );
+        assert_eq!(purpose.display_name, "我的用途");
     }
 
     #[test]

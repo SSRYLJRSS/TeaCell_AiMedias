@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::db::tag_facets::{FacetImpact, TagFacet};
+use crate::db::tag_facets::{FacetImpact, FacetSaveInput, TagFacet};
 use crate::db::tag_ops::TagOp;
 use crate::db::tags::TagFacetGovernance;
 use crate::db::tags::{Tag, TagNode};
@@ -10,6 +10,24 @@ use crate::state::AppState;
 
 fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
+}
+
+fn lock_facet_config(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, ()>> {
+    let guard = state
+        .ai_config_guard
+        .lock()
+        .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
+    let active = state
+        .ai_cancel
+        .lock()
+        .map_err(|_| AppError::msg("AI 任务锁中毒"))?;
+    if !active.is_empty() {
+        return Err(AppError::conflict(
+            "AI 打标任务运行期间不能修改分类配置，请等待任务结束后重试。",
+        ));
+    }
+    drop(active);
+    Ok(guard)
 }
 
 #[tauri::command]
@@ -42,6 +60,7 @@ pub fn create_tag_facet(
     max_items: Option<i64>,
     applies_to: Option<String>,
 ) -> AppResult<TagFacet> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::create(
         &conn,
@@ -69,6 +88,7 @@ pub fn update_tag_facet(
     max_items: Option<i64>,
     applies_to: String,
 ) -> AppResult<()> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::update_facet(
         &conn,
@@ -82,12 +102,21 @@ pub fn update_tag_facet(
     )
 }
 
+/// 创建或编辑分面：服务层校验统一请求 DTO，数据库在单个事务中保存。
+#[tauri::command]
+pub fn save_tag_facet(state: State<AppState>, input: FacetSaveInput) -> AppResult<TagFacet> {
+    let _config_guard = lock_facet_config(&state)?;
+    let conn = lock_db(&state)?;
+    crate::services::facets::save_facet(&conn, &input)
+}
+
 /// W2-3：物理删除分面 + 全级联（系统分面拒绝）。返回删除报告供确认弹窗对账。
 #[tauri::command]
 pub fn delete_tag_facet(
     state: State<AppState>,
     key: String,
 ) -> AppResult<crate::db::tag_facets::FacetDeleteReport> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::delete_facet(&conn, &key)
 }
@@ -95,6 +124,7 @@ pub fn delete_tag_facet(
 /// 分面排序（传入完整有序 key 列表）。
 #[tauri::command]
 pub fn reorder_tag_facets(state: State<AppState>, ordered_keys: Vec<String>) -> AppResult<()> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::reorder(&conn, &ordered_keys)
 }
@@ -102,6 +132,7 @@ pub fn reorder_tag_facets(state: State<AppState>, ordered_keys: Vec<String>) -> 
 /// 软停用（保留历史引用）；系统分面返回错误。
 #[tauri::command]
 pub fn deactivate_tag_facet(state: State<AppState>, key: String) -> AppResult<()> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::deactivate(&conn, &key)
 }
@@ -109,6 +140,7 @@ pub fn deactivate_tag_facet(state: State<AppState>, key: String) -> AppResult<()
 /// 恢复分面。
 #[tauri::command]
 pub fn restore_tag_facet(state: State<AppState>, key: String) -> AppResult<()> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::restore(&conn, &key)
 }
@@ -452,6 +484,11 @@ pub fn convert_facet_kind(
     key: String,
     dry_run: bool,
 ) -> AppResult<crate::db::facet_numbers::ConversionReport> {
+    let _config_guard = if dry_run {
+        None
+    } else {
+        Some(lock_facet_config(&state)?)
+    };
     let conn = lock_db(&state)?;
     crate::db::facet_numbers::convert_facet_kind_execute(&conn, &key, dry_run)
 }
@@ -470,6 +507,7 @@ pub fn set_facet_kind(
     num_decimals: Option<i64>,
     num_step: Option<f64>,
 ) -> AppResult<crate::db::tag_facets::TagFacet> {
+    let _config_guard = lock_facet_config(&state)?;
     let conn = lock_db(&state)?;
     crate::db::tag_facets::set_facet_kind(
         &conn,

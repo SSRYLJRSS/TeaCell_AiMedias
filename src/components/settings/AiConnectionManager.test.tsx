@@ -8,15 +8,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
-import { deleteAiConnection, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
+import { deleteAiConnection, discoverAiModels, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
+import { openAgnesApiKeyDocs } from "@/api/settings";
 import { usePlatformStore } from "@/stores/platformStore";
 
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn(),
+  discoverAiModels: vi.fn(),
   deleteAiConnection: vi.fn(),
   saveAiConnection: vi.fn(),
   testAiConnection: vi.fn(),
 }));
+vi.mock("@/api/settings", () => ({ openAgnesApiKeyDocs: vi.fn().mockResolvedValue(undefined) }));
 
 import type { AiConnection } from "@/api/connections";
 
@@ -74,8 +77,8 @@ describe("AiConnectionManager（§6.3）", () => {
     fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
     fireEvent.change(screen.getByPlaceholderText(/如「通义官方」/), { target: { value: "智谱" } });
     fireEvent.change(screen.getByPlaceholderText(/api.example.com/), { target: { value: "https://zhipu/v1" } });
-    fireEvent.change(screen.getByPlaceholderText("qwen-vl-plus"), { target: { value: "glm-4v" } });
-    fireEvent.change(screen.getByPlaceholderText(/sk-…/), { target: { value: "sk-secret" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "模型名称" }), { target: { value: "glm-4v" } });
+    fireEvent.change(screen.getByPlaceholderText(/无需鉴权可留空/), { target: { value: "sk-secret" } });
     fireEvent.click(screen.getByRole("button", { name: "创建" }));
 
     await waitFor(() =>
@@ -99,6 +102,7 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "+ 新增服务" })).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
+    fireEvent.click(screen.getByText("高级设置"));
     fireEvent.change(screen.getByPlaceholderText(/如「通义官方」/), { target: { value: "限额服务" } });
     fireEvent.change(screen.getByPlaceholderText(/api.example.com/), { target: { value: "https://limits/v1" } });
     fireEvent.change(screen.getByLabelText("最大并发数"), { target: { value: "2" } });
@@ -122,6 +126,7 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.click(screen.getByText("高级设置"));
     expect(screen.getByLabelText("最大并发数")).toHaveValue(3);
     expect(screen.getByLabelText("每分钟请求数")).toHaveValue(18);
     expect(screen.getByLabelText("每小时请求数")).toHaveValue(600);
@@ -145,6 +150,90 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() =>
       expect(saveAiConnection).toHaveBeenCalledWith(expect.objectContaining({ id: "c1", apiKey: null })),
     );
+  });
+
+  it("用作者推荐菜单应用 Agnes 预设，并将申请入口放在推荐旁边", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "+ 新增服务" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
+    fireEvent.click(screen.getByRole("button", { name: /作者推荐/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Agnes AI.*兼容 API/ }));
+
+    expect(screen.getByPlaceholderText(/如「通义官方」/)).toHaveValue("Agnes AI（作者推荐）");
+    expect(screen.getByPlaceholderText(/api.example.com/)).toHaveValue("https://apihub.agnes-ai.com/v1");
+    expect(screen.getByRole("combobox", { name: "模型名称" })).toHaveValue("agnes-2.5-flash");
+    fireEvent.click(screen.getByRole("button", { name: /获取 Agnes API Key/ }));
+    await waitFor(() => expect(openAgnesApiKeyDocs).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("API 格式")).toBeInTheDocument();
+    expect(screen.queryByText("API 格式（高级）")).not.toBeInTheDocument();
+  });
+
+  it("Agnes 预设会覆盖已有配置时先确认，取消后草稿保持不变", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.click(screen.getByRole("button", { name: /作者推荐/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Agnes AI.*兼容 API/ }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("继续吗"));
+    expect(screen.getByPlaceholderText(/如「通义官方」/)).toHaveValue("通义");
+    expect(screen.getByPlaceholderText(/api.example.com/)).toHaveValue("https://a/v1");
+    expect(screen.getByRole("combobox", { name: "模型名称" })).toHaveValue("qwen-max");
+    expect(saveAiConnection).not.toHaveBeenCalled();
+  });
+
+  it("确认应用预设时只覆盖公开连接字段并保留密钥与高级限流", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(listAiConnections).mockResolvedValue([
+      { ...fakeConns[0], maxConcurrency: 2, requestsPerMinute: 12, requestsPerHour: 300 },
+    ]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByPlaceholderText(/留空保留已保存密钥/), { target: { value: "sk-new-secret" } });
+    fireEvent.click(screen.getByText("高级设置"));
+    expect(screen.getByLabelText("每分钟请求数")).toHaveValue(12);
+    fireEvent.click(screen.getByRole("button", { name: /作者推荐/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Agnes AI.*兼容 API/ }));
+
+    expect(screen.getByPlaceholderText(/如「通义官方」/)).toHaveValue("Agnes AI（作者推荐）");
+    expect(screen.getByPlaceholderText(/api.example.com/)).toHaveValue("https://apihub.agnes-ai.com/v1");
+    expect(screen.getByRole("combobox", { name: "模型名称" })).toHaveValue("agnes-2.5-flash");
+    expect(screen.getByPlaceholderText(/留空保留已保存密钥/)).toHaveValue("sk-new-secret");
+    expect(screen.getByLabelText("每分钟请求数")).toHaveValue(12);
+  });
+
+  it("未填写 API 密钥时模型可手动输入，但不能读取远端模型列表", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "+ 新增服务" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
+
+    const modelInput = screen.getByRole("combobox", { name: "模型名称" });
+    expect(modelInput).toBeEnabled();
+    expect(screen.getByRole("button", { name: "读取模型列表" })).toBeDisabled();
+    fireEvent.change(modelInput, { target: { value: "manual-model" } });
+    expect(modelInput).toHaveValue("manual-model");
+  });
+
+  it("手动编辑模型名不会清空已读取的模型候选", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(discoverAiModels).mockResolvedValue(["qwen-max", "qwen-plus"]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.click(screen.getByRole("button", { name: "读取模型列表" }));
+    await screen.findByRole("option", { name: "qwen-plus" });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "模型名称" }), {
+      target: { value: "qwen-plus" },
+    });
+
+    expect(screen.getByRole("option", { name: "qwen-max" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新模型列表" })).toBeInTheDocument();
   });
 
   it("删除需确认并调用 deleteAiConnection", async () => {
@@ -179,6 +268,51 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() =>
       expect(screen.getByText(/连接成功：连接成功（HTTP 200，共 12 个模型），耗时 312ms/)).toBeInTheDocument(),
     );
+  });
+
+  it("修改模型后清除旧连接状态，并禁止检测未保存草稿", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(testAiConnection).mockResolvedValue({
+      ok: true,
+      statusCode: 200,
+      latencyMs: 20,
+      protocol: "openai_chat",
+      model: "qwen-max",
+      message: "服务可达，模型列表读取成功",
+    });
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await screen.findByText(/连接成功：服务可达/);
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "模型名称" }), { target: { value: "new-model" } });
+
+    expect(screen.getByText("配置已变更，尚未检测")).toBeInTheDocument();
+    expect(screen.getByText(/尚未在当前连接配置下验证/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存后检测" })).toBeDisabled();
+  });
+
+  it("连接草稿变更后忽略先前检测的迟到响应", async () => {
+    let resolveTest!: (result: Awaited<ReturnType<typeof testAiConnection>>) => void;
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(testAiConnection).mockReturnValueOnce(new Promise((resolve) => { resolveTest = resolve; }));
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() => expect(testAiConnection).toHaveBeenCalledWith("c1"));
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByPlaceholderText(/api.example.com/), { target: { value: "https://new.example/v1" } });
+    resolveTest({
+      ok: true,
+      statusCode: 200,
+      latencyMs: 20,
+      protocol: "openai_chat",
+      model: "qwen-max",
+      message: "旧地址检测成功",
+    });
+
+    await waitFor(() => expect(screen.getByText("配置已变更，尚未检测")).toBeInTheDocument());
+    expect(screen.queryByText(/旧地址检测成功/)).not.toBeInTheDocument();
   });
 
   it("测试失败显示失败信息（红色路径）", async () => {

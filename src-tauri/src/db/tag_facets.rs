@@ -25,6 +25,14 @@ pub struct FacetPromptContext {
     pub num_max: Option<f64>,
     #[serde(default)]
     pub num_unit: String,
+    #[serde(default)]
+    pub num_decimals: i64,
+    #[serde(default = "default_prompt_num_step")]
+    pub num_step: f64,
+}
+
+fn default_prompt_num_step() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,8 +73,27 @@ pub struct TagFacet {
     pub num_step: f64,
 }
 
+/// 创建或编辑分类的一次 IPC 请求；同一 DTO 覆盖普通分类和数值分类。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacetSaveInput {
+    pub key: String,
+    pub display_name: String,
+    pub description: String,
+    pub input_mode: String,
+    pub selection_mode: String,
+    pub max_items: Option<i64>,
+    pub applies_to: String,
+    pub facet_kind: String,
+    pub num_min: Option<f64>,
+    pub num_max: Option<f64>,
+    pub num_unit: String,
+    pub num_decimals: i64,
+    pub num_step: f64,
+}
+
 /// F1-b：有效值派生（SQL 侧四个常量，唯一声明处）。
-/// 注意 EFF_SEARCH 不看 status —— 停用分面的标签仍可搜（F4 语义变更）。
+/// 注意 EFF_SEARCH 不看 status —— 停用分面的标签仍可用于词条候选和结构化条件；全文 FTS 仍按生命周期退出。
 pub const EFF_VISIBLE: &str = "f.status = 'active' AND f.cfg_visible_in_navigation = 1";
 pub const EFF_MANUAL: &str = "f.status = 'active' AND f.cfg_manual_assignable = 1";
 pub const EFF_AI: &str = "f.status = 'active' AND f.cfg_ai_assignable = 1";
@@ -177,8 +204,23 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
 const FACET_COLS: &str =
     "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, cfg_visible_in_navigation, cfg_manual_assignable, cfg_ai_assignable, cfg_searchable, facet_kind, num_min, num_max, num_unit, num_decimals, num_step";
 
+/// 用户可见且可停用的内置 AI 分类。key 是固定协议，分类说明仍允许编辑。
+const CORE_SYSTEM_AI_FACETS: &[&str] = &["subject", "scene", "composition", "lighting", "people"];
+
+fn is_core_system_ai_facet(key: &str) -> bool {
+    CORE_SYSTEM_AI_FACETS.contains(&key)
+}
+
+fn is_internal_facet(key: &str) -> bool {
+    matches!(key, "color" | "custom")
+}
+
+fn is_reserved_facet_key(key: &str) -> bool {
+    key == "description" || is_internal_facet(key) || is_core_system_ai_facet(key)
+}
+
 /// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
-/// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
+/// purpose/technical 已由后续迁移移出内置默认；color 是内部兼容 key，补种后置 inactive。
 const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
     (
         "subject",
@@ -194,7 +236,6 @@ const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
         3,
         20,
     ),
-    ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
     ("color", "色彩", "主色、色调与色彩关系", 3, 50),
     ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
     ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
@@ -206,13 +247,6 @@ const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
         80,
     ),
     (
-        "technical",
-        "可用性/技术特征",
-        "透明背景、可裁切等非文件格式属性",
-        4,
-        90,
-    ),
-    (
         "custom",
         "自定义",
         "用户自定义且暂未归入固定分面的标签",
@@ -220,44 +254,6 @@ const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
         100,
     ),
 ];
-
-/// 旧系统分面若仍保持出厂文案和上限，则平滑升级为新默认值；
-/// 用户已经修改过的显示名、说明或数量上限不做覆盖。
-pub fn refresh_system_facet_defaults(conn: &Connection, now: i64) -> AppResult<()> {
-    conn.execute(
-        "UPDATE tag_facets
-            SET display_name = '主体对象',
-                description = '画面中被重点呈现的人、动物、物体；人物统一标「人」，不写性别、年龄和穿着',
-                max_items = 3,
-                updated_at = ?1
-          WHERE key = 'subject'
-            AND display_name = '主体/对象'
-            AND description = '画面中可观察到的主要对象'
-            AND max_items = 5",
-        [now],
-    )?;
-    conn.execute(
-        "UPDATE tag_facets
-            SET description = '画面发生的空间、环境和地点；多值如实输出，不写主体物品',
-                max_items = 3,
-                updated_at = ?1
-          WHERE key = 'scene'
-            AND description = '素材发生的环境或地点'
-            AND max_items = 3",
-        [now],
-    )?;
-    conn.execute(
-        "UPDATE tag_facets
-            SET description = '人物状态、人数档位、性别、年龄段、穿着和动作；多人时分别输出可观察属性',
-                max_items = 8,
-                updated_at = ?1
-          WHERE key = 'people'
-            AND description = '人物数量、年龄段和可观察动作'
-            AND max_items = 4",
-        [now],
-    )?;
-    Ok(())
-}
 
 /// 幂等补种系统分面（INSERT OR IGNORE：已存在行不动，包括用户改过的 display_name 与停用态）。
 /// 使用场景：① V8 迁移建库；② 重置标签数据后重建系统分面；③ 启动自愈兜底。
@@ -274,17 +270,6 @@ pub fn seed_system_facets(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// 新库/重置后的产品默认：主观用途与可用性判断交给用户填写。
-pub(crate) fn set_human_judgment_facets_manual_only(conn: &Connection) -> AppResult<()> {
-    conn.execute(
-        "UPDATE tag_facets
-            SET cfg_ai_assignable = 0, input_mode = 'manual_only'
-          WHERE is_system = 1 AND key IN ('purpose', 'technical')",
-        [],
-    )?;
-    Ok(())
-}
-
 /// 空表自愈：tag_facets 一行都没有（历史重置标签路径清空后未补种）时重建系统分面。
 /// color 补种后立即置回 inactive（V16 语义：颜色由算法主色呈现，AI 侧已摘除）。
 /// 只在完全空表时触发，不影响任何已有分面（含用户自建）。
@@ -294,7 +279,6 @@ pub fn seed_system_facets_if_empty(conn: &Connection) -> AppResult<()> {
         return Ok(());
     }
     seed_system_facets(conn)?;
-    set_human_judgment_facets_manual_only(conn)?;
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "UPDATE tag_facets SET status = 'inactive', updated_at = ?1 WHERE key = 'color'",
@@ -347,6 +331,11 @@ pub fn create(
     let display_name = display_name.trim().to_string();
     if display_name.is_empty() {
         return Err(AppError::msg("显示名不能为空"));
+    }
+    if is_reserved_facet_key(&key) {
+        return Err(AppError::invalid_arg(
+            "该分类 key 由系统保留，不能用于新建分类",
+        ));
     }
     if selection_mode != "single" && selection_mode != "multi" {
         return Err(AppError::msg("selection_mode 只允许 single | multi"));
@@ -422,6 +411,17 @@ pub fn update_facet(
     max_items: Option<i64>,
     applies_to: &str,
 ) -> AppResult<()> {
+    let existing = get(conn, key)?;
+    if existing.is_system && !is_core_system_ai_facet(key) {
+        return Err(AppError::unsupported(
+            "该系统分面由应用内部管理，不能通过分类编辑器修改",
+        ));
+    }
+    if is_core_system_ai_facet(key) && input_mode != "ai_and_manual" {
+        return Err(AppError::invalid_arg(
+            "内置 AI 分类不能移出 AI 自动打标分组",
+        ));
+    }
     let display_name = display_name.trim().to_string();
     if display_name.is_empty() {
         return Err(AppError::msg("显示名不能为空"));
@@ -471,6 +471,143 @@ pub fn update_facet(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// 创建或编辑分面的一次性持久化入口。基础字段、AI 适用状态与数值类型配置
+/// 在同一 SQLite 事务内提交，避免前端用多次 IPC 做不可靠的补偿保存。
+pub(crate) fn save_facet(conn: &Connection, input: &FacetSaveInput) -> AppResult<TagFacet> {
+    let key = input.key.as_str();
+    let display_name = input.display_name.trim();
+    let description = input.description.as_str();
+    let input_mode = input.input_mode.as_str();
+    let selection_mode = input.selection_mode.as_str();
+    let applies_to = input.applies_to.as_str();
+    let facet_kind = input.facet_kind.as_str();
+    let num_min = input.num_min;
+    let num_max = input.num_max;
+    let num_unit = input.num_unit.as_str();
+    let num_decimals = input.num_decimals;
+    let num_step = input.num_step;
+    let max_items = match selection_mode {
+        "single" => Some(1),
+        _ => input.max_items,
+    };
+    let tx = conn.unchecked_transaction()?;
+    let existing = tx
+        .query_row(
+            "SELECT is_system, facet_kind FROM tag_facets WHERE key=?1",
+            [&key],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let is_new = existing.is_none();
+    if is_new {
+        if is_reserved_facet_key(key) {
+            return Err(AppError::invalid_arg(
+                "该分类 key 由系统保留，不能用于新建分类",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let sort_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tag_facets",
+            [],
+            |row| row.get(0),
+        )?;
+        let (num_min, num_max, num_unit, num_decimals, num_step) = if facet_kind == "number" {
+            (num_min, num_max, num_unit, num_decimals, num_step)
+        } else {
+            (None, None, "", 0, 1.0)
+        };
+        tx.execute(
+            "INSERT INTO tag_facets
+             (key, display_name, description, selection_mode, max_items, sort_order, is_system,
+              status, applies_to, created_at, updated_at, cfg_ai_assignable, facet_kind,
+              num_min, num_max, num_unit, num_decimals, num_step, input_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'active', ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                key,
+                display_name,
+                description,
+                selection_mode,
+                max_items,
+                sort_order,
+                applies_to,
+                now,
+                i64::from(input_mode == "ai_and_manual"),
+                facet_kind,
+                num_min,
+                num_max,
+                num_unit,
+                num_decimals,
+                num_step,
+                input_mode,
+            ],
+        )?;
+    } else {
+        let (is_system, existing_kind) = existing.unwrap();
+        if is_system && !is_core_system_ai_facet(key) {
+            return Err(AppError::unsupported(
+                "该系统分面由应用内部管理，不能通过分类编辑器修改",
+            ));
+        }
+        if is_core_system_ai_facet(key) && input_mode != "ai_and_manual" {
+            return Err(AppError::invalid_arg(
+                "内置 AI 分类不能移出 AI 自动打标分组",
+            ));
+        }
+        if existing_kind == "number" && facet_kind != "number" {
+            return Err(AppError::invalid_arg(
+                "数值分面不能改回标签型（连续值无法无损转成离散标签）",
+            ));
+        }
+        if existing_kind == "tag" && facet_kind == "number" {
+            let tag_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM tags WHERE facet_key=?1 AND status != 'deprecated'",
+                [&key],
+                |row| row.get(0),
+            )?;
+            if tag_count > 0 {
+                return Err(AppError::conflict(format!(
+                    "分面「{key}」已有 {tag_count} 个标签，请先使用转换预览"
+                )));
+            }
+        }
+        let (num_min, num_max, num_unit, num_decimals, num_step) = if facet_kind == "number" {
+            (num_min, num_max, num_unit, num_decimals, num_step)
+        } else {
+            (None, None, "", 0, 1.0)
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = tx.execute(
+            "UPDATE tag_facets SET display_name=?2, description=?3,
+              cfg_ai_assignable=?4,
+              input_mode=CASE WHEN ?4=1 THEN 'ai_and_manual' ELSE 'manual_only' END,
+              selection_mode=?5, max_items=?6, applies_to=?7, facet_kind=?8,
+              num_min=?9, num_max=?10, num_unit=?11, num_decimals=?12, num_step=?13,
+              updated_at=?14 WHERE key=?1",
+            params![
+                key,
+                display_name,
+                description,
+                i64::from(input_mode == "ai_and_manual"),
+                selection_mode,
+                max_items,
+                applies_to,
+                facet_kind,
+                num_min,
+                num_max,
+                num_unit,
+                num_decimals,
+                num_step,
+                now,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(AppError::not_found("分面不存在"));
+        }
+    }
+    tx.commit()?;
+    get(conn, key)
 }
 
 /// W2-3：删除报告（数字与 W2-4 get_impact 一致，可互相印证）。
@@ -537,6 +674,9 @@ pub(crate) fn delete_facet_cascade(conn: &Connection, key: &str) -> AppResult<Fa
 /// 「不能删除」仍是唯一保留项（delete_facet 检查 is_system）。
 pub fn deactivate(conn: &Connection, key: &str) -> AppResult<()> {
     let f = get(conn, key)?;
+    if f.is_system && !is_core_system_ai_facet(key) {
+        return Err(AppError::unsupported("该系统分面由应用内部管理，不能停用"));
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let n = conn.execute(
         "UPDATE tag_facets SET status='inactive', updated_at=?1 WHERE key=?2 AND status='active'",
@@ -550,6 +690,10 @@ pub fn deactivate(conn: &Connection, key: &str) -> AppResult<()> {
 
 /// 恢复。
 pub fn restore(conn: &Connection, key: &str) -> AppResult<()> {
+    let f = get(conn, key)?;
+    if f.is_system && !is_core_system_ai_facet(key) {
+        return Err(AppError::unsupported("该系统分面由应用内部管理，不能恢复"));
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let n = conn.execute(
         "UPDATE tag_facets SET status='active', updated_at=?1 WHERE key=?2",
@@ -683,7 +827,7 @@ pub fn build_prompt_context(
     }
     let mut stmt = conn.prepare(&format!(
         "SELECT key, display_name, description, selection_mode, max_items,
-                facet_kind, num_min, num_max, num_unit
+                facet_kind, num_min, num_max, num_unit, num_decimals, num_step
            FROM tag_facets f
           WHERE {EFF_AI}
             AND (?1 = 'all' OR f.applies_to = 'all' OR f.applies_to = ?1)
@@ -701,6 +845,8 @@ pub fn build_prompt_context(
                 num_min: r.get(6)?,
                 num_max: r.get(7)?,
                 num_unit: r.get(8)?,
+                num_decimals: r.get(9)?,
+                num_step: r.get(10)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -730,6 +876,14 @@ pub fn set_facet_kind(
     }
     if !num_step.is_finite() || num_step <= 0.0 {
         return Err(AppError::msg("步进必须是正数"));
+    }
+    if kind == "number"
+        && (!(0..=10).contains(&num_decimals)
+            || num_min.is_some_and(|value| !value.is_finite())
+            || num_max.is_some_and(|value| !value.is_finite())
+            || matches!((num_min, num_max), (Some(min), Some(max)) if min > max))
+    {
+        return Err(AppError::invalid_arg("数值范围、精度或步进无效"));
     }
     let now = chrono::Utc::now().timestamp_millis();
     if f.facet_kind == "number" {
@@ -807,9 +961,7 @@ mod tests {
         );
         assert_eq!(get(&c, "color").unwrap().status, "inactive");
         for key in ["purpose", "technical"] {
-            let facet = get(&c, key).unwrap();
-            assert!(!facet.cfg_ai_assignable, "{key} 默认只允许人工填写");
-            assert_eq!(facet.input_mode, "manual_only");
+            assert!(get(&c, key).is_err(), "{key} 不应作为系统默认分类出现");
         }
         // 非空表不触发（用户自建分面不被打扰）
         seed_system_facets_if_empty(&c).unwrap();
@@ -863,6 +1015,110 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_system_and_internal_keys_but_allows_legacy_user_keys() {
+        let c = conn();
+        for key in [
+            "subject",
+            "scene",
+            "composition",
+            "lighting",
+            "people",
+            "color",
+            "custom",
+            "description",
+        ] {
+            assert!(
+                create(&c, key, "保留分类", "", "multi", None, "all").is_err(),
+                "{key} must remain reserved"
+            );
+        }
+        let purpose = create(&c, "purpose", "用途", "", "multi", None, "all").unwrap();
+        let technical = create(&c, "technical", "技术特征", "", "multi", None, "all").unwrap();
+        assert!(!purpose.is_system);
+        assert!(!technical.is_system);
+    }
+
+    #[test]
+    fn save_facet_persists_all_fields_for_number_facets() {
+        let c = conn();
+        let saved = save_facet(
+            &c,
+            &FacetSaveInput {
+                key: "custom_count".into(),
+                display_name: "自定义人数".into(),
+                description: "画面内的人数".into(),
+                input_mode: "manual_only".into(),
+                selection_mode: "multi".into(),
+                max_items: Some(4),
+                applies_to: "all".into(),
+                facet_kind: "number".into(),
+                num_min: Some(0.0),
+                num_max: Some(50.0),
+                num_unit: "人".into(),
+                num_decimals: 1,
+                num_step: 0.5,
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.input_mode, "manual_only");
+        assert!(!saved.cfg_ai_assignable);
+        assert_eq!(saved.facet_kind, "number");
+        assert_eq!(saved.num_min, Some(0.0));
+        assert_eq!(saved.num_max, Some(50.0));
+        assert_eq!(saved.num_decimals, 1);
+        assert_eq!(saved.num_step, 0.5);
+    }
+
+    #[test]
+    fn save_facet_rolls_back_all_fields_when_database_rejects_update() {
+        let c = conn();
+        let original = create(
+            &c,
+            "atomic_facet",
+            "原名称",
+            "原说明",
+            "multi",
+            Some(3),
+            "all",
+        )
+        .unwrap();
+        c.execute_batch(
+            "CREATE TRIGGER reject_atomic_facet_update BEFORE UPDATE ON tag_facets
+             WHEN NEW.key='atomic_facet' AND NEW.display_name='触发回滚'
+             BEGIN SELECT RAISE(ABORT, 'test rollback'); END;",
+        )
+        .unwrap();
+
+        assert!(save_facet(
+            &c,
+            &FacetSaveInput {
+                key: "atomic_facet".into(),
+                display_name: "触发回滚".into(),
+                description: "新说明".into(),
+                input_mode: "manual_only".into(),
+                selection_mode: "multi".into(),
+                max_items: Some(8),
+                applies_to: "video".into(),
+                facet_kind: "number".into(),
+                num_min: Some(1.0),
+                num_max: Some(9.0),
+                num_unit: "项".into(),
+                num_decimals: 2,
+                num_step: 0.5,
+            },
+        )
+        .is_err());
+
+        let after = get(&c, "atomic_facet").unwrap();
+        assert_eq!(after.display_name, original.display_name);
+        assert_eq!(after.description, original.description);
+        assert_eq!(after.input_mode, original.input_mode);
+        assert_eq!(after.max_items, original.max_items);
+        assert_eq!(after.applies_to, original.applies_to);
+        assert_eq!(after.facet_kind, "tag");
+    }
+
+    #[test]
     fn validate_key_enforces_snake_case() {
         assert_eq!(validate_key("clothing_color").unwrap(), "clothing_color");
         assert!(validate_key("镜头语言").is_err());
@@ -904,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn deactivate_restore_roundtrip_and_system_allowed() {
+    fn deactivate_restore_roundtrip_for_user_and_core_system_facets() {
         let c = conn();
         let f = create(&c, "mood", "氛围", "", "multi", None, "all").unwrap();
         deactivate(&c, &f.key).unwrap();
@@ -913,7 +1169,7 @@ mod tests {
         assert!(!list(&c).unwrap().iter().any(|x| x.key == "mood"));
         restore(&c, &f.key).unwrap();
         assert_eq!(get(&c, &f.key).unwrap().status, "active");
-        // F7：系统分面允许停用（delete 才拒绝）——去掉了单向陷阱
+        // 五个面向用户的内置 AI 分类允许停用/恢复，但不允许删除。
         let sys = get(&c, "subject").unwrap();
         assert!(sys.is_system);
         deactivate(&c, &sys.key).unwrap();
@@ -922,6 +1178,10 @@ mod tests {
         assert_eq!(get(&c, &sys.key).unwrap().status, "active", "停用→恢复对称");
         // 系统分面仍不能物理删除
         assert!(delete_facet(&c, &sys.key).is_err());
+
+        // 内部兼容分面不暴露给普通分类管理操作。
+        assert!(deactivate(&c, "color").is_err());
+        assert!(restore(&c, "color").is_err());
     }
 
     #[test]

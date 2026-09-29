@@ -115,7 +115,6 @@ pub fn reset_db(
         tx.execute("DELETE FROM asset_facet_numbers", [])?;
         tx.execute("DELETE FROM tag_facets", [])?;
         super::tag_facets::seed_system_facets(&tx)?;
-        super::tag_facets::set_human_judgment_facets_manual_only(&tx)?;
         super::tags::seed_core_taxonomy(&tx)?;
         // V16 语义：color 分面停用（颜色由算法主色呈现，AI 侧摘除）
         let now = chrono::Utc::now().timestamp_millis();
@@ -286,9 +285,7 @@ mod tests {
         let color = crate::db::tag_facets::get(&conn, "color").unwrap();
         assert_eq!(color.status, "inactive");
         for key in ["purpose", "technical"] {
-            let facet = crate::db::tag_facets::get(&conn, key).unwrap();
-            assert!(!facet.cfg_ai_assignable, "{key} 重置后应只允许人工填写");
-            assert_eq!(facet.input_mode, "manual_only");
+            assert!(crate::db::tag_facets::get(&conn, key).is_err());
         }
         // 重置后重启自愈不应再改动（幂等）
         crate::db::tag_facets::seed_system_facets_if_empty(&conn).unwrap();

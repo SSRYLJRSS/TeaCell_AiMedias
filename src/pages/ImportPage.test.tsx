@@ -18,6 +18,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
   }),
 }));
 vi.mock("@/api/import", () => ({
+  newImportTaskId: vi.fn().mockReturnValue("task-test"),
   inspectImport: vi.fn(),
   importFiles: vi.fn(),
   cancelImport: vi.fn(),
@@ -37,6 +38,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({
     loaded: true,
+    loading: false,
+    loadError: null,
     settings: { libraryRoot: "d:/库" } as never,
   });
   useLibraryStore.setState({ items: [], total: 0, loading: false });
@@ -73,6 +76,33 @@ describe("ImportPage", () => {
     await waitFor(() => {
       expect(screen.getByText("未发现可入库的图片/视频文件")).toBeTruthy();
     });
+  });
+
+  it("选择器确认后先绘制左侧检查状态，再等待扫描结果", async () => {
+    let resolveInspection!: (value: Awaited<ReturnType<typeof inspectImport>>) => void;
+    vi.mocked(pickFiles).mockResolvedValue(["d:/slow/first.jpg"]);
+    vi.mocked(inspectImport).mockReturnValue(new Promise((resolve) => { resolveInspection = resolve; }));
+    render(<ImportPage />);
+
+    fireEvent.click(screen.getByText("选择文件…"));
+    await waitFor(() => expect(inspectImport).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("正在检查文件与缩略图")).toBeInTheDocument();
+    expect(screen.getByLabelText("入库进度")).toHaveAttribute("data-state", "running");
+
+    await act(async () => resolveInspection({ items: [], images: 0, videos: 0, totalSize: 0, warnings: [] }));
+    expect(await screen.findByText("未发现可入库的图片/视频文件")).toBeInTheDocument();
+  });
+
+  it("未设置总库时先提示去设置，且不打开选择器或启动扫描", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/x.jpg"]);
+    useSettingsStore.setState({ settings: { libraryRoot: "" } as never });
+    render(<ImportPage />);
+    fireEvent.click(screen.getByRole("button", { name: "前往设置" }));
+    expect(screen.getByText(/请先在设置中配置并保存总库位置/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("选择文件…"));
+    expect(screen.getAllByText(/请先在设置中配置并保存总库位置/)).toHaveLength(1);
+    expect(pickFiles).not.toHaveBeenCalled();
+    expect(inspectImport).not.toHaveBeenCalled();
   });
 
   it("无法生成缩略图的文件先拦截，确认剔除后保留可导入项", async () => {
@@ -194,6 +224,26 @@ describe("ImportPage", () => {
     expect(within(panel).queryByText(/重复/)).toBeNull();
     expect(within(panel).queryByText(/失败/)).toBeNull();
     expect(within(panel).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "8");
+  });
+
+  it("扫描和缩略图检查复用左侧唯一进度区", () => {
+    upsertImport({
+      taskId: "scan-1",
+      phase: "checking",
+      phaseCurrent: 118,
+      phaseTotal: 133,
+      file: "IMG_001.JPG",
+      imported: 0,
+      duplicates: 0,
+      failed: 0,
+      message: "正在检查文件与缩略图",
+    });
+    render(<ImportPage />);
+    expect(screen.getAllByLabelText("入库进度")).toHaveLength(1);
+    const panel = screen.getByLabelText("入库进度");
+    expect(within(panel).getByText("正在检查文件与缩略图")).toBeInTheDocument();
+    expect(within(panel).getByText("已检查 118/133 项")).toBeInTheDocument();
+    expect(within(panel).queryByText(/成功|重复|失败 \d/)).toBeNull();
   });
 
   it("进度区始终占位，完成后保留最终进度", () => {

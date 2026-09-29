@@ -141,6 +141,10 @@ pub struct AppState {
     pub export_cancel: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     /// AI 批次取消标志注册表（batch_id → flag）
     pub ai_cancel: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    /// AI 批次提示词/分面配置快照与配置写入的互斥闸。
+    pub ai_config_guard: Arc<Mutex<()>>,
+    /// 超级搜索解析取消标志注册表（request_id → flag）
+    pub search_cancel: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// 媒体元数据回填任务取消标志（单槽，同一时刻一个回填）
     pub media_refill_cancel: Arc<AtomicBool>,
     /// 回填类长任务互斥闸（元数据回填 / 色板回算共用一条，同一时刻只允许一个）。
@@ -164,6 +168,8 @@ impl AppState {
             import_running: Arc::new(AtomicBool::new(false)),
             export_cancel: Arc::new(Mutex::new(HashMap::new())),
             ai_cancel: Arc::new(Mutex::new(HashMap::new())),
+            ai_config_guard: Arc::new(Mutex::new(())),
+            search_cancel: Arc::new(Mutex::new(HashMap::new())),
             media_refill_cancel: Arc::new(AtomicBool::new(false)),
             refill_running: Arc::new(AtomicBool::new(false)),
             video_proxy_cancel: Arc::new(Mutex::new(HashMap::new())),

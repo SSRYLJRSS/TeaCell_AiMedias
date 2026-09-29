@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn truncate_chars_preserves_utf8_boundary() {
-        assert_eq!(truncate_chars("茶包素材", 2), "茶包…");
+        assert_eq!(truncate_chars("茶馆素材", 2), "茶馆…");
         assert_eq!(truncate_chars("茶包", 2), "茶包");
     }
 

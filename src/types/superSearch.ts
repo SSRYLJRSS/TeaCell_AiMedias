@@ -38,12 +38,20 @@ export interface SearchConceptV3 {
   termMatch?: TermMatch | null;
 }
 
-/** 一个条件组：组内全部条件 AND；preferred 为加分项（不淘汰，只影响排序） */
+/** AI 算法元数据软条件：满足时加分，不满足时仍保留素材。 */
+export interface PreferredMetadataV3 extends MetadataFilter {
+  /** 模型对偏好判断的原文依据；后端校验后回显。 */
+  evidence: string | null;
+  weight: number | null;
+}
+
+/** 一个条件组：组内 required 条件 AND；preferred 与 preferredMetadata 只影响排序。 */
 export interface SearchGroupV3 {
   assetType: "all" | "image" | "video";
   concepts: SearchConceptV3[];
   textTerms: IntentTextTerm[];
   metadata: MetadataFilter[];
+  preferredMetadata: PreferredMetadataV3[];
   preferred: SearchConceptV3[];
 }
 
