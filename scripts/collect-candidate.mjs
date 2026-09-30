@@ -11,6 +11,7 @@ import {
   assertRunnerMatchesTarget,
   assertCandidateCheckout,
   comparePackageNames,
+  filterPackageFilesByVersion,
   hasRequiredPackageExtensions,
 } from "./candidate-contract.mjs";
 import { heifCandidateProvenance, verifyHeifCache } from "./heif-contract.mjs";
@@ -69,9 +70,10 @@ function filesUnder(directory) {
   });
 }
 
-const installers = filesUnder(bundleDir).filter((file) =>
+const bundlePackages = filesUnder(bundleDir).filter((file) =>
   targets[target].includes(file.slice(file.lastIndexOf(".")).toLowerCase()),
 );
+const installers = filterPackageFilesByVersion(bundlePackages, packageJson.version);
 if (installers.length === 0) throw new Error(`未找到 ${target} 安装包`);
 const installerNames = installers.map((file) => basename(file));
 if (!hasRequiredPackageExtensions(target, installerNames)) {

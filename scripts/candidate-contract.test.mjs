@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   assertCandidateCheckout,
   assertRunnerMatchesTarget,
+  filterPackageFilesByVersion,
   hasRequiredPackageExtensions,
   packageMetadataMatches,
   RUNNER_BY_TARGET,
@@ -49,6 +50,23 @@ test("candidate package contract requires every planned installer type", () => {
     true,
   );
   assert.equal(hasRequiredPackageExtensions("x86_64-unknown-linux-gnu", ["app_amd64.deb"]), false);
+});
+
+test("candidate collection excludes stale bundles from other app versions", () => {
+  const packages = [
+    "茶馆_1.0.1_x64-setup.exe",
+    "茶馆_1.0.1_x64_en-US.msi",
+    "茶馆_1.0.2_x64-setup.exe",
+    "茶馆_1.0.2_x64_en-US.msi",
+    "茶馆_1.0.2_x64_zh-CN.msi",
+    "茶馆_1.0.20_x64-setup.exe",
+  ];
+  assert.deepEqual(filterPackageFilesByVersion(packages, "1.0.2"), [
+    "茶馆_1.0.2_x64-setup.exe",
+    "茶馆_1.0.2_x64_en-US.msi",
+    "茶馆_1.0.2_x64_zh-CN.msi",
+  ]);
+  assert.deepEqual(filterPackageFilesByVersion(packages, "not-a-version"), []);
 });
 
 test("candidate package metadata comparison catches missing, altered, and duplicate records", () => {

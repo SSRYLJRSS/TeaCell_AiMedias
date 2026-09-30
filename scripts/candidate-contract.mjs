@@ -14,6 +14,15 @@ export function comparePackageNames(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+export function filterPackageFilesByVersion(files, version) {
+  if (!Array.isArray(files) || typeof version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    return [];
+  }
+  const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const versionInFilename = new RegExp(`(?:^|[^0-9])${escapedVersion}(?:$|[^0-9])`);
+  return files.filter((file) => typeof file === "string" && versionInFilename.test(file));
+}
+
 export function assertRunnerMatchesTarget(target, runner) {
   const expected = RUNNER_BY_TARGET[target];
   if (!expected) throw new Error(`未知候选目标：${target}`);
