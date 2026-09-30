@@ -18,9 +18,9 @@
 
 ### 2.0 v1.0.2 品牌迁移与发布状态
 
-GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRYLJRSS/TeaCell_AiMedias)。v1.0.2 将产品英文全名统一为 `TeaCell AI Media Manager`，中文全名为“茶馆AI素材管理”；桌面短名称继续为“茶馆”。设置页项目、反馈和许可证链接，以及安装器元数据均指向新仓库。Windows 安装界面提供英文和简体中文；各平台包描述和发布资产名称采用中英文并列。
+GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRYLJRSS/TeaCell_AiMedias)。v1.0.2 将产品英文全名统一为 `TeaCell AI Media Manager`，中文全名为“茶馆AI素材管理”；桌面短名称继续为“茶馆”。设置页项目、反馈和许可证链接，以及安装器元数据均指向新仓库。Windows 安装界面提供英文和简体中文；各平台包描述和 Release 附件标签采用中英双语。
 
-桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。此版本的本机测试与构建结果按 v1.0.2 提交单独记录。用户已明确授权发布 v1.0.2 并在新版本可用后删除 v1.0.1 Release；真实素材 UAT、非 Windows 真机验收和媒体依赖再分发审查仍按 §2.2 列为未完成，不因发布动作而视为通过。
+桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。v1.0.2 已于 2026-09-30 从提交 `d7f1dc328684457a07be257eb0d3ad8ded5e46b0` 发布：[Release 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2)，包含 Windows x64（NSIS 和中英双语 MSI）、macOS Apple Silicon DMG、Linux x64（AppImage 和 DEB）、构建/许可证证据及 SHA-256 清单。旧 v1.0.1 Release 已删除，`v1.0.1` 源码标签保留作历史定位。三端候选 manifest、依赖许可证材料、文件摘要和提交号经 `scripts/verify-candidates.mjs` 通过；同提交 [code-gate](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296905) 和 [smoke](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296889) 通过。候选工作流 [run 36662320517](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662320517) 的 Windows 原生打包成功，但 runner 在构建后因工作区状态检查未能收集 artifact；Windows 候选由干净 checkout 的本机同提交构建和收集，与 macOS/Linux runner 候选合并后完成上述三端校验。真实素材 UAT、macOS/Linux 真机验收和媒体依赖再分发许可复核仍未完成，不因发布动作或自动校验通过而视为完成。
 
 ### 2.1 已完成的功能基线
 
