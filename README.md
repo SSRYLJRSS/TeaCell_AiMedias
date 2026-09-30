@@ -1,119 +1,149 @@
-# 茶馆AI素材管理 / TeaCell AI Media Manager
+<div align="center">
 
-本地优先的图片与视频素材管理桌面应用。项目使用 Tauri 2、Rust、SQLite FTS5、React 19、TypeScript、Zustand 和 Tailwind CSS v4。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="app-icon-black-bg.png">
+  <source media="(prefers-color-scheme: light)" srcset="app-icon-white-bg.png">
+  <img src="app-icon-square.png" alt="茶馆" width="160"/>
+</picture>
 
-当前版本：`1.0.2`。功能代码已完成到搜索计划 V3、分面 V2、本地模型部署和查看器/去重/备份等能力；真实素材 UAT 与发布证据仍需按测试文档补齐。
+# 茶馆 AI 素材管理
 
-## 能力概览
+**让素材进得来、找得到、打得快、拿得走**
 
-- 图片/视频两段式入库，支持总库/分库托管、批量改名、占位图优先和后台高清缩略图。
-- JPG/PNG/WebP/TIFF/BMP/TGA，以及 HEIC/HEIF 和 25+ RAW 扩展名；RAW 内嵌预览优先，真解码仅进入高清层。
-- 虚拟滚动素材库、多选、排序、筛选、收藏评级、查看器、视频播放和悬浮预览。
-- FTS5 中文文件名/标签搜索，支持逐字切分、短语和短查询兜底。
-- 超级搜索使用 SearchPlanV3，支持必须、优先、排除、元数据、数值分面、AI 解析和诊断。
-- 稳定分面协议，区分 AI 可打标分面与仅手工分面，支持别名、治理、合并、撤销和数值分面。
-- 云端 OpenAI 兼容/Anthropic 接口与 Ollama 本地模型；AI 建议默认人工确认后写入。
-- 重复文件与感知相似图检测、同源文件组、回收站、批量删除和恢复。
-- 本地复制/移动导出、目录布局、CSV 清单、数据库备份恢复和运行日志。
+一个装在你自己电脑上的图片/视频素材库。开源免费，数据不出你的硬盘，AI 打标但人说了算。
 
-素材库和索引默认保存在本机 SQLite。使用云端 AI 时，只有发起请求的素材预览会发送到用户配置的服务商；API Key 使用系统凭据存储，不写入设置 JSON。
+[![Release](https://img.shields.io/github/v/release/SSRYLJRSS/TeaCell_AiMedias?style=flat-square)](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)](#下载)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
-## 当前状态
+[下载](#下载) · [快速上手](#快速上手) · [常见问题](#常见问题)
 
-功能代码已完成，但**尚不能标记为可放行**。按[项目计划](docs/PROJECT_PLAN.md)的发布阻塞项，放行前还需完成：
+</div>
 
-- **真实素材 UAT**：超级搜索 relevance 排序、`mustNot` 排除、`should` 全不命中仍保留、位置权重和 hydrate 后 plan JSON，都需要真实数据证据。
-- **核心用户旅程**：用真实素材走通导入、浏览、AI 打标、搜索、查看器、评级、导出、删除恢复和备份恢复。
-- **格式与性能复测**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
-- **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部留下结果记录。
+---
 
-自动化全绿不等同于产品可发布，真实素材验收是独立门禁。数据位置、备份恢复和发布步骤见[运维手册](docs/OPERATIONS.md)。
+> **【图片位置 1 —— 首页主图，最重要的一张】**
+> 内容：素材库主界面全宽截图。要求网格里铺满大量缩略图（百张以上，体现"几万张也扛得住"），能同时看到筛选栏和底部主导航。建议 1920 宽的完整窗口截图。
+> 加分做法：换成一段 10 秒左右的滚动浏览 GIF（自动循环那种），比静态图抓人得多。
+> 插入方式：把本说明替换为 `![素材库主界面](图片路径)`。
 
-## 技术结构
+---
 
-```text
-React pages/components
-  -> stores
-  -> src/api
-  -> Tauri invoke / events
-  -> Rust commands
-  -> services
-  -> db / filesystem
-```
+## 这是什么
 
-- 前端：`src/`
-- Rust/Tauri：`src-tauri/`
-- HEIC 原生依赖：从固定的三端 `binaries-heif` release 下载，SHA256、目标 ABI、源码版本与许可证来源见 [`src-tauri/native/heif-manifest.json`](src-tauri/native/heif-manifest.json)；目标缓存不纳入 Git。
-- 文档：`docs/`
-- AI 协作入口：[AGENTS.md](AGENTS.md)
+摄影师、设计师、自媒体人，谁的硬盘里没躺着几千上万张素材？
 
-## 快速开始
+文件名是 `DSC_4821.jpg`，找一张图翻十分钟；想用 AI 帮忙整理，得先把照片传到别人的服务器上，传不传、传哪些，自己说了不算。
 
-环境要求：
+茶馆把这件事拉回你自己手里：
 
-- Windows 10/11 x64 为首发完整功能目标；Apple Silicon macOS、Ubuntu 24.04 x64 为预览目标，当前验收状态见 [平台文档](docs/PLATFORM.md)。
-- Node.js 22–24。
-- Rust 1.98.1（Windows 另需 MSVC 与 Visual Studio C++ Build Tools）。
-- 开发时系统 `ffmpeg`/`ffprobe` 可选；安装包构建使用按目标校验的 sidecar。
+- **进得来** —— 整个文件夹拖进去就完事，自动改名、自动查重，iPhone 的 HEIC 和相机的 RAW 都认识
+- **找得到** —— 打中文关键词，秒出结果；再不行就用超级搜索，说清楚"想要什么、不要什么"就行
+- **打得快** —— AI 帮你批量打标签，但每一条都等你点头才生效，反悔了整批撤销
+- **拿得走** —— 按标签或按日期整整齐齐导出，一键复制到你想要的地方
+
+你的素材库、标签、评分，全部只存在你自己的电脑里。用 AI 打标时，只有你亲手点"生成建议"的那一张，才会把预览发给你自己填的 AI 服务；用本地模型的话，拔了网线照样能跑。
+
+> **【图片位置 2 —— 紧跟"这是什么"】**
+> 内容：AI 打标工作台截图。要求同屏能看到"AI 给出的标签建议"和"确认"按钮，最好有一条素材的描述 + 标签列表清晰可见。
+> 这张图的任务：一眼传达"AI 打标，但最终是你说了算"。
+> 插入方式：同上，替换为图片 markdown。
+
+---
+
+## 能干什么
+
+**入库**
+
+- 文件夹拖进去，先看清单再确认：多少张、多大、哪些是重复的，明明白白
+- 自动改名，支持"原名 + 日期 + 编号"这类模板，导入前就能预览最终文件名
+- JPG、PNG、WebP 常见格式之外，iPhone 的 HEIC、各家相机的 RAW 都能导入
+
+**浏览和查找**
+
+- 几万张素材，滚动流畅不卡顿
+- 打分、收藏、按标签筛、按时间排，怎么顺手怎么来
+- 双击全屏看图，视频直接播，鼠标悬停还能快速预览
+- 搜中文文件名、搜标签，打两个三个字也能命中
+- 超级搜索：把条件拆成"必须要有 / 最好有 / 不要有"三栏，还能按大小、日期、分辨率筛。搜不出来的时候，它会告诉你是哪个条件把结果清零的
+
+**AI 打标**
+
+- 支持市面主流的 AI 接口，也支持装在自己电脑上的本地模型
+- AI 按条给建议：画面里有什么主体、什么场景、一句话描述，你逐条确认或整批通过
+- 打标批次可以暂停、取消、接着跑，打错了整批撤销
+- 视频也能打标：自动抽开头、中间、结尾三帧来看
+- API 密钥存进系统自带的凭据管理，不在设置文件里留明文
+
+**整理和安全**
+
+- 重复文件一键找出来，长得像的图也能认出来
+- 删除先进回收站，能恢复；真删失败会如实告诉你，绝不假装删掉
+- 数据库一键备份、一键恢复
+- 导出时按标签或日期自动建文件夹，还附一份 CSV 清单
+
+## 下载
+
+到 [Releases 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/latest) 下载对应平台的安装包：
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Windows 10/11 x64 | `...-Windows-x64-setup.exe` | 完整支持 |
+| macOS Apple Silicon | `...-macOS-arm64.dmg` | 预览支持 |
+| Linux x64 | `...-Linux-x64.AppImage` / `.deb` | 预览支持 |
+
+> [!WARNING]
+> 公测版：macOS 与 Linux 安装包目前是预览支持，用之前先备份重要素材库。遇到问题欢迎[提 Issue](https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues)。
+
+## 快速上手
+
+1. 装好打开，选一个放素材库的位置（默认在你自己的用户目录）
+2. 把文件夹拖进入库页，看一眼清单，点确认
+3. 想用 AI 打标：设置里填一个 AI 接口，或者启动你电脑上的本地模型
+4. 进打标页选一批素材，点"生成 AI 建议"，逐条确认或整批确认
+5. 搜索框打中文关键词找图，选中，一键导出
+
+> **【图片位置 3 —— 跟在快速上手后面】**
+> 内容：入库页截图。要求能看到拖拽区域和待入库清单（数量/大小统计、改名模板预览）。
+> 这张图的任务：让新用户 3 秒知道第一步长什么样。
+> 插入方式：同上，替换为图片 markdown。
+
+## 常见问题
+
+**和 Eagle、Billfish 这类素材管理器比，有什么不一样？**
+开源免费，代码全部公开；AI 打的每一条标签都由你确认，标签体系完全是你的，随时改、随时合并；没有账号，没有云端，数据不离开你的电脑。
+
+**必须联网才能用吗？**
+不联网，导入、浏览、搜索、导出全都正常。只有 AI 打标需要连服务，用本地模型的话全程离线。
+
+**我的图片会被上传吗？**
+不会。素材和索引都在你自己的电脑里。只有你主动触发某张图的 AI 打标时，那张图的预览才会发给你自己填的 AI 服务商。
+
+**相机 RAW 文件能直接看吗？**
+能。优先读相机内嵌的预览图，速度快；需要高清大图时再完整解码。
+
+**有些图导入后缩略图是灰的？**
+个别特殊格式生成不了预览。入库前的清单会把这些文件列出来让你确认，不会悄悄吞掉。
+
+## 想折腾代码？
+
+项目用 Tauri 2 + Rust + React + TypeScript 写的，装好 [Node.js 22+](https://nodejs.org) 和 [Rust](https://www.rust-lang.org/tools/install) 后：
 
 ```powershell
-npm ci
-npm run desktop:dev
+npm install
+npm run desktop:dev      # 跑起来看看
 ```
 
-构建安装包：
-
-```powershell
-npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
-npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
-npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
-npm run desktop:build -- --target x86_64-pc-windows-msvc
-```
-
-## 开发命令
-
-```powershell
-npm run lint
-npm run typecheck
-npm run test:unit
-npm run build
-
-cd src-tauri
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
-
-直接运行 Cargo 编译/测试前，需要准备当前原生目标的 HEIF 库，并在当前 shell 将 `HEIF_BINARIES_DIR` 指向该目录；缺失或目标不符会由 `build.rs` 明确失败，不再回退到 `heif-rs` 未校验的联网下载。`npm run desktop:dev` 和 `npm run desktop:build` 会自动准备目标库。
-
-完整本地冒烟：
-
-```powershell
-pwsh ./scripts/smoke.ps1
-```
-
-## 文档入口
-
-- [文档中心](docs/README.md)
-- [产品需求](docs/PRD.md)
-- [项目计划](docs/PROJECT_PLAN.md)
-- [架构说明](docs/ARCHITECTURE.md)
-- [开发规范](docs/DEVELOPMENT.md)
-- [UI 规范](docs/UI_DESIGN_SYSTEM.md)
-- [协议契约](docs/CONTRACTS.md)
-- [测试策略](docs/TEST_STRATEGY.md)
-- [真机验收手册](docs/QA_PLAYBOOK.md)
-- [性能手册](docs/PERFORMANCE.md)
-- [运维手册](docs/OPERATIONS.md)
-- [排障手册](docs/TROUBLESHOOTING.md)
-
-## 发布约束
-
-- 普通改动必须通过 lint、typecheck、前端单测、Rust fmt、clippy 和 cargo test。
-- 交付版本必须通过 `scripts/smoke.ps1` 和真实素材 UAT。
-- 已发布数据库迁移不得回改；结构变化必须新增或追加幂等迁移。
-- 破坏性操作必须可确认、可回滚或明确报告失败，禁止假成功和静默数据丢失。
+架构和开发规范在 [docs/](docs/) 目录里，欢迎 PR。
 
 ## License
 
-MIT。项目中涉及的第三方图像/视频编解码依赖另有许可证要求，对外分发前必须复核 [架构说明](docs/ARCHITECTURE.md) 中的许可提示。
+[MIT](LICENSE)。
+
+---
+
+<div align="center">
+
+如果茶馆对你有用，给个 Star，让更多创作者看到它。
+
+</div>
