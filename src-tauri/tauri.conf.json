@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "茶馆",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "identifier": "com.bagertea.aimdeias",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,13 +32,26 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "TeaCell",
+    "homepage": "https://github.com/SSRYLJRSS/TeaCell_AiMedias",
+    "copyright": "Copyright © 2026 TeaCell contributors",
+    "license": "MIT",
+    "shortDescription": "茶馆AI素材管理 / TeaCell AI Media Manager",
+    "longDescription": "本地优先的图片与视频素材管理应用，支持人工确认的 AI 打标、组合筛选与超级搜索。 / A local-first photo and video asset manager with human-approved AI tagging, combined filters, and advanced search.",
     "windows": {
       "wix": {
         "language": {
           "en-US": {
             "localePath": "wix/en-us.wxl"
+          },
+          "zh-CN": {
+            "localePath": "wix/zh-cn.wxl"
           }
         }
+      },
+      "nsis": {
+        "languages": ["English", "SimpChinese"],
+        "displayLanguageSelector": true
       }
     },
     "icon": [

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simplified Chinese MSI language, with bilingual product identity and descriptions. -->
+<WixLocalization Culture="zh-CN" Codepage="936" xmlns="http://schemas.microsoft.com/wix/2006/localization">
+  <String Id="TauriLanguage">2052</String>
+  <String Id="TauriCodepage">936</String>
+  <String Id="LaunchApp">启动 茶馆 (TeaCell AI Media Manager)</String>
+  <String Id="DowngradeErrorMessage">已安装较新版本的 茶馆 (TeaCell AI Media Manager)。</String>
+  <String Id="PathEnvVarFeature">将 茶馆 (TeaCell AI Media Manager) 的安装位置添加到 PATH 系统环境变量，以便从任意位置调用。</String>
+  <String Id="InstallAppFeature">安装 茶馆 (TeaCell AI Media Manager)，一款本地优先的图片与视频素材管理应用，支持 AI 辅助打标。</String>
+</WixLocalization>

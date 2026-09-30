@@ -10,9 +10,9 @@ use crate::state::AppState;
 const HELP_PAGE_URL: &str =
     "https://my.feishu.cn/wiki/RGLmw1ExbiNcVvkk240cXJxjnmf?from=from_copylink";
 const AGNES_API_KEY_DOCS_URL: &str = "https://platform.agnes-ai.com/";
-const PROJECT_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias";
-const FEEDBACK_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias/issues/new";
-const LICENSE_URL: &str = "https://github.com/SSRYLJRSS/BagerTea_AiMdeias/blob/main/LICENSE";
+const PROJECT_URL: &str = "https://github.com/SSRYLJRSS/TeaCell_AiMedias";
+const FEEDBACK_URL: &str = "https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues/new";
+const LICENSE_URL: &str = "https://github.com/SSRYLJRSS/TeaCell_AiMedias/blob/main/LICENSE";
 const AUTHOR_URL: &str = "https://www.xiaohongshu.com/user/profile/68294317000000000e01ca6d";
 
 #[tauri::command]

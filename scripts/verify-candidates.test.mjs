@@ -18,7 +18,7 @@ const commit = "a".repeat(40);
 const heifLicense = "fixture HEIF license\n";
 
 function createFixture() {
-  const parent = mkdtempSync(join(tmpdir(), "bagertea-candidate-set-"));
+  const parent = mkdtempSync(join(tmpdir(), "teacell-candidate-set-"));
   const artifactRoot = join(parent, "artifacts");
   mkdirSync(artifactRoot);
   const heifManifest = {
@@ -62,7 +62,7 @@ function createFixture() {
   };
 
   for (const target of SUPPORTED_CANDIDATE_TARGETS) {
-    const dir = join(artifactRoot, `bagertea-${target}`);
+    const dir = join(artifactRoot, `teacell-${target}`);
     const packagesDir = join(dir, "packages");
     const mediaLicenseDir = join(dir, "licenses", target);
     const heifLicenseDir = join(dir, "licenses", "heif");
@@ -125,7 +125,7 @@ test("candidate verifier accepts a complete three-target set from one version an
 test("candidate verifier rejects a package changed after checksum collection", (context) => {
   const fixture = createFixture();
   context.after(() => rmSync(fixture.parent, { recursive: true, force: true }));
-  const packagePath = join(fixture.artifactRoot, "bagertea-x86_64-pc-windows-msvc", "packages", "fixture-0.exe");
+  const packagePath = join(fixture.artifactRoot, "teacell-x86_64-pc-windows-msvc", "packages", "fixture-0.exe");
   writeFileSync(packagePath, "tampered installer\n");
 
   assert.throws(() => verifyCandidateArtifacts(fixture), /候选文件摘要不匹配/);
@@ -134,7 +134,7 @@ test("candidate verifier rejects a package changed after checksum collection", (
 test("candidate verifier rejects a build log changed after checksum collection", (context) => {
   const fixture = createFixture();
   context.after(() => rmSync(fixture.parent, { recursive: true, force: true }));
-  const logPath = join(fixture.artifactRoot, "bagertea-x86_64-pc-windows-msvc", "build.log");
+  const logPath = join(fixture.artifactRoot, "teacell-x86_64-pc-windows-msvc", "build.log");
   writeFileSync(logPath, "tampered build log\n");
 
   assert.throws(() => verifyCandidateArtifacts(fixture), /构建日志缺失、大小或 SHA256 不匹配/);
@@ -143,7 +143,7 @@ test("candidate verifier rejects a build log changed after checksum collection",
 test("candidate verifier rejects a target manifest from a different commit", (context) => {
   const fixture = createFixture();
   context.after(() => rmSync(fixture.parent, { recursive: true, force: true }));
-  const manifestPath = join(fixture.artifactRoot, "bagertea-aarch64-apple-darwin", "build-manifest.json");
+  const manifestPath = join(fixture.artifactRoot, "teacell-aarch64-apple-darwin", "build-manifest.json");
   const build = JSON.parse(readFileSync(manifestPath, "utf8"));
   build.commit = "c".repeat(40);
   writeFileSync(manifestPath, `${JSON.stringify(build, null, 2)}\n`);
@@ -154,7 +154,7 @@ test("candidate verifier rejects a target manifest from a different commit", (co
 test("candidate verifier rejects checksum paths that escape the artifact directory", (context) => {
   const fixture = createFixture();
   context.after(() => rmSync(fixture.parent, { recursive: true, force: true }));
-  const checksumPath = join(fixture.artifactRoot, "bagertea-x86_64-pc-windows-msvc", "SHA256SUMS.txt");
+  const checksumPath = join(fixture.artifactRoot, "teacell-x86_64-pc-windows-msvc", "SHA256SUMS.txt");
   const checksums = readFileSync(checksumPath, "utf8");
   writeFileSync(checksumPath, `${checksums}${"d".repeat(64)}  ../../outside.txt\n`);
 

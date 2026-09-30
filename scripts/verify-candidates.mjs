@@ -47,7 +47,7 @@ export function verifyCandidateArtifacts({
   const root = resolve(artifactRoot);
   const verified = [];
   for (const target of SUPPORTED_CANDIDATE_TARGETS) {
-    const dir = join(root, `bagertea-${target}`);
+    const dir = join(root, `teacell-${target}`);
     const manifestPath = join(dir, "build-manifest.json");
     const checksumPath = join(dir, "SHA256SUMS.txt");
     if (!existsSync(manifestPath) || !existsSync(checksumPath)) throw new Error(`候选材料缺失：${target}`);

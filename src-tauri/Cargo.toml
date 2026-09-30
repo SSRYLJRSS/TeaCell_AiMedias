@@ -1,8 +1,8 @@
 [package]
-name = "bagertea_ai_media_v2"
-version = "1.0.1"
+name = "teacell_ai_media_manager"
+version = "1.0.2"
 edition = "2021"
-description = "茶馆AI素材管理 — 本地图片与视频素材库"
+description = "茶馆AI素材管理 / TeaCell AI Media Manager — 本地优先的图片与视频素材库 / Local-first photo and video library"
 
 [lib]
 name = "bagertea_ai_media_v2_lib"

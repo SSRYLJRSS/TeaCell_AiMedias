@@ -1,6 +1,6 @@
 # 项目计划
 
-> 更新日期：2026-09-28
+> 更新日期：2026-09-30
 >
 > 本文档记录当前阶段、交付状态和下一阶段范围。产品行为见 [PRD.md](PRD.md)，技术结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -15,6 +15,12 @@
 - 代码结构和文档上下文足够稳定，便于持续迭代和 AI 协作。
 
 ## 2. 当前交付状态
+
+### 2.0 v1.0.2 品牌迁移与发布状态
+
+GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRYLJRSS/TeaCell_AiMedias)。v1.0.2 将产品英文全名统一为 `TeaCell AI Media Manager`，中文全名为“茶馆AI素材管理”；桌面短名称继续为“茶馆”。设置页项目、反馈和许可证链接，以及安装器元数据均指向新仓库。Windows 安装界面提供英文和简体中文；各平台包描述和发布资产名称采用中英文并列。
+
+桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。此版本的本机测试与构建结果按 v1.0.2 提交单独记录。用户已明确授权发布 v1.0.2 并在新版本可用后删除 v1.0.1 Release；真实素材 UAT、非 Windows 真机验收和媒体依赖再分发审查仍按 §2.2 列为未完成，不因发布动作而视为通过。
 
 ### 2.1 已完成的功能基线
 
@@ -59,17 +65,17 @@
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-代码/工作流验证基线 `b5c25b2fc786cee3ba6a8e417f8423f9f686114c` 的 [code-gate run 36105870606](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36105870606) 四个 jobs 及同 SHA 的 Windows [smoke run 36105890701](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36105890701) 全部通过。后续 `f2f4a1f` 和本次收尾只改项目计划，没有修改产品代码、依赖、测试或工作流，不手动重复派发全套测试；push 自动触发的运行独立保留结果，不以旧 SHA 的通过冒充新 SHA 已验证。Windows MSI/NSIS 仍来自 `1c33ba8`，不是当前三端候选包；尚无三端候选 manifest，也未安装、启动或分发。
+代码/工作流验证基线 `b5c25b2fc786cee3ba6a8e417f8423f9f686114c` 的 [code-gate run 36105870606](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36105870606) 四个 jobs 及同 SHA 的 Windows [smoke run 36105890701](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36105890701) 全部通过。后续 `f2f4a1f` 和本次收尾只改项目计划，没有修改产品代码、依赖、测试或工作流，不手动重复派发全套测试；push 自动触发的运行独立保留结果，不以旧 SHA 的通过冒充新 SHA 已验证。Windows MSI/NSIS 仍来自 `1c33ba8`，不是当前三端候选包；尚无三端候选 manifest，也未安装、启动或分发。
 
 合并前直接查询 GitHub 确认远端与本地 `main` 均为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，集成基线 `f2f4a1f79923beb51ebb65a87cc011b53bc0bbca` 领先 21 个提交、不落后，可无冲突快进。本次已按用户授权快进本地 `main`，随后提交本文修正并正常推送主线；实际远端完成状态以 `git ls-remote origin refs/heads/main` 为准。旧记录中的 `c989912` 是未刷新的本地远端跟踪引用，不是当时实时远端主线，所谓领先 78/79 个提交的结论无效。
 
 ### 2.4 当前审计结论与证据边界
 
 - 范围审计以 `main` `683628a`、Windows 快照 `4c2e140` 和平台快照 `b59188a` 为基线。收尾已核实远端主线与该审计基线一致，没有另一个遗漏的 58 提交差异范围。逐路径核对结论：差异属于既有 Windows 行为、平台兼容、缺陷修复、回归测试、文档与门禁；未发现无来源的新增产品入口、AI 能力、搜索语法或数据含义。Windows 快照中已有的 SearchIntent V3、AI 图像输入规范化、V25、AI 连接限流和帮助入口不得误判为本轮新增或擅自删除。此结论不等于逐行无缺陷或真机验收通过。
-- 源码清理提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的本机门禁和三端 code-gate 已通过：前端 709 passed/2 skipped、lint 无 warning；Rust all-features 788 passed/8 ignored；完整 smoke 和 Windows strict media check 通过。远端证据：[code-gate run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018)。本批未新增产品功能。
+- 源码清理提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的本机门禁和三端 code-gate 已通过：前端 709 passed/2 skipped、lint 无 warning；Rust all-features 788 passed/8 ignored；完整 smoke 和 Windows strict media check 通过。远端证据：[code-gate run 35986278018](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/35986278018)。本批未新增产品功能。
 - workflow run `35969019646` attempt 1 的 `SettingsPage.test.tsx` 失败发生在“初始未修改时不显示未保存状态”断言；日志实际显示该提示元素存在。它紧随本文件内的色条设置测试，而该测试曾留下 800ms 防抖 timer。`36a5d35` 将该前置测试改为假时钟、在本测试中完成防抖保存/回读，并在 `afterEach` 恢复真实时钟；这与失败路径构成具体的跨测试 timer 泄漏解释。修复版该测试文件顺序运行 3 次，均为 37 passed/2 skipped；后续完整前端及三端 run `35992128310` 通过。结论：timer 泄漏是有代码路径支持的根因判断并已做针对性隔离，但历史 attempt 本身未能在修复前稳定重现；若未来复发仍需重新诊断。
-- 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。对应源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [三端 code-gate run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683) 已全部通过。
-- 工作分支 SHA `7474d48e7af2c4d48b922538d8956acd5496d9e7` 的首次手动 Windows smoke [run 36094987343 attempt 1](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36094987343) 在 `ViewerPage.test.tsx` 的“fallback 沉浸按 Esc 返回查看器”用例失败：Escape 后未在 waitFor 时限内恢复“返回素材库”按钮。相同 SHA 的 attempt 2 通过；本机单文件 14/14 和完整前端单测 709 passed/2 skipped 也通过，故原失败未能稳定复现。检查到键盘监听器在 passive `useEffect` 中随 `immersiveMode` 重绑，沉浸 portal 出现与新监听器生效之间存在事件空档。`0aa1039` 将监听器改为 `useLayoutEffect`，让处理器在提交后的绘制前更新；修复后本机该文件 14/14、全量前端单测 709/2、lint、typecheck 通过，且该 SHA 的 Windows smoke `36096765334` 与四 job code-gate `36096755139` 均全绿。结论：原始失败为一次真实但未复现的异步时序失败；修复针对代码中可确认的监听器空档，不把 attempt 2 当成覆盖 attempt 1 的证据。
+- 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。对应源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [三端 code-gate run 36000987683](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36000987683) 已全部通过。
+- 工作分支 SHA `7474d48e7af2c4d48b922538d8956acd5496d9e7` 的首次手动 Windows smoke [run 36094987343 attempt 1](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36094987343) 在 `ViewerPage.test.tsx` 的“fallback 沉浸按 Esc 返回查看器”用例失败：Escape 后未在 waitFor 时限内恢复“返回素材库”按钮。相同 SHA 的 attempt 2 通过；本机单文件 14/14 和完整前端单测 709 passed/2 skipped 也通过，故原失败未能稳定复现。检查到键盘监听器在 passive `useEffect` 中随 `immersiveMode` 重绑，沉浸 portal 出现与新监听器生效之间存在事件空档。`0aa1039` 将监听器改为 `useLayoutEffect`，让处理器在提交后的绘制前更新；修复后本机该文件 14/14、全量前端单测 709/2、lint、typecheck 通过，且该 SHA 的 Windows smoke `36096765334` 与四 job code-gate `36096755139` 均全绿。结论：原始失败为一次真实但未复现的异步时序失败；修复针对代码中可确认的监听器空档，不把 attempt 2 当成覆盖 attempt 1 的证据。
 - 本次采用快进方式将集成基线纳入 `main`，保留全部原始提交，不 squash、不强推、不删除恢复分支，也不覆盖快照工作区中的用户改动。代码/工作流验证基线仍为 `b5c25b2`。未创建 PR、未改保护规则、未发布。分支与门禁状态见 §2.3；Required checks、候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过和主线合并都不等于可发布或平台支持等级已升级。
 
 ### 2.5 安装测试问题修复状态（2026-09-28）

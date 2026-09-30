@@ -375,45 +375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bagertea_ai_media_v2"
-version = "1.0.1"
-dependencies = [
- "base64 0.22.1",
- "cc",
- "chrono",
- "dirs 5.0.1",
- "heif-rs",
- "image 0.25.10",
- "kamadak-exif",
- "keyring",
- "kmeans_colors",
- "palette",
- "rawler",
- "rayon",
- "reqwest 0.12.28",
- "rfd",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-opener",
- "tauri-plugin-shell",
- "tauri-plugin-store",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "walkdir",
- "zip",
-]
-
-[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5610,6 +5571,45 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "teacell_ai_media_manager"
+version = "1.0.2"
+dependencies = [
+ "base64 0.22.1",
+ "cc",
+ "chrono",
+ "dirs 5.0.1",
+ "heif-rs",
+ "image 0.25.10",
+ "kamadak-exif",
+ "keyring",
+ "kmeans_colors",
+ "palette",
+ "rawler",
+ "rayon",
+ "reqwest 0.12.28",
+ "rfd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-opener",
+ "tauri-plugin-shell",
+ "tauri-plugin-store",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]

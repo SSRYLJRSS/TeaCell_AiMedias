@@ -47,13 +47,13 @@ vi.mock("@/api/settings", () => ({
   openLogsDir: vi.fn().mockResolvedValue(undefined),
   openHelpPage: vi.fn().mockResolvedValue(undefined),
   openProjectPage: vi.fn().mockResolvedValue(undefined),
-  getProjectPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias"),
+  getProjectPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/TeaCell_AiMedias"),
   openLicensePage: vi.fn().mockResolvedValue(undefined),
-  getLicensePageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias/blob/main/LICENSE"),
+  getLicensePageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/TeaCell_AiMedias/blob/main/LICENSE"),
   openAuthorPage: vi.fn().mockResolvedValue(undefined),
   getAuthorPageUrl: vi.fn().mockResolvedValue("https://www.xiaohongshu.com/user/profile/68294317000000000e01ca6d"),
   openFeedbackPage: vi.fn().mockResolvedValue(undefined),
-  getFeedbackPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/BagerTea_AiMdeias/issues/new"),
+  getFeedbackPageUrl: vi.fn().mockResolvedValue("https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues/new"),
   exportDiagnostics: vi.fn().mockResolvedValue({ path: "D:/diag.zip", logFiles: 2, bytes: 2048 }),
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
   resetAppData: vi.fn().mockResolvedValue({
@@ -382,8 +382,8 @@ describe("SettingsPage §6.1 信息架构", () => {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("关于"));
-    expect(await screen.findByText("V1.0公测版")).toBeInTheDocument();
-    expect(screen.getByText("茶馆AI素材管理")).toBeInTheDocument();
+    expect(await screen.findByText("V1.0.2 公测版")).toBeInTheDocument();
+    expect(screen.getByText(/茶馆AI素材管理 \/ TeaCell AI Media Manager/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "小红书主页" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "MIT License" })).toBeInTheDocument();

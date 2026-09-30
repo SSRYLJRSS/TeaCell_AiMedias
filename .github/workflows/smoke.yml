@@ -1,5 +1,5 @@
 # ============================================================
-# 茶包素材 BagerTea AiMedias — P0 冒烟集 CI（目标 ≤15 分钟）
+# 茶馆AI素材管理 / TeaCell AI Media Manager — P0 冒烟集 CI（目标 ≤15 分钟）
 # 对应 docs/TEST_STRATEGY.md §6.1 与附录 D.4；编排与 scripts/smoke.ps1 等价
 # 触发：push / PR 到 main；可手动 workflow_dispatch 重跑
 # 已知 flaky 处理：网络类集成测试（本地 TCP mock，Windows）偶发一次

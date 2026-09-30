@@ -4,7 +4,7 @@
  * R-24：<html> 的 data-theme 属性控制 light|dark；system（或属性缺失）时跟随 prefers-color-scheme。
  */
 @theme {
-  /* Bagertea visual language: warm gallery neutrals, ink actions, restrained amber status. */
+  /* TeaCell visual language: warm gallery neutrals, ink actions, restrained amber status. */
   --color-bg: #fafaf8;
   --color-surface: #f3f2ee;
   --color-surface-raised: #ffffff;

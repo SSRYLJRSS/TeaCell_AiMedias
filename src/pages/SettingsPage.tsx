@@ -514,7 +514,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 13);
     const target = await saveDialog({
       title: "导出诊断包",
-      defaultPath: `bagertea-diagnostics-${stamp}.zip`,
+      defaultPath: `teacell-diagnostics-${stamp}.zip`,
       filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
     });
     if (!target) return;
@@ -1209,12 +1209,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
             <>
             <PageHeader title="关于" description="查看应用信息、项目地址与作者主页。" />
             <Group title="应用信息">
-              <Field label="茶馆AI素材管理" hint="本地图片与视频素材管理">
-                <span className="text-sm text-[var(--color-text-secondary)]">V1.0公测版</span>
+              <Field
+                label="茶馆AI素材管理 / TeaCell AI Media Manager"
+                hint="本地优先的图片与视频素材管理 / Local-first photo and video asset manager"
+              >
+                <span className="text-sm text-[var(--color-text-secondary)]">V1.0.2 公测版</span>
               </Field>
               <Field label="项目地址" hint="查看源代码、版本与项目说明。">
                 <Button onClick={() => void onOpenExternalPage(openProjectPage, getProjectPageUrl)}>
-                  GitHub · SSRYLJRSS/BagerTea_AiMdeias
+                  GitHub · SSRYLJRSS/TeaCell_AiMedias
                 </Button>
               </Field>
               <Field label="关于作者" hint="打开作者的小红书主页。">

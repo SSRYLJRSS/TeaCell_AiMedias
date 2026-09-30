@@ -13,7 +13,7 @@
 - 素材库、标签和索引默认保存在本机。
 - 云端 AI 只在用户触发时发送选中素材的预览。
 
-当前 v1.0.1 的主要发布阻塞是真实素材 UAT 和发布证据，不等于代码未实现。
+当前 v1.0.2 的主要发布阻塞是真实素材 UAT 和发布证据，不等于代码未实现。
 
 ## 2. 本地启动
 
@@ -39,7 +39,7 @@ npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
 npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
 
-Windows MSI 的安装器界面使用英文 `en-US`，并通过 `src-tauri/wix/en-us.wxl` 指定 Windows-936 code page，以保留中文产品名；不要移除该 locale 覆盖或把 `TauriCodepage` 改回 1252。
+Windows NSIS 安装器包含英文与简体中文界面并允许选择语言；MSI 分别构建 `en-US` 与 `zh-CN` 版本。WiX locale 文件使用 Windows-936 code page，以保留中英文产品名称；不要移除 `src-tauri/wix/*.wxl` 的 locale 覆盖或把 `TauriCodepage` 改回 1252。
 
 正式交付前：
 
