@@ -2,12 +2,21 @@ name: release-candidate
 
 on:
   workflow_dispatch:
+    inputs:
+      buildDependenciesOnly:
+        description: Build hash-pinned native programs and their corresponding source before installers
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  dependencies:
+    if: ${{ inputs.buildDependenciesOnly }}
+    uses: ./.github/workflows/distribution-dependencies.yml
   bundle:
+    if: ${{ !inputs.buildDependenciesOnly }}
     name: bundle (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 100
@@ -68,7 +77,7 @@ jobs:
 
   verify:
     needs: bundle
-    if: always()
+    if: ${{ always() && !inputs.buildDependenciesOnly }}
     runs-on: ubuntu-24.04
     steps:
       - name: Fail if any platform bundle failed

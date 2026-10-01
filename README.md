@@ -14,7 +14,7 @@
 
 [![Release](https://img.shields.io/github/v/release/SSRYLJRSS/TeaCell_AiMedias?style=flat-square)](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)](#下载)
-[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green?style=flat-square)](LICENSE)
 
 [下载](#下载) · [快速上手](#快速上手) · [常见问题](#常见问题)
 
@@ -138,7 +138,7 @@ npm run desktop:dev      # 跑起来看看
 
 ## License
 
-[MIT](LICENSE)。
+[GNU GPL v3 或后续版本](LICENSE)。允许免费使用、修改和商用；分发本程序或其修改版本时，须保留版权及许可证说明，并按 GPL 提供对应源码与构建材料。第三方组件保留各自许可，详见 [NOTICE](NOTICE)。此前以 MIT 发布的代码保留其原授权，原许可文本保存在 [LICENSES/TeaCell-legacy-MIT.txt](LICENSES/TeaCell-legacy-MIT.txt)。
 
 ---
 

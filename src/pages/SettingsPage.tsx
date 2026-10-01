@@ -1255,7 +1255,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </Button>
               </Field>
               <Field label="许可证" hint="本项目按仓库根目录的许可证文件发布。">
-                <Button onClick={() => void onOpenExternalPage(openLicensePage, getLicensePageUrl)}>MIT License</Button>
+                <Button onClick={() => void onOpenExternalPage(openLicensePage, getLicensePageUrl)}>GNU GPL v3 or later</Button>
               </Field>
             </Group>
             {failedExternalUrl && (

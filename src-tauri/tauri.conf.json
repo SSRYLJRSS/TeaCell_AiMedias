@@ -35,7 +35,7 @@
     "publisher": "TeaCell",
     "homepage": "https://github.com/SSRYLJRSS/TeaCell_AiMedias",
     "copyright": "Copyright © 2026 TeaCell contributors",
-    "license": "MIT",
+    "license": "GPL-3.0-or-later",
     "shortDescription": "茶馆AI素材管理 / TeaCell AI Media Manager",
     "longDescription": "本地优先的图片与视频素材管理应用，支持人工确认的 AI 打标、组合筛选与超级搜索。 / A local-first photo and video asset manager with human-approved AI tagging, combined filters, and advanced search.",
     "windows": {

@@ -391,11 +391,11 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.getByText(/茶馆AI素材管理 \/ TeaCell AI Media Manager/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "小红书主页" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "MIT License" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "GNU GPL v3 or later" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ }));
     fireEvent.click(screen.getByRole("button", { name: "小红书主页" }));
-    fireEvent.click(screen.getByRole("button", { name: "MIT License" }));
+    fireEvent.click(screen.getByRole("button", { name: "GNU GPL v3 or later" }));
     await waitFor(() => expect(openProjectPage).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(openAuthorPage).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(vi.mocked(openLicensePage)).toHaveBeenCalledTimes(1));
