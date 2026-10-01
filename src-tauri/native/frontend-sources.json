@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "name": "react",
+      "repositoryUrl": "https://github.com/facebook/react",
+      "sourceCommit": "1dd4ecbdabf826f527fc9a58c05ea70375b7d170",
+      "archiveName": "react-1dd4ecbdabf826f527fc9a58c05ea70375b7d170.tar.gz",
+      "archiveUrl": "https://codeload.github.com/facebook/react/tar.gz/1dd4ecbdabf826f527fc9a58c05ea70375b7d170",
+      "archiveSha256": "59a9b06a9c395e4ca9651f8b1da3ad95f2740191de104c44a06d6b5b20f1f1ec",
+      "archiveSizeBytes": 9133257
+    },
+    {
+      "name": "scheduler",
+      "repositoryUrl": "https://github.com/react/react",
+      "sourceCommit": "861811347b8fa936b4a114fc022db9b8253b3d86",
+      "archiveName": "scheduler-861811347b8fa936b4a114fc022db9b8253b3d86.tar.gz",
+      "archiveUrl": "https://codeload.github.com/react/react/tar.gz/861811347b8fa936b4a114fc022db9b8253b3d86",
+      "archiveSha256": "5fbc80d47a1e0657e930f70e0db0524835bb64dba18a664395775e39b5e4ce0c",
+      "archiveSizeBytes": 9111228
+    },
+    {
+      "name": "tauri-api",
+      "repositoryUrl": "https://github.com/tauri-apps/tauri",
+      "sourceCommit": "6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a",
+      "archiveName": "tauri-api-6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a.tar.gz",
+      "archiveUrl": "https://codeload.github.com/tauri-apps/tauri/tar.gz/6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a",
+      "archiveSha256": "4f63eb62ceb1498c07c2de31b08ecf7d65ad40f236662e9237adbfa54da968ee",
+      "archiveSizeBytes": 15564808
+    },
+    {
+      "name": "tauri-dialog",
+      "repositoryUrl": "https://github.com/tauri-apps/plugins-workspace",
+      "sourceCommit": "03afae6d7275030a708eaedd39f0e604ccb901f3",
+      "archiveName": "tauri-dialog-03afae6d7275030a708eaedd39f0e604ccb901f3.tar.gz",
+      "archiveUrl": "https://codeload.github.com/tauri-apps/plugins-workspace/tar.gz/03afae6d7275030a708eaedd39f0e604ccb901f3",
+      "archiveSha256": "93cf661060184fb7c20e646c7e93cb7ca587238aa5bfc73860e171dc8e09acdb",
+      "archiveSizeBytes": 6955726
+    },
+    {
+      "name": "clsx",
+      "repositoryUrl": "https://github.com/lukeed/clsx",
+      "sourceCommit": "925494cf31bcd97d3337aacd34e659e80cae7fe2",
+      "archiveName": "clsx-925494cf31bcd97d3337aacd34e659e80cae7fe2.tar.gz",
+      "archiveUrl": "https://codeload.github.com/lukeed/clsx/tar.gz/925494cf31bcd97d3337aacd34e659e80cae7fe2",
+      "archiveSha256": "90b01de6b585bd1f2a86edee60a0142e2d4ac3347ae9dc297a76033eb4b77e73",
+      "archiveSizeBytes": 28084
+    },
+    {
+      "name": "lucide",
+      "repositoryUrl": "https://github.com/lucide-icons/lucide",
+      "sourceCommit": "1a60fd28ed7111bbf6acedc0896f3d83cd73945a",
+      "archiveName": "lucide-1a60fd28ed7111bbf6acedc0896f3d83cd73945a.tar.gz",
+      "archiveUrl": "https://codeload.github.com/lucide-icons/lucide/tar.gz/1a60fd28ed7111bbf6acedc0896f3d83cd73945a",
+      "archiveSha256": "3ddf8c8874c2d56c0cea9fb8d758bd22878c19fb848b03b351966771bcf53634",
+      "archiveSizeBytes": 5171720
+    },
+    {
+      "name": "zustand",
+      "repositoryUrl": "https://github.com/pmndrs/zustand",
+      "sourceCommit": "bfb2a9e7ce52608d54d8a077fb87ac9d12e73c58",
+      "archiveName": "zustand-bfb2a9e7ce52608d54d8a077fb87ac9d12e73c58.tar.gz",
+      "archiveUrl": "https://codeload.github.com/pmndrs/zustand/tar.gz/bfb2a9e7ce52608d54d8a077fb87ac9d12e73c58",
+      "archiveSha256": "f272ee5473d9136e1815a6371f3c781e19dc9be6bcef17a3bdd5c32540e38608",
+      "archiveSizeBytes": 1104054
+    }
+  ]
+}

@@ -139,7 +139,9 @@ npm run desktop:build -- --target x86_64-pc-windows-msvc
 手动候选工作流 `.github/workflows/release-candidate.yml` 从同一个 workflow commit 并行生成三端
 安装包，并附 `build-manifest.json`、runner OS/架构、每个安装包的大小与 SHA256、整体 SHA256 清单、FFmpeg 与 HEIF 许可证文本及其固定来源。验证 job 检查目标、版本、提交、必需包类型、runner 架构和摘要；artifact 只保留 7 天，不会发布到 Releases。macOS 包目前没有签名/公证流程。
 
-**分发许可门禁**：HEIF 依赖包含静态链接的 LGPL 组件和 GPL 许可的 x265。许可证文本、版本、来源和 SHA256 不能代替对应二进制的源码、构建参数、许可义务和再分发条件审查。在这些材料被项目负责人独立审查确认之前，不得把 artifact 交给测试者，也不得公开分发。生成 artifact 本身不是发布授权。其他当前发布状态见 [项目计划 §2.2](PROJECT_PLAN.md#22-当前发布阻塞)。
+**分发许可门禁**：项目负责人已选择 GPL-3.0-or-later 发布组合安装包，原 MIT 代码授权和署名保留。每次公开发布必须提供与安装包相匹配的对应源码包，包含应用 Git 快照、Cargo 依赖源码、前端依赖源码、固定的 HEIF/FFmpeg 及其外部库源码、构建脚本、锁文件、许可证和逐平台构建参数。源码包与安装包一起记录 SHA256；只有许可证文本或上游链接不能通过此门禁。其他验收限制仍见 [项目计划 §2.2](PROJECT_PLAN.md#22-当前发布阻塞)。
+
+原生媒体依赖先由 `distribution-dependencies.yml` 从 [`distribution-sources.json`](../src-tauri/native/distribution-sources.json) 构建，使用 CMake 3.31.6；Windows 的 HEIF 使用 MSVC，FFmpeg 使用 MinGW。将构建输出的摘要固定到两个运行时 manifest 后，再运行候选工作流。FFmpeg 保留本地媒体处理、H.264/AAC、VP8/Vorbis 和 AV1 解码，禁用网络协议和系统库自动发现。对应源码收集脚本见 [`collect-corresponding-source.mjs`](../scripts/collect-corresponding-source.mjs)。
 
 ### 5.3 构建产物
 

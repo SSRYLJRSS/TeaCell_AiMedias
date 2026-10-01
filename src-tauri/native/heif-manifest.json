@@ -30,7 +30,7 @@
     },
     {
       "name": "x265",
-      "version": "4.1",
+      "version": "4.0+1 (API 215)",
       "license": "GPL-2.0-or-later",
       "repositoryUrl": "https://github.com/Multicorewareinc/x265",
       "sourceCommit": "1d117bed4747758b51bd2c124d738527e30392cb",
@@ -42,12 +42,19 @@
   ],
   "targets": {
     "x86_64-pc-windows-msvc": {
-      "runner": { "os": "win32", "arch": "x64" },
+      "runner": {
+        "os": "win32",
+        "arch": "x64"
+      },
       "assetName": "static_windows_x64.zip",
       "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_windows_x64.zip",
       "assetSha256": "6021c0643460e525a4ece60b15eecfa4f772d7448cefb178552861c032a8a870",
       "assetSizeBytes": 9967106,
-      "staticLibraries": ["heif.lib", "x265-static.lib", "libde265.lib"],
+      "staticLibraries": [
+        "heif.lib",
+        "x265-static.lib",
+        "libde265.lib"
+      ],
       "staticLibrarySha256s": {
         "heif.lib": "3172154a8de54edbd8f72a57ceaea3d417e6e433f63a1f29e2c8db758653b0d8",
         "x265-static.lib": "af2e4d37d7193c152ce4ef69470449df2f94f042890e4ecebe2166881b13a250",
@@ -55,12 +62,19 @@
       }
     },
     "aarch64-apple-darwin": {
-      "runner": { "os": "darwin", "arch": "arm64" },
+      "runner": {
+        "os": "darwin",
+        "arch": "arm64"
+      },
       "assetName": "static_osx_arm64.zip",
       "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_osx_arm64.zip",
       "assetSha256": "92be83c8ec3b7039b0721254a3b91b4adbbb16f0be349a37b5d53a5b413cbedf",
       "assetSizeBytes": 2876516,
-      "staticLibraries": ["libheif.a", "libx265.a", "libde265.a"],
+      "staticLibraries": [
+        "libheif.a",
+        "libx265.a",
+        "libde265.a"
+      ],
       "staticLibrarySha256s": {
         "libheif.a": "e0332de3d1f8f4e02eecb4bed3b42060cacc453333e7b51e9cfdf9da1121a3af",
         "libx265.a": "4ac4c2e455623d7cd2c5951caaaa8446f9e40ff9eb4a18bfb464d161c0777d03",
@@ -68,12 +82,19 @@
       }
     },
     "x86_64-unknown-linux-gnu": {
-      "runner": { "os": "linux", "arch": "x64" },
+      "runner": {
+        "os": "linux",
+        "arch": "x64"
+      },
       "assetName": "static_linux_x64.zip",
       "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_linux_x64.zip",
       "assetSha256": "0c04f28819bcfe6572aa46c50535c38e3ce69ae5ba687086acd274ef10c1c785",
       "assetSizeBytes": 3133905,
-      "staticLibraries": ["libheif.a", "libx265.a", "libde265.a"],
+      "staticLibraries": [
+        "libheif.a",
+        "libx265.a",
+        "libde265.a"
+      ],
       "staticLibrarySha256s": {
         "libheif.a": "fb45fb12be934c8b763c4220065096679edaa78837ec28dd332338a335703ff7",
         "libx265.a": "6d5c80597d0f3fca5377b92b3aa1cc7293ba4ba1522712d021a86ab01a89594d",

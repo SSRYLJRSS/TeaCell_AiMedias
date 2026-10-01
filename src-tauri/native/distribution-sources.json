@@ -30,7 +30,7 @@
     },
     {
       "name": "x265",
-      "version": "4.1",
+      "version": "4.0+1 (API 215)",
       "sourceCommit": "1d117bed4747758b51bd2c124d738527e30392cb",
       "repositoryUrl": "https://github.com/Multicorewareinc/x265",
       "archiveName": "x265-1d117bed4747758b51bd2c124d738527e30392cb.tar.gz",

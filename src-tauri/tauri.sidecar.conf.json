@@ -10,7 +10,7 @@
       "native/heif/*/licenses/*",
       "../LICENSE",
       "../NOTICE",
-      "../LICENSES/TeaCell-legacy-MIT.txt"
+      "../LICENSES/*.txt"
     ]
   }
 }
