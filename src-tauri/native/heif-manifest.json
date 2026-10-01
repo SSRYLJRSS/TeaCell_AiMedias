@@ -3,7 +3,7 @@
   "release": {
     "version": "1.0.2",
     "repositoryUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias",
-    "releaseUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2"
+    "releaseUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/build-materials-v1.0.2"
   },
   "libraries": [
     {
@@ -47,7 +47,7 @@
         "arch": "x64"
       },
       "assetName": "TeaCell_HEIF_x86_64-pc-windows-msvc.zip",
-      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_x86_64-pc-windows-msvc.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_HEIF_x86_64-pc-windows-msvc.zip",
       "assetSha256": "b82dd5571a3fd371c436de9e0336e222be0d9a9d0c20bb94cae342ecb9dacea8",
       "assetSizeBytes": 9177900,
       "staticLibraries": [
@@ -67,7 +67,7 @@
         "arch": "arm64"
       },
       "assetName": "TeaCell_HEIF_aarch64-apple-darwin.zip",
-      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_aarch64-apple-darwin.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_HEIF_aarch64-apple-darwin.zip",
       "assetSha256": "ca907a18dac906e8f2010b0ef0f8b9088b5cf3c28844849e3ae2db62a4a85c74",
       "assetSizeBytes": 2490570,
       "staticLibraries": [
@@ -87,7 +87,7 @@
         "arch": "x64"
       },
       "assetName": "TeaCell_HEIF_x86_64-unknown-linux-gnu.zip",
-      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_x86_64-unknown-linux-gnu.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_HEIF_x86_64-unknown-linux-gnu.zip",
       "assetSha256": "fbdc976fd604e705455db6b9e5a87fb967c03b5a7d161b99f1406ff7b9b54217",
       "assetSizeBytes": 3284842,
       "staticLibraries": [

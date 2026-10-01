@@ -31,3 +31,54 @@ legacy_done:
   Pop $R1
   Pop $R0
 !macroend
+
+; Rename only links that actually target this application. Never touch foreign links.
+!macro TeaCellMigrateShortcut oldPath newPath
+  Push $0
+  Push $1
+  !insertmacro IsShortcutTarget "${oldPath}" "$INSTDIR\${MAINBINARYNAME}.exe"
+  Pop $0
+  ${If} $0 = 1
+    !insertmacro IsShortcutTarget "${newPath}" "$INSTDIR\${MAINBINARYNAME}.exe"
+    Pop $1
+    ${If} $1 = 1
+      Delete "${oldPath}"
+    ${ElseIfNot} ${FileExists} "${newPath}"
+      Rename "${oldPath}" "${newPath}"
+    ${EndIf}
+  ${EndIf}
+  Pop $1
+  Pop $0
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  !insertmacro TeaCellMigrateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$DESKTOP\${SHORTCUTNAME}.lnk"
+  !insertmacro TeaCellMigrateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$SMPROGRAMS\${SHORTCUTNAME}.lnk"
+  !insertmacro TeaCellMigrateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$SMPROGRAMS\$AppStartMenuFolder\${SHORTCUTNAME}.lnk"
+  Push $0
+  Push $1
+  Push $2
+  ; A new GUID on every install/reinstall, independent of the preserved user data.
+  System::Call 'ole32::CoCreateGuid(g .r0) i.r1'
+  ${If} $1 != 0
+    Abort "无法创建安装标识，请重新运行安装程序。"
+  ${EndIf}
+  ClearErrors
+  FileOpen $2 "$INSTDIR\installation-id.txt" w
+  ${If} ${Errors}
+    Abort "无法写入安装标识，请检查安装目录权限后重试。"
+  ${EndIf}
+  FileWrite $2 "$0$\r$\n"
+  ${If} ${Errors}
+    FileClose $2
+    Abort "无法保存安装标识，请检查磁盘空间后重试。"
+  ${EndIf}
+  FileClose $2
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  Delete "$INSTDIR\installation-id.txt"
+!macroend

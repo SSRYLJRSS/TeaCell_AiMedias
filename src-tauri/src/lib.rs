@@ -66,6 +66,7 @@ pub fn run() {
 
     // 应用数据目录：$APP_DATA_DIR/bagertea_ai_media_v2/library.db
     let db_path = data_dir.join("library.db");
+    let installation_id = services::installation::installed_tutorial_id();
 
     // 关键路径（保留）：创建数据目录 + 打开数据库 + 必要迁移。
     // W0-10：迁移失败弹原生 dialog 给用户可见出路，不再裸 panic 静默崩溃
@@ -73,6 +74,11 @@ pub fn run() {
         Ok(c) => c,
         Err(e) => fatal_db_error(&db_path, &data_dir.join("logs"), &e),
     };
+    if let Some(id) = installation_id {
+        if let Err(error) = settings::normalize_tutorial_installation(&conn, &id) {
+            tracing::warn!("安装后的教程提示状态同步失败，下次启动将重试: {error}");
+        }
+    }
     // 用户保存的日志级别在数据库可用后应用；初始化阶段仍使用环境变量或 info。
     if let Ok(saved) = settings::get_settings(&conn) {
         if let Err(e) = observability::set_log_level(&saved.log_level) {

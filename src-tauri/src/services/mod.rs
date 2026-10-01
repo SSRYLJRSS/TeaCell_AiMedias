@@ -9,6 +9,7 @@ pub mod facets;
 pub mod heic_decode;
 pub mod imaging;
 pub mod importer;
+pub mod installation;
 pub mod kinship;
 pub mod media_refill;
 pub mod ollama_installer;
