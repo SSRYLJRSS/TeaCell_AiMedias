@@ -50,8 +50,13 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
       - name: Record native CMake path
+        if: runner.os != 'Windows'
         shell: bash
         run: echo "CMAKE_COMMAND=$(command -v cmake)" >> "$GITHUB_ENV"
+      - name: Record Windows CMake path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"CMAKE_COMMAND=$((Get-Command cmake.exe).Source.Replace(''\'', ''/''))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
       - name: Build native HEIF static libraries
         run: node scripts/build-distribution-heif.mjs artifacts/dependency-inputs artifacts/dependency-build
       - name: Build local-file FFmpeg (Unix)

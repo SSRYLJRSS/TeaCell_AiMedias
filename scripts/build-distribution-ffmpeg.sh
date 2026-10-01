@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GPL-3.0-or-later. Build local-file FFmpeg tools solely from the accompanying fixed sources.
-set -euo pipefail
+set -eo pipefail
 inputs=$(cd "$1" && pwd)
 mkdir -p "$2"
 output=$(cd "$2" && pwd)
