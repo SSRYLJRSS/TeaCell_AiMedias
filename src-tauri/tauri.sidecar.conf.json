@@ -6,7 +6,11 @@
       "binaries/ffprobe"
     ],
     "resources": [
-      "binaries/licenses/*/*.txt"
+      "binaries/licenses/*/*.txt",
+      "native/heif/*/licenses/*",
+      "../LICENSE",
+      "../NOTICE",
+      "../LICENSES/*.txt"
     ]
   }
 }

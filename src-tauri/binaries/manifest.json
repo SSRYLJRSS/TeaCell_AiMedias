@@ -1,55 +1,70 @@
 {
   "schemaVersion": 1,
-  "ffmpegVersion": "7.1",
+  "ffmpegVersion": "7.1.3",
   "targets": {
     "x86_64-pc-windows-msvc": {
       "os": "windows",
-      "runner": { "os": "win32", "arch": "x64" },
+      "runner": {
+        "os": "win32",
+        "arch": "x64"
+      },
       "exeExt": ".exe",
-      "archiveUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-01-31-12-58/ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1.zip",
-      "archiveSha256": "701292d0914c95f2edbf20da28fe922b60d15ace690de96bd518dc68612e9f6e",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_x86_64-pc-windows-msvc.zip",
+      "archiveSha256": "6383b37d01f4af25d20b2df8dc4b205c4cbc56e82bd14330917b1a5efec59064",
       "archiveKind": "zip",
-      "ffmpegPathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/bin/ffmpeg.exe",
-      "ffprobePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/bin/ffprobe.exe",
-      "ffmpegSha256": "cf5bcf890408dc3431d51738cf454893b4e8c6464c319dcaad0edcdb3a7fc77c",
-      "ffprobeSha256": "4ac029a180081c4d4b0070a906b3851d2d6cf6d3eca4c26c3b3cfce6d8ecae78",
-      "licensePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-win64-gpl-7.1/LICENSE.txt",
+      "ffmpegPathInArchive": "bin/ffmpeg.exe",
+      "ffprobePathInArchive": "bin/ffprobe.exe",
+      "ffmpegSha256": "2fac13e8e4d7c50421f6202a2814eaccfccedb4711eaedfe1573b7b34c1a74d8",
+      "ffprobeSha256": "2bfdfa8b4304f1f82c6c1cfe372633b2bc811785e66947da4e80f755161983b3",
+      "licensePathInArchive": "LICENSE.txt",
       "licenseSha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
-      "requiredEncoders": ["libx264", "aac"]
+      "requiredEncoders": [
+        "libx264",
+        "aac"
+      ]
     },
     "aarch64-apple-darwin": {
       "os": "macos",
-      "runner": { "os": "darwin", "arch": "arm64" },
+      "runner": {
+        "os": "darwin",
+        "arch": "arm64"
+      },
       "exeExt": "",
-      "archiveUrl": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1737140319_7.1/ffmpeg.zip",
-      "archiveSha256": "3d57f8032cb6ac8550e3abf41e74f15fd52865523d16c14fe3c55b31a07ecd6f",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_aarch64-apple-darwin.zip",
+      "archiveSha256": "3be32fd3a4ba4df9fcc33e868cb3258eb8422873ff164e1442515c41a9ba351c",
       "archiveKind": "zip",
-      "ffmpegPathInArchive": "ffmpeg",
-      "ffprobeArchiveUrl": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1737140319_7.1/ffprobe.zip",
-      "ffprobeArchiveSha256": "7bad07c2d8c8d2b7dfa95071b9c52ee7907d3a69a3165eb2a659c26248b5b764",
-      "ffprobeArchiveKind": "zip",
-      "ffprobePathInArchive": "ffprobe",
-      "ffmpegSha256": "35d5b4bae415843ec8827480ae28be760d04ddfe4bb33b8834178104c288fd20",
-      "ffprobeSha256": "54b3eaddd43d64a2eccfe1140ac2cb8fa8cfa5312b4d78a90916ffb6e0a15760",
-      "licenseUrl": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/GPL-3.0-only.txt",
-      "licenseSha256": "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0",
-      "licenseFileName": "GPL-3.0.txt",
-      "requiredEncoders": ["libx264", "aac"]
+      "ffmpegPathInArchive": "bin/ffmpeg",
+      "ffprobePathInArchive": "bin/ffprobe",
+      "ffmpegSha256": "55b44c3575d2509c295a004573afd9142e8fadf0c7e8f3183f3fb7412bf95e14",
+      "ffprobeSha256": "27c545b66bf1aaa9a814547525d2edfb47b5740d84ede8f9c03e81f639562211",
+      "licensePathInArchive": "LICENSE.txt",
+      "licenseSha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "requiredEncoders": [
+        "libx264",
+        "aac"
+      ]
     },
     "x86_64-unknown-linux-gnu": {
       "os": "linux",
-      "runner": { "os": "linux", "arch": "x64" },
+      "runner": {
+        "os": "linux",
+        "arch": "x64"
+      },
       "exeExt": "",
-      "archiveUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-01-31-12-58/ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1.tar.xz",
-      "archiveSha256": "a3cf6c3934850c0fa2e8dd90901b68dd3ce82e36f98c99b064f685ecc059135b",
-      "archiveKind": "tar.xz",
-      "ffmpegPathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/bin/ffmpeg",
-      "ffprobePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/bin/ffprobe",
-      "ffmpegSha256": "f25f17a4e6f118845a178a2b42dddc09de87e225a2d358f9dac6302ed05c2c24",
-      "ffprobeSha256": "db345cf2e2ee7392963e93a5c14b9b7c4cc1b6ca5d73bc8dfc43e05e1c938ce5",
-      "licensePathInArchive": "ffmpeg-n7.1-184-gdc07f98934-linux64-gpl-7.1/LICENSE.txt",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_x86_64-unknown-linux-gnu.zip",
+      "archiveSha256": "75a25dd94bbae95de944d260d7e908001fee07a6da1a60e0280209ac57fa5190",
+      "archiveKind": "zip",
+      "ffmpegPathInArchive": "bin/ffmpeg",
+      "ffprobePathInArchive": "bin/ffprobe",
+      "ffmpegSha256": "4449bcddeb07f30b6af2e9de4e229544ba3003b387dc2289c6adc4ccf1156787",
+      "ffprobeSha256": "1e3cac900adaf15a8cbabc51680534795abd22168100ff8e403f445e76f67050",
+      "licensePathInArchive": "LICENSE.txt",
       "licenseSha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
-      "requiredEncoders": ["libvpx", "libvorbis"]
+      "requiredEncoders": [
+        "libvpx",
+        "libvorbis"
+      ]
     }
-  }
+  },
+  "ffmpegBuildRevision": "bbe2534"
 }

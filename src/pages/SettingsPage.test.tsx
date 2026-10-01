@@ -11,9 +11,11 @@ import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { usePlatformStore } from "@/stores/platformStore";
+import { ollamaInstallStatus, ollamaInstallerCacheInfo } from "@/api/ollama";
 import { useTagStore } from "@/stores/tagStore";
 import { exportDiagnostics, getSettings, openAuthorPage, openFeedbackPage, openHelpPage, openLicensePage, openProjectPage, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
+import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
 
@@ -71,6 +73,7 @@ vi.mock("@/api/settings", () => ({
   }),
 }));
 vi.mock("@/api/ollama", () => ({
+  ollamaInstallerCacheInfo: vi.fn().mockResolvedValue({ path: null, sizeBytes: 0 }),
   ollamaInstallStatus: vi.fn().mockResolvedValue({ installerPath: null, installerSize: 0 }),
   ollamaRemoveInstaller: vi.fn().mockResolvedValue(undefined),
   ollamaListSources: vi.fn().mockResolvedValue([{ id: "auto", label: "自动", url: "" }]),
@@ -194,6 +197,8 @@ const emptyStore = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(ollamaInstallerCacheInfo).mockReset().mockResolvedValue({ path: null, sizeBytes: 0 });
+  vi.mocked(videoProxyCacheStats).mockReset().mockResolvedValue([2, 1024 * 1024]);
   useSettingsStore.setState(emptyStore);
   // R1（三端复核）：这些回归编码 Windows（托管 Ollama）契约——本机服务 tab 可见。
   // 平台能力 store 置为 ready+windows；非托管平台的隐藏行为由 platformStore 单测覆盖。
@@ -386,11 +391,11 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.getByText(/茶馆AI素材管理 \/ TeaCell AI Media Manager/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "小红书主页" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "MIT License" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "GNU GPL v3 or later" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /GitHub · SSRYLJRSS/ }));
     fireEvent.click(screen.getByRole("button", { name: "小红书主页" }));
-    fireEvent.click(screen.getByRole("button", { name: "MIT License" }));
+    fireEvent.click(screen.getByRole("button", { name: "GNU GPL v3 or later" }));
     await waitFor(() => expect(openProjectPage).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(openAuthorPage).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(vi.mocked(openLicensePage)).toHaveBeenCalledTimes(1));
@@ -943,6 +948,68 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
 
 // ── W7 真机复现：切换到「存储与维护」路由不抛 hooks 错误 ──
 describe("存储与维护路由（W5c 备份恢复 + W5d phash 行）", () => {
+  it.each(["unsupported", "loading", "error"])("平台能力为 %s 时不请求托管缓存，通用缓存仍可读", async (capability) => {
+    if (capability === "unsupported") {
+      const current = usePlatformStore.getState().capabilities!;
+      usePlatformStore.setState({ capabilities: { ...current, os: "linux", managedOllama: false } });
+    } else {
+      usePlatformStore.setState({ status: capability as "loading" | "error", capabilities: null });
+    }
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("存储与维护"));
+    await waitFor(() => expect(videoProxyCacheStats).toHaveBeenCalledTimes(1));
+    expect(ollamaInstallerCacheInfo).not.toHaveBeenCalled();
+    expect(ollamaInstallStatus).not.toHaveBeenCalled();
+    expect(screen.queryByText("Ollama 安装包缓存")).toBeNull();
+  });
+
+  it("缓存读取失败显示错误，显式重试后恢复统计", async () => {
+    vi.mocked(ollamaInstallerCacheInfo).mockRejectedValueOnce(new Error("permission denied"));
+    vi.mocked(videoProxyCacheStats).mockRejectedValueOnce(new Error("database unavailable"));
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("存储与维护"));
+    expect(await screen.findByText("缓存读取失败：permission denied")).toBeInTheDocument();
+    expect(await screen.findByText("缓存读取失败：database unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("未缓存安装包（一键安装时自动下载）")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "重试安装包缓存" }));
+    expect(await screen.findByText("未缓存安装包（一键安装时自动下载）")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/缓存读取失败/)).toBeNull());
+  });
+
+  it("清理后忽略旧缓存请求的迟到结果", async () => {
+    let resolveOld!: (value: { path: string | null; sizeBytes: number }) => void;
+    vi.mocked(ollamaInstallerCacheInfo).mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve; }));
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("存储与维护"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "清理全部" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "清理全部" }));
+    await waitFor(() => expect(clearAllVideoProxies).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("未缓存安装包（一键安装时自动下载）")).toBeInTheDocument();
+    await act(async () => resolveOld({ path: "D:/old.exe", sizeBytes: 104857600 }));
+    expect(screen.queryByRole("button", { name: "删除安装包" })).toBeNull();
+    expect(ollamaInstallStatus).not.toHaveBeenCalled();
+  });
+
+  it("能力加载完成后再读取安装包缓存", async () => {
+    const capabilities = usePlatformStore.getState().capabilities!;
+    usePlatformStore.setState({ status: "loading", capabilities: null });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("存储与维护"));
+    expect(ollamaInstallerCacheInfo).not.toHaveBeenCalled();
+    act(() => usePlatformStore.setState({ status: "ready", capabilities }));
+    await waitFor(() => expect(ollamaInstallerCacheInfo).toHaveBeenCalledTimes(1));
+  });
+  it("维护页只读缓存，不执行 Ollama 版本或服务健康探测", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("存储与维护"));
+    await waitFor(() => expect(ollamaInstallerCacheInfo).toHaveBeenCalledTimes(1));
+    expect(ollamaInstallStatus).not.toHaveBeenCalled();
+  });
   it("点击「存储与维护」渲染备份/恢复与相似图识别数据，不抛 more-hooks 错误", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
     render(<SettingsPage />);

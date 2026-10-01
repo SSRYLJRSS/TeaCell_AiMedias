@@ -38,6 +38,10 @@ node scripts/prepare-heif-libraries.mjs --target x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-msvc").Path
 
+Run-Step "Windows background console regression" {
+    pwsh ./scripts/test-background-process.ps1
+}
+
 # [1/5] Backend stable group (parallel; network targets excluded to avoid flaky)
 Run-Step "[1/5] cargo test stable group (lib + db_integration + qa_edge + format_matrix + services_integration)" {
     cargo test --manifest-path src-tauri/Cargo.toml `

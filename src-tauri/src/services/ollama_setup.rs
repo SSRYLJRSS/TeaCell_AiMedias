@@ -124,12 +124,13 @@ pub fn ping(base_url: &str) -> OllamaStatus {
 
 /// 显存探针：nvidia-smi 优先（可靠），失败 → unknown 不猜测
 pub fn probe_gpu() -> GpuInfo {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
+    let out = crate::utils::process::output_with_timeout(
+        crate::utils::process::background_command("nvidia-smi").args([
             "--query-gpu=name,memory.total",
             "--format=csv,noheader,nounits",
-        ])
-        .output();
+        ]),
+        std::time::Duration::from_secs(5),
+    );
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);

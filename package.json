@@ -2,6 +2,7 @@
   "name": "teacell-ai-media-manager",
   "private": true,
   "version": "1.0.2",
+  "license": "GPL-3.0-or-later",
   "engines": {
     "node": ">=22 <25"
   },

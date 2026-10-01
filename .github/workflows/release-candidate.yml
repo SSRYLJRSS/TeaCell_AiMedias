@@ -2,12 +2,45 @@ name: release-candidate
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuildMacHeifOnly:
+        description: Rebuild macOS HEIF with only the declared static codec dependencies
+        type: boolean
+        default: false
+      buildDependenciesOnly:
+        description: Build hash-pinned native programs and their corresponding source before installers
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  mac-heif:
+    if: ${{ inputs.rebuildMacHeifOnly }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: brew install ninja
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: 3.31.6
+      - run: node scripts/prepare-distribution-sources.mjs artifacts/dependency-inputs
+      - run: node scripts/build-distribution-heif.mjs artifacts/dependency-inputs artifacts/dependency-build
+      - run: node scripts/collect-distribution-dependencies.mjs aarch64-apple-darwin artifacts/dependency-inputs artifacts/dependency-build artifacts/mac-heif --heif-only
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-heif
+          path: artifacts/mac-heif/
+          retention-days: 14
+  dependencies:
+    if: ${{ inputs.buildDependenciesOnly && !inputs.rebuildMacHeifOnly }}
+    uses: ./.github/workflows/distribution-dependencies.yml
   bundle:
+    if: ${{ !inputs.buildDependenciesOnly && !inputs.rebuildMacHeifOnly }}
     name: bundle (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 100
@@ -68,7 +101,7 @@ jobs:
 
   verify:
     needs: bundle
-    if: always()
+    if: ${{ always() && !inputs.buildDependenciesOnly && !inputs.rebuildMacHeifOnly }}
     runs-on: ubuntu-24.04
     steps:
       - name: Fail if any platform bundle failed

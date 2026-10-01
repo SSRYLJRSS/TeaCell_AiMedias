@@ -140,6 +140,9 @@ commands 不允许：
 | `credentials.rs` | 系统凭据读写 |
 | `heic_decode.rs` / `raw_decode.rs` | imaging 的专用解码下游 |
 
+后台外部进程统一通过 `utils/process.rs` 构造；Windows 使用无控制台标志，其他平台保持原生命令行为。版本/GPU健康探针使用有限时的双管道读取，超时终止并回收子进程；媒体抽帧与转码保留各自取消/超时控制。
+维护页通过 `ollama_installer_cache_info` 只读安装包文件元数据，不复用包含版本子进程与本机 HTTP 请求的 `ollama_install_status`。缓存读取失败不返回空缓存假成功。
+
 `error.rs` 是命令错误的统一序列化边界：`AppError` 返回 `{ code, message, cause? }`。
 `code` 使用稳定的机器码，业务校验优先使用 `invalid_arg` / `not_found` / `conflict` /
 `cancelled` / `timeout` / `file_locked` / `ai_rate_limited` / `unauthorized` /
@@ -366,10 +369,10 @@ pending -> processing -> done
 
 ## 8. 分发与许可
 
-项目使用 MIT 许可证，但以下依赖需要对外分发前复核：
+项目和组合安装包使用 GPL-3.0-or-later，许可全文见根目录 `LICENSE`，版权及第三方声明见 `NOTICE`。此前以 MIT 发布的代码保留原授权。公开分发必须随安装包提供对应源码与构建材料：
 
 - `rawler` 及其 LGPL/GPL 许可条件。
-- `heif-rs`、libheif、libde265、x265 等静态链接组件。三目标原生归档及源码/许可证 URL、SHA256 见 [`src-tauri/native/heif-manifest.json`](../src-tauri/native/heif-manifest.json)；x265 使用 GPL-2.0-or-later，任何对外交付前必须由负责人独立审查许可义务和再分发条件。
+- `heif-rs`、libheif、libde265、x265 等静态链接组件。三目标原生归档及源码/许可证 URL、SHA256 见 [`src-tauri/native/heif-manifest.json`](../src-tauri/native/heif-manifest.json)；x265 使用 GPL-2.0-or-later，在本组合分发中适用 GPLv3。
 - 其他图像、视频或模型依赖的再分发条款。
 
-内部自用风险与对外商业分发不同。发布安装包前必须核对许可证，并保留动态链接、替换库或更换依赖的备选方案。
+源码归档必须包含本程序、静态库与独立 FFmpeg 程序的实际源码、所需补丁、构建脚本和依赖锁。仅有许可证文本和上游主页链接不能替代对应源码。商业使用允许；再分发程序或修改版本时须遵守 GPL 源码与许可义务。

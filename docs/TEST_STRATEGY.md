@@ -29,6 +29,8 @@
 
 自动化通过不代表产品可发布，L6 是独立发布门禁。
 
+Windows 后台控制台回归使用 `pwsh ./scripts/test-background-process.ps1`：GUI subsystem 测试父进程经真实 helper 启动控制台 fixture，验证未分配控制台，并验证卡住的探针按期限终止/回收。该检查进入本地完整冒烟与 Windows CI；它证明进程构造策略，不能代替安装包中维护页、媒体与 GPU 操作的真机验收。
+
 ## 3. 风险覆盖
 
 | 风险域 | 必测内容 | 主要防线 |

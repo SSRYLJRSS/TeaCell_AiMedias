@@ -68,6 +68,10 @@ jobs:
       - name: Frontend typecheck
         run: npm run typecheck
 
+      - name: Background console regression
+        shell: pwsh
+        run: pwsh ./scripts/test-background-process.ps1
+
       - name: Frontend build
         run: npm run build
 

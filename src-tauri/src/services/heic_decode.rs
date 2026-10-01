@@ -5,7 +5,7 @@
 //! HEVC 全解码比内嵌 JPEG 提取慢一到两个量级，绝不能进入库占位路径。
 //!
 //! 依赖链：heif-rs（Apache-2.0）静态链接 libheif（LGPL-3.0）+ libde265（LGPL-3.0）；
-//! 闭源分发合规要求见 docs/ARCHITECTURE.md。
+//! GPL 组合分发与对应源码要求见 docs/ARCHITECTURE.md。
 
 use image::{DynamicImage, ImageDecoder};
 

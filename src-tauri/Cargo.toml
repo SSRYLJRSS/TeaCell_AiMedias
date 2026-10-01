@@ -2,6 +2,7 @@
 name = "teacell_ai_media_manager"
 version = "1.0.2"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "茶馆AI素材管理 / TeaCell AI Media Manager — 本地优先的图片与视频素材库 / Local-first photo and video library"
 
 [lib]

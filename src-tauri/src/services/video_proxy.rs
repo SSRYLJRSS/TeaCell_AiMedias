@@ -502,13 +502,19 @@ pub fn proxy_cache_stats(db: &Arc<Database>, proxy_dir: &Path) -> AppResult<(i64
     )?;
     drop(conn);
     let mut bytes: u64 = 0;
-    if let Ok(rd) = fs::read_dir(proxy_dir) {
-        for e in rd.flatten() {
-            if let Ok(md) = e.metadata() {
-                if md.is_file() {
-                    bytes += md.len();
-                }
-            }
+    let entries = match fs::read_dir(proxy_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((count, 0)),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => bytes += metadata.len(),
+            Ok(_) => {}
+            // Concurrent cache removal is not a permission/read failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok((count, bytes))
@@ -543,6 +549,21 @@ pub fn clear_all_proxies(db: &Arc<Database>, proxy_dir: &Path) -> AppResult<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_stats_distinguishes_absent_cache_from_unreadable_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let database = db();
+        let missing = workspace.path().join("missing");
+        assert_eq!(proxy_cache_stats(&database, &missing).unwrap(), (0, 0));
+        let directory = workspace.path().join("缓存 空间");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("proxy.mp4"), b"cached proxy").unwrap();
+        assert_eq!(proxy_cache_stats(&database, &directory).unwrap(), (0, 12));
+        let not_directory = workspace.path().join("file");
+        fs::write(&not_directory, b"not a directory").unwrap();
+        assert!(proxy_cache_stats(&database, &not_directory).is_err());
+    }
     use crate::db::{init_memory, video_proxy};
     use rusqlite::Connection;
 

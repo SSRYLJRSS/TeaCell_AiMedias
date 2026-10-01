@@ -1,0 +1,26 @@
+TeaCell AI Media Manager / 茶馆AI素材管理
+Copyright (c) 2026 TeaCell contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This application is distributed under GNU GPL version 3 or, at your option,
+any later version. See LICENSE. Commercial use is permitted. Distribution of
+the program or a modified version requires the corresponding source and
+build materials under the applicable GPL terms, as well as preservation of
+copyright and license notices.
+
+Code previously offered under MIT retains that permission; its original
+notice is preserved in LICENSES/TeaCell-legacy-MIT.txt. Incorporating that
+code into this GPL distribution does not revoke previously granted rights.
+
+Third-party components retain their respective copyright and license:
+- heif-rs: Apache-2.0
+- libheif and libde265: LGPL-3.0-or-later
+- x265: GPL-2.0-or-later (used under GPLv3 in this combined distribution)
+- rawler: LGPL-2.1
+- FFmpeg/ffprobe: separately invoked GPLv3 programs
+- Rust and JavaScript dependencies: licenses recorded with their sources
+
+The release's corresponding-source archive contains the application source,
+native/media sources, build scripts, dependency locks and license notices.
+The release SHA256SUMS file binds those materials to its installers.
+These notices do not replace the licenses contained in the source archive.

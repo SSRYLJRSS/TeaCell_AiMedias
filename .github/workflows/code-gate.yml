@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: code-gate-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   frontend:
     runs-on: ubuntu-24.04
