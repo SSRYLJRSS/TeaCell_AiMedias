@@ -68,17 +68,17 @@
       },
       "assetName": "TeaCell_HEIF_aarch64-apple-darwin.zip",
       "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_aarch64-apple-darwin.zip",
-      "assetSha256": "2da4f95c3a7561045c117cea11b438f0b4cece83f29b9d8adaa96a789a88dd67",
-      "assetSizeBytes": 2493211,
+      "assetSha256": "ca907a18dac906e8f2010b0ef0f8b9088b5cf3c28844849e3ae2db62a4a85c74",
+      "assetSizeBytes": 2490570,
       "staticLibraries": [
         "libheif.a",
         "libx265.a",
         "libde265.a"
       ],
       "staticLibrarySha256s": {
-        "libheif.a": "8a22b14d3f4a04ca69551c9057121a44072d02d103225d5d91805e2bcd99f6bf",
-        "libx265.a": "77d5bfd67414fceb654815c584df5155e943614a0b5fcf4713ddfced77acf7a1",
-        "libde265.a": "62fa380f7c37afa8c83df839a2a3f8e128fc5c2421155d8c63fcf928fc3c0d56"
+        "libheif.a": "f47837d07198a9a690ab6b9e2658eda700047a5d5ddd2f9f08888939ecda6afd",
+        "libx265.a": "9ca479c1a48b10efe886ca0c8df4e6c9c1c1682c9f6eaceb7cd2f408a9648fd0",
+        "libde265.a": "29198c7d5bcc1caa793b11e16e0a02bc7775ffdaf996d69cc903562d562e7d29"
       }
     },
     "x86_64-unknown-linux-gnu": {

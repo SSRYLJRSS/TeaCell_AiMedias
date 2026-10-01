@@ -53,7 +53,7 @@ GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRY
 5. **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部有结果记录。
 6. **三端远端门禁**：GitHub `main` 已启用 strict Required checks，要求 `frontend`、三个目标平台 Rust 检查及 `smoke`，并对管理员生效。远端 `main` SHA `d10507925a834a87e2c6816e395940b66b81ee0d` 的最近 `code-gate` 与 `smoke` 通过；当前工作区改动未提交到该 SHA，仍需在干净提交上完成远端门禁。
 7. **macOS/Linux 真机验收**：当前没有这两类目标设备的验收证据；自动构建成功也不能标记为支持。
-8. **媒体依赖分发材料**：项目负责人已明确授权按 GPL-3.0-or-later 发布；原 MIT 授权保留。正在从固定源码重建 HEIF/FFmpeg，收集 Rust、前端、原生媒体对应源码和构建材料。安装包与对应源码、逐平台构建证据及 SHA256 必须配套完成，不能仅更新许可证文字后分发。流程见 [OPERATIONS.md](OPERATIONS.md#52-三端候选构建)。
+8. **媒体依赖分发材料**：项目负责人已明确授权按 GPL-3.0-or-later 发布；原 MIT 授权保留。HEIF/FFmpeg 已改为固定源码自建，Rust、前端和原生媒体对应源码及构建材料已收集，三端运行时摘要固定在 manifest。Windows HEIF 使用本机 MSVC 构建并完成真实样本验证；macOS 单独重建以排除 runner 自动发现的 libsharpyuv；FFmpeg 三端通过编码、探测和解码验证。安装包与完整对应源码、逐平台构建证据及 SHA256 必须配套发布，不能仅更新许可证文字后分发。流程见 [OPERATIONS.md](OPERATIONS.md#52-三端候选构建)。
 
 当前项目计划不把“自动化全绿”等同于“产品可发布”。真实素材验收仍是独立门禁。
 
