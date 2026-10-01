@@ -6,6 +6,8 @@
 
 ## 1. 快速认识项目
 
+面向用户的 Release 每个平台只提供一个安装包：Windows x64 NSIS `.exe`、macOS Apple Silicon `.dmg`、Linux x64 `.AppImage`。不单独发布中英文 MSI 或 DEB；Windows 同一个安装器提供语言选择，应用当前界面仍为中文。GPL 完整对应源码、原生构建依赖、构建证据与校验清单放在单独的[开发构建材料](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/build-materials-v1.0.2)中，并从应用 Release 说明直接链接。开发材料不是另一个应用版本，不作为最新版本。移动材料时先验证新位置摘要，再更新固定下载清单，最后移除主 Release 的重复附件。
+
 茶馆是 Tauri 桌面应用：
 
 - React 前端负责页面、状态和交互。

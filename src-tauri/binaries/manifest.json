@@ -9,7 +9,7 @@
         "arch": "x64"
       },
       "exeExt": ".exe",
-      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_x86_64-pc-windows-msvc.zip",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_FFmpeg_x86_64-pc-windows-msvc.zip",
       "archiveSha256": "6383b37d01f4af25d20b2df8dc4b205c4cbc56e82bd14330917b1a5efec59064",
       "archiveKind": "zip",
       "ffmpegPathInArchive": "bin/ffmpeg.exe",
@@ -30,7 +30,7 @@
         "arch": "arm64"
       },
       "exeExt": "",
-      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_aarch64-apple-darwin.zip",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_FFmpeg_aarch64-apple-darwin.zip",
       "archiveSha256": "3be32fd3a4ba4df9fcc33e868cb3258eb8422873ff164e1442515c41a9ba351c",
       "archiveKind": "zip",
       "ffmpegPathInArchive": "bin/ffmpeg",
@@ -51,7 +51,7 @@
         "arch": "x64"
       },
       "exeExt": "",
-      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_FFmpeg_x86_64-unknown-linux-gnu.zip",
+      "archiveUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/build-materials-v1.0.2/TeaCell_FFmpeg_x86_64-unknown-linux-gnu.zip",
       "archiveSha256": "75a25dd94bbae95de944d260d7e908001fee07a6da1a60e0280209ac57fa5190",
       "archiveKind": "zip",
       "ffmpegPathInArchive": "bin/ffmpeg",
