@@ -7,7 +7,6 @@
 //! 注意：Child 由本模块独占持有（不 Send 复制），Mutex 包裹后由命令层/退出钩子访问。
 
 use std::process::Child;
-#[cfg(any(windows, test))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
