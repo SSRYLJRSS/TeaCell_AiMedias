@@ -14,7 +14,12 @@ export CC=${CC:-cc}
 export CXX=${CXX:-c++}
 jobs=4
 cmake_bin=${CMAKE_COMMAND:-cmake}
-source_dir() { find "$inputs/sources" -mindepth 1 -maxdepth 1 -type d -name "$1-*" | head -n 1; }
+source_dir() {
+  local directory
+  directory=$(find "$inputs/sources" -mindepth 1 -maxdepth 1 -type d -iname "$1-*" | head -n 1)
+  test -n "$directory" || { echo "Missing source directory: $1" >&2; return 1; }
+  printf '%s\n' "$directory"
+}
 windows=false
 case "$(uname -s)" in MINGW*|MSYS*) windows=true; export CC=gcc CXX=g++; export LDFLAGS="$LDFLAGS -static -static-libgcc -static-libstdc++" ;; esac
 
