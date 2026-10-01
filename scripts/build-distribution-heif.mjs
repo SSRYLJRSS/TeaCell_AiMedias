@@ -35,6 +35,7 @@ const x265 = join(prefix, "lib", windows ? "x265-static.lib" : "libx265.a");
 if (windows && !existsSync(x265) && existsSync(join(prefix, "lib", "x265.lib"))) cpSync(join(prefix, "lib", "x265.lib"), x265);
 if (!existsSync(de265) || !existsSync(x265)) throw new Error("Native codec archive names differ from the linker contract");
 build("heif", source("libheif"), ["-DBUILD_SHARED_LIBS=OFF", `-DCMAKE_PREFIX_PATH=${prefix}`,
+  ...(windows ? ["-DCMAKE_CXX_FLAGS=-DLIBDE265_STATIC_BUILD"] : []),
   `-DLIBDE265_INCLUDE_DIR=${join(prefix, "include")}`, `-DLIBDE265_LIBRARY=${de265}`,
   `-DX265_INCLUDE_DIR=${join(prefix, "include")}`, `-DX265_LIBRARY=${x265}`,
   "-DWITH_LIBDE265=ON", "-DWITH_LIBDE265_PLUGIN=OFF", "-DWITH_X265=ON", "-DWITH_X265_PLUGIN=OFF",
