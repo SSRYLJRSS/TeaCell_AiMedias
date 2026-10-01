@@ -13,6 +13,7 @@ export LDFLAGS="-L$prefix/lib"
 export CC=${CC:-cc}
 export CXX=${CXX:-c++}
 jobs=4
+cmake_bin=${CMAKE_COMMAND:-cmake}
 source_dir() { find "$inputs/sources" -mindepth 1 -maxdepth 1 -type d -name "$1-*" | head -n 1; }
 windows=false
 case "$(uname -s)" in MINGW*|MSYS*) windows=true; export CC=gcc CXX=g++; export LDFLAGS="$LDFLAGS -static -static-libgcc -static-libstdc++" ;; esac
@@ -21,11 +22,11 @@ cd "$(source_dir zlib)"
 ./configure --static --prefix="$prefix"
 make -j"$jobs" && make install
 for name in ogg vorbis; do
-  cmake -S "$(source_dir "$name")" -B "$output/build-$name" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  "$cmake_bin" -S "$(source_dir "$name")" -B "$output/build-$name" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
     -DCMAKE_PREFIX_PATH="$prefix" -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DINSTALL_DOCS=OFF
-  cmake --build "$output/build-$name" --parallel "$jobs"
-  cmake --install "$output/build-$name"
+  "$cmake_bin" --build "$output/build-$name" --parallel "$jobs"
+  "$cmake_bin" --install "$output/build-$name"
 done
 cd "$(source_dir x264)"
 host=()

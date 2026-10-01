@@ -23,7 +23,7 @@ function cmake(args) {
 }
 function build(name, directory, flags) {
   const buildDir = join(output, `build-${name}`);
-  cmake(["-S", directory, "-B", buildDir, ...(windows ? ["-G", "Visual Studio 17 2022", "-A", "x64"] : []), ...common, ...flags]);
+  cmake(["-S", directory, "-B", buildDir, "-G", "Ninja", ...(windows ? ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"] : []), ...common, ...flags]);
   cmake(["--build", buildDir, "--config", "Release", "--parallel", "4"]);
   cmake(["--install", buildDir, "--config", "Release"]);
 }

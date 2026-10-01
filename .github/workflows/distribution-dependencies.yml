@@ -42,6 +42,16 @@ jobs:
             mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-meson
       - name: Verify and extract corresponding source
         run: node scripts/prepare-distribution-sources.mjs artifacts/dependency-inputs
+      - name: Select supported CMake for upstream codec sources
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: 3.31.6
+      - name: Select Windows MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Record native CMake path
+        shell: bash
+        run: echo "CMAKE_COMMAND=$(command -v cmake)" >> "$GITHUB_ENV"
       - name: Build native HEIF static libraries
         run: node scripts/build-distribution-heif.mjs artifacts/dependency-inputs artifacts/dependency-build
       - name: Build local-file FFmpeg (Unix)
