@@ -10,7 +10,7 @@ import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { displayBasename } from "@/utils/pathDisplay";
-import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
+import { ollamaInstallerCacheInfo, ollamaRemoveInstaller } from "@/api/ollama";
 import { backupDb, clearThumbnailCache, exportDiagnostics, getAuthorPageUrl, getDataDir, getFeedbackPageUrl, getLicensePageUrl, getProjectPageUrl, openAuthorPage, openDataDir, openFeedbackPage, openHelpPage, openLicensePage, openLogsDir, openProjectPage, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
@@ -30,6 +30,7 @@ import ServiceManagement from "@/components/settings/ServiceManagement";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { selectManagedOllama, usePlatformStore } from "@/stores/platformStore";
 import { useTagStore } from "@/stores/tagStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
 import { CELL_STEPS } from "@/types/settings";
@@ -82,6 +83,7 @@ const DEFAULT_ROUTE: SettingsRoute = "library";
 const SETTINGS_AUTOSAVE_DELAY_MS = 500;
 
 export default function SettingsPage({ onBack }: { onBack?: () => void }) {
+  const managedOllama = usePlatformStore(selectManagedOllama);
   const { settings, loaded, loading, load, save, loadError } = useSettingsStore(
     useShallow((s) => ({
       settings: s.settings,
@@ -150,6 +152,12 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   // A3：安装包缓存（「存储与维护」分组展示占用/清理）
   const [installerInfo, setInstallerInfo] = useState<{ path: string; size: number } | null>(null);
   const [removingInstaller, setRemovingInstaller] = useState(false);
+  const [installerError, setInstallerError] = useState<string | null>(null);
+  const [installerLoading, setInstallerLoading] = useState(false);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  const [proxyLoading, setProxyLoading] = useState(false);
+  const [cacheRevision, setCacheRevision] = useState(0);
+  const cacheRequestRef = useRef(0);
   // §6.7：视频代理缓存统计（数量/占用）+ 清理
   const [proxyStats, setProxyStats] = useState<{ count: number; bytes: number } | null>(null);
   const [clearingProxies, setClearingProxies] = useState(false);
@@ -394,35 +402,54 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => setDataDirError(true));
   }, []);
 
-  // 进入「存储与维护」分组时刷新安装包缓存 + 视频代理缓存统计
+  // File-only statistics; discard replies after navigation, cleanup or a newer refresh.
   useEffect(() => {
     if (route !== "data") return;
-    ollamaInstallStatus()
-      .then((s) =>
-        s.installerPath ? setInstallerInfo({ path: s.installerPath, size: s.installerSize }) : setInstallerInfo(null),
-      )
-      .catch(() => setInstallerInfo(null));
-    videoProxyCacheStats()
-      .then(([count, bytes]) => setProxyStats({ count, bytes }))
-      .catch(() => setProxyStats(null));
-  }, [route]);
+    const request = ++cacheRequestRef.current;
+    let active = true;
+    const current = () => active && request === cacheRequestRef.current;
+    setInstallerInfo(null);
+    setInstallerError(null);
+    setInstallerLoading(managedOllama);
+    if (managedOllama) {
+      void ollamaInstallerCacheInfo().then((info) => {
+        if (current()) setInstallerInfo(info.path ? { path: info.path, size: info.sizeBytes } : null);
+      }).catch((cause: unknown) => {
+        if (current()) setInstallerError(cause instanceof Error ? cause.message : String(cause));
+      }).finally(() => {
+        if (current()) setInstallerLoading(false);
+      });
+    }
+    setProxyStats(null);
+    setProxyError(null);
+    setProxyLoading(true);
+    void videoProxyCacheStats().then(([count, bytes]) => {
+      if (current()) setProxyStats({ count, bytes });
+    }).catch((cause: unknown) => {
+      if (current()) setProxyError(cause instanceof Error ? cause.message : String(cause));
+    }).finally(() => {
+      if (current()) setProxyLoading(false);
+    });
+    return () => { active = false; };
+  }, [route, managedOllama, cacheRevision]);
 
   const onClearVideoProxies = async () => {
     setClearingProxies(true);
+    ++cacheRequestRef.current;
     try {
       const removed = await clearAllVideoProxies();
       setNotice(removed > 0 ? `已清理 ${removed} 个视频代理文件` : "视频代理缓存已清理");
-      const [count, bytes] = await videoProxyCacheStats();
-      setProxyStats({ count, bytes });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setClearingProxies(false);
+      setCacheRevision((revision) => revision + 1);
     }
   };
 
   const onRemoveInstaller = async () => {
     setRemovingInstaller(true);
+    ++cacheRequestRef.current;
     try {
       await ollamaRemoveInstaller();
       setInstallerInfo(null);
@@ -431,6 +458,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRemovingInstaller(false);
+      setCacheRevision((revision) => revision + 1);
     }
   };
 
@@ -995,20 +1023,20 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void onClearCache()}>立即清除</Button>
                 </div>
               </Field>
-              <Field
-                label="Ollama 安装包缓存"
-                hint={
-                  installerInfo
+              {managedOllama && (
+                <Field label="Ollama 安装包缓存" hint={
+                  installerLoading ? "正在读取安装包缓存…" : installerError ? `缓存读取失败：${installerError}` : installerInfo
                     ? `约 ${(installerInfo.size / 1024 / 1024).toFixed(0)} MB，供离线重装；删除后需重新下载`
                     : "未缓存安装包（一键安装时自动下载）"
-                }
-              >
-                {installerInfo && (
-                  <Button variant="danger" disabled={removingInstaller} onClick={() => void onRemoveInstaller()}>
-                    {removingInstaller ? "删除中…" : "删除安装包"}
-                  </Button>
-                )}
-              </Field>
+                }>
+                  {installerError && <Button onClick={() => setCacheRevision((revision) => revision + 1)}>重试安装包缓存</Button>}
+                  {installerInfo && (
+                    <Button variant="danger" disabled={removingInstaller || installerLoading} onClick={() => void onRemoveInstaller()}>
+                      {removingInstaller ? "删除中…" : "删除安装包"}
+                    </Button>
+                  )}
+                </Field>
+              )}
               <Field label="回收站" hint="超过保留期限后，会在启动时自动清理；设为 0 时不自动清理。">
                 <input
                   type="number"
@@ -1020,12 +1048,13 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               <Field
                 label="视频代理缓存"
                 hint={
-                  proxyStats && proxyStats.count > 0
+                  proxyLoading ? "正在读取视频代理缓存…" : proxyError ? `缓存读取失败：${proxyError}` : proxyStats && proxyStats.count > 0
                     ? `当原视频无法直接播放时生成的兼容副本（当前 ${proxyStats.count} 个，约 ${(proxyStats.bytes / 1024 / 1024).toFixed(1)} MB）。清理不会删除原视频，需要时会重新生成。`
                     : "当原视频无法直接播放时，会自动生成兼容副本。清理不会删除原视频；当前没有可清理的副本。"
                 }
               >
-                <Button variant="danger" disabled={clearingProxies} onClick={() => void onClearVideoProxies()}>
+                {proxyError && <Button onClick={() => setCacheRevision((revision) => revision + 1)}>重试视频代理缓存</Button>}
+                <Button variant="danger" disabled={clearingProxies || proxyLoading || !!proxyError} onClick={() => void onClearVideoProxies()}>
                   {clearingProxies ? "清理中…" : "清理全部"}
                 </Button>
               </Field>

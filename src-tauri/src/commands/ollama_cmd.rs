@@ -133,6 +133,17 @@ pub async fn ollama_install_status() -> AppResult<InstallStatus> {
     .map_err(|e| AppError::msg(format!("安装态探测任务异常: {e}")))
 }
 
+/// Storage settings only need file metadata, not installation or runtime health.
+#[tauri::command]
+pub async fn ollama_installer_cache_info() -> AppResult<installer::InstallerCacheInfo> {
+    require_managed_ollama_supported()?;
+    tauri::async_runtime::spawn_blocking(|| {
+        installer::installer_cache_info_at(&installer::installer_path())
+    })
+    .await
+    .map_err(|error| AppError::msg(format!("缓存读取任务异常: {error}")))?
+}
+
 /// 从 settings 读取当前自定义源（installer::DownloadSource 形式）
 fn read_custom_sources(state: &State<AppState>) -> AppResult<Vec<installer::DownloadSource>> {
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;

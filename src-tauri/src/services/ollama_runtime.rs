@@ -8,7 +8,6 @@
 
 use std::process::Child;
 #[cfg(any(windows, test))]
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -145,11 +144,8 @@ impl OllamaRuntimeState {
         // 已确认退出（或从未持有 Child）时不再 taskkill，避免对已退出进程的噪音报错。
         #[cfg(windows)]
         if !confirmed_exit {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let _ = Command::new("taskkill")
+            let _ = crate::utils::process::background_command("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .creation_flags(CREATE_NO_WINDOW)
                 .status();
         }
         self.ownership = None;
@@ -252,7 +248,7 @@ mod tests {
     fn spawn_dummy(secs: u64) -> Child {
         #[cfg(windows)]
         {
-            Command::new("cmd")
+            crate::utils::process::background_command("cmd")
                 .args([
                     "/C",
                     "ping",
@@ -269,7 +265,7 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            Command::new("sleep")
+            crate::utils::process::background_command("sleep")
                 .arg(secs.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

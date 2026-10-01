@@ -176,6 +176,34 @@ pub fn installer_path() -> PathBuf {
         .join("OllamaSetup.exe")
 }
 
+/// File-only cache information; never starts Ollama or probes the local service.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallerCacheInfo {
+    pub path: Option<String>,
+    pub size_bytes: u64,
+}
+
+pub fn installer_cache_info_at(path: &Path) -> AppResult<InstallerCacheInfo> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InstallerCacheInfo {
+                path: None,
+                size_bytes: 0,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Err(AppError::invalid_arg("安装包缓存路径不是文件"));
+    }
+    Ok(InstallerCacheInfo {
+        path: Some(crate::utils::path::encode_native_path(path)?),
+        size_bytes: metadata.len(),
+    })
+}
+
 /// 由目标路径派生 .part 与 .part.meta 路径
 fn part_paths(dest: &Path) -> (PathBuf, PathBuf) {
     let name = dest
@@ -261,10 +289,11 @@ pub fn parse_version_output(stdout: &str, stderr: &str) -> Option<String> {
 }
 
 fn query_version(exe: &Path) -> Option<String> {
-    let o = std::process::Command::new(exe)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let o = crate::utils::process::output_with_timeout(
+        crate::utils::process::background_command(exe).arg("--version"),
+        Duration::from_secs(5),
+    )
+    .ok()?;
     parse_version_output(
         &String::from_utf8_lossy(&o.stdout),
         &String::from_utf8_lossy(&o.stderr),
@@ -842,7 +871,7 @@ fn download_one<F: Fn(InstallProgress)>(
 
 /// 静默安装：等待安装进程退出并返回退出码（spawn 失败多为杀软拦截）
 pub fn install_silent(installer: &Path) -> AppResult<i32> {
-    let st = std::process::Command::new(installer)
+    let st = crate::utils::process::background_command(installer)
         .args(SILENT_ARGS)
         .status()
         .map_err(|e| AppError::msg(format!("启动安装程序失败（可能被安全软件拦截）: {e}")))?;
@@ -923,19 +952,13 @@ pub const KEEP_ALIVE_IDLE: &str = "2m";
 /// - 可选注入模型下载代理 HTTPS_PROXY/HTTP_PROXY（保留代理环境变量）；
 /// - Windows 无窗口标志。
 fn build_serve_command(exe_path: &Path, proxy: Option<&str>) -> std::process::Command {
-    let mut cmd = std::process::Command::new(exe_path);
+    let mut cmd = crate::utils::process::background_command(exe_path);
     cmd.arg("serve");
     // L1：空闲保留时长注入（不记录密钥；值固定常量无敏感内容）
     cmd.env("OLLAMA_KEEP_ALIVE", KEEP_ALIVE_IDLE);
     if let Some(p) = proxy {
         // Ollama 模型拉取走进程内 reqwest，读标准 HTTPS_PROXY/HTTP_PROXY 即可换源
         cmd.env("HTTPS_PROXY", p).env("HTTP_PROXY", p);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
 }
@@ -950,6 +973,21 @@ fn start_service_inner(exe_path: &Path, proxy: Option<&str>) -> AppResult<std::p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_cache_info_reads_only_file_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("茶包 cache 空间.exe");
+        let missing = installer_cache_info_at(&path).unwrap();
+        assert!(missing.path.is_none());
+        assert_eq!(missing.size_bytes, 0);
+        std::fs::write(&path, b"cached installer").unwrap();
+        let info = installer_cache_info_at(&path).unwrap();
+        assert_eq!(info.path.as_deref(), path.to_str());
+        assert_eq!(info.size_bytes, 16);
+        assert_eq!(std::fs::read(&path).unwrap(), b"cached installer");
+        assert!(installer_cache_info_at(temp.path()).is_err());
+    }
 
     #[test]
     fn ollama_path_lookup_preserves_unicode_native_paths() {

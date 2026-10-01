@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { Buffer } from "node:buffer";
+import { URL } from "node:url";
 import {
   assertCandidateCheckout,
   assertRunnerMatchesTarget,
@@ -8,6 +12,22 @@ import {
   packageMetadataMatches,
   RUNNER_BY_TARGET,
 } from "./candidate-contract.mjs";
+
+test("English package identity preserves the legacy MSI upgrade family", () => {
+  const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  assert.equal(config.productName, "TeaCell AI Media Manager");
+  assert.equal(config.identifier, "com.bagertea.aimdeias");
+  // Tauri's documented UUID-v5 derivation for the original Windows x64 product.
+  const dnsNamespace = Buffer.from("6ba7b8109dad11d180b400c04fd430c8", "hex");
+  const digest = createHash("sha1").update(dnsNamespace).update("茶馆.exe.app.x64").digest().subarray(0, 16);
+  digest[6] = (digest[6] & 0x0f) | 0x50;
+  digest[8] = (digest[8] & 0x3f) | 0x80;
+  const hex = digest.toString("hex");
+  const legacyUpgradeCode = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  assert.equal(config.bundle.windows.wix.upgradeCode, legacyUpgradeCode);
+  const englishPackages = ["TeaCell AI Media Manager_1.0.2_x64-setup.exe", "TeaCell AI Media Manager_1.0.20_x64-setup.exe"];
+  assert.deepEqual(filterPackageFilesByVersion(englishPackages, "1.0.2"), [englishPackages[0]]);
+});
 
 test("candidate metadata only accepts the exact clean source commit", () => {
   const commit = "a".repeat(40);

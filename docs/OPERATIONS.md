@@ -13,7 +13,7 @@
 - 素材库、标签和索引默认保存在本机。
 - 云端 AI 只在用户触发时发送选中素材的预览。
 
-当前 v1.0.2 的主要发布阻塞是真实素材 UAT 和发布证据，不等于代码未实现。
+当前发布阻塞和验收状态见 [项目计划 §2.2](PROJECT_PLAN.md#22-当前发布阻塞)，不等于代码未实现。
 
 ## 2. 本地启动
 
@@ -40,6 +40,9 @@ npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
 
 Windows NSIS 安装器包含英文与简体中文界面并允许选择语言；MSI 分别构建 `en-US` 与 `zh-CN` 版本。WiX locale 文件使用 Windows-936 code page，以保留中英文产品名称；不要移除 `src-tauri/wix/*.wxl` 的 locale 覆盖或把 `TauriCodepage` 改回 1252。
+
+打包产品名和新安装默认目录使用 PRD 定义的英文全名，中文 UI 短名保持不变。MSI 固定沿用旧中文产品名对应的 UpgradeCode `30bc1910-3467-5659-bcff-284af99c9896`，禁止因改名重新生成。NSIS 通过 `nsis/installer-hooks.nsh` 在当前安装用户上下文检查旧中文安装：验证发布者及卸载器、明确确认后正常卸载旧应用文件，再安装新包；无法安全识别或卸载时中止，不删除用户数据。首次从旧中文 NSIS 产品身份迁移须交互安装，静默迁移拒绝执行；改名后的后续升级仍走 Tauri 原有更新路径。安装目录可以含中文用户名、用户自选中文目录或空格，不能靠禁止中文路径掩盖编码问题。
+应用 identifier 与下文的数据根目录保持兼容，不随产品展示名变化。实际安装与旧版升级仍需按 [QA_PLAYBOOK.md](QA_PLAYBOOK.md) 验收，配置正确不代表已完成安装验收。
 
 正式交付前：
 
@@ -136,10 +139,7 @@ npm run desktop:build -- --target x86_64-pc-windows-msvc
 手动候选工作流 `.github/workflows/release-candidate.yml` 从同一个 workflow commit 并行生成三端
 安装包，并附 `build-manifest.json`、runner OS/架构、每个安装包的大小与 SHA256、整体 SHA256 清单、FFmpeg 与 HEIF 许可证文本及其固定来源。验证 job 检查目标、版本、提交、必需包类型、runner 架构和摘要；artifact 只保留 7 天，不会发布到 Releases。macOS 包目前没有签名/公证流程。
 
-**当前硬阻塞**：HEIF 依赖包含静态链接的 LGPL 组件和 GPL 许可的 x265。许可证文本、版本、来源和 SHA256 不能代替对应二进制的源码、构建参数、许可义务和再分发
-条件审查。在这些材料被独立审查确认之前，不得把 artifact 交给熟人测试，也不得公开分发。生成 artifact
-本身不是发布授权。首次远端 code-gate 全绿、GitHub `main` Required checks 配置和三个平台人工核心
-五步验收也都尚待完成。
+**分发许可门禁**：HEIF 依赖包含静态链接的 LGPL 组件和 GPL 许可的 x265。许可证文本、版本、来源和 SHA256 不能代替对应二进制的源码、构建参数、许可义务和再分发条件审查。在这些材料被项目负责人独立审查确认之前，不得把 artifact 交给测试者，也不得公开分发。生成 artifact 本身不是发布授权。其他当前发布状态见 [项目计划 §2.2](PROJECT_PLAN.md#22-当前发布阻塞)。
 
 ### 5.3 构建产物
 

@@ -34,9 +34,12 @@ vi.mock("@/api/assets", () => ({
 import { open as pickFiles } from "@tauri-apps/plugin-dialog";
 import { importFiles, inspectImport } from "@/api/import";
 
+const originalLoadSettings = useSettingsStore.getState().load;
+
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({
+    load: originalLoadSettings,
     loaded: true,
     loading: false,
     loadError: null,
@@ -47,6 +50,25 @@ beforeEach(() => {
 });
 
 describe("ImportPage", () => {
+  it("设置读取中不误报缺少总库或提供跳转按钮", async () => {
+    useSettingsStore.setState({ loaded: false, loading: true, settings: null, load: vi.fn().mockResolvedValue(undefined) });
+    render(<ImportPage />);
+    expect(screen.getByText("正在读取设置，请稍候。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "前往设置" })).toBeNull();
+    await act(async () => {});
+  });
+
+  it("设置读取失败优先显示错误和重试，不冒充加载中", async () => {
+    const load = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ loaded: false, settings: null, loadError: "无法读取数据库", load });
+    render(<ImportPage />);
+    expect(screen.getByText("设置读取失败：无法读取数据库")).toBeInTheDocument();
+    expect(screen.queryByText("正在读取设置，请稍候。")).toBeNull();
+    expect(screen.queryByRole("button", { name: "前往设置" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(load).toHaveBeenCalledTimes(2);
+    await act(async () => {});
+  });
   it("渲染空库引导（拖拽区 + 选择按钮）", () => {
     render(<ImportPage />);
     expect(screen.getByText("把图片 / 视频拖到这里")).toBeTruthy();
@@ -98,9 +120,9 @@ describe("ImportPage", () => {
     useSettingsStore.setState({ settings: { libraryRoot: "" } as never });
     render(<ImportPage />);
     fireEvent.click(screen.getByRole("button", { name: "前往设置" }));
-    expect(screen.getByText(/请先在设置中配置并保存总库位置/)).toBeInTheDocument();
+    expect(screen.getByText(/请先设置素材总库位置/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("选择文件…"));
-    expect(screen.getAllByText(/请先在设置中配置并保存总库位置/)).toHaveLength(1);
+    expect(screen.getAllByText(/请先设置素材总库位置/)).toHaveLength(1);
     expect(pickFiles).not.toHaveBeenCalled();
     expect(inspectImport).not.toHaveBeenCalled();
   });

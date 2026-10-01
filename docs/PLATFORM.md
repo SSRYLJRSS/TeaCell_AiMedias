@@ -98,6 +98,9 @@ Rust 目标依赖放在 `Cargo.toml` 的 `[target.'cfg(...)'.dependencies]`。�
 
 ## 6. 高风险区域
 
+后台探针、媒体工具与托管服务统一经 `utils/process.rs` 启动；Windows 创建子进程时设置 `CREATE_NO_WINDOW`，不能以重定向输出或主程序 GUI subsystem 代替。非 Windows 不设置 Windows 进程标志。用户主动安装时的权限/安装器界面与后台控制台分别验收；GUI 安装器还须保留静默参数。
+托管安装包缓存只在 `managedOllama` 已就绪且允许时读取；未知/失败能力状态和非 Windows 不发托管请求，通用缓存统计仍可使用。
+
 碰到以下领域时，必须阅读本文并增加目标平台测试：
 
 - 路径分隔符、大小写和非 UTF-8 文件名。

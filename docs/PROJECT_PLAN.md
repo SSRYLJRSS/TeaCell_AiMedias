@@ -1,6 +1,6 @@
 # 项目计划
 
-> 更新日期：2026-09-30
+> 更新日期：2026-10-01
 >
 > 本文档记录当前阶段、交付状态和下一阶段范围。产品行为见 [PRD.md](PRD.md)，技术结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -47,7 +47,7 @@ GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRY
 3. **格式与性能**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
 4. **工作区交付边界**：所有应发布改动必须完成审查、测试并形成可回退提交。
 5. **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部有结果记录。
-6. **三端远端门禁**：工作分支代码级 CI 已通过，但 GitHub `main` 尚未启用有效保护规则/Required checks，因此 CI 不是合并阻断硬门禁；最新运行证据见 §2.3，历史失败与复验说明见 §2.4。
+6. **三端远端门禁**：GitHub `main` 已启用 strict Required checks，要求 `frontend`、三个目标平台 Rust 检查及 `smoke`，并对管理员生效。远端 `main` SHA `d10507925a834a87e2c6816e395940b66b81ee0d` 的最近 `code-gate` 与 `smoke` 通过；当前工作区改动未提交到该 SHA，仍需在干净提交上完成远端门禁。
 7. **macOS/Linux 真机验收**：当前没有这两类目标设备的验收证据；自动构建成功也不能标记为支持。
 8. **媒体依赖合规**：FFmpeg/HEIF/RAW 相关二进制的来源、对应源码/再分发材料和最终许可义务尚未完成独立复核；HEIF 的三目标归档、解压后静态库 SHA256、源码提交和 LGPL/GPL 许可证摘要已固定并随候选附带，但这不替代法律审查，许可证文本本身不足以解除分发阻塞。
 
@@ -57,10 +57,10 @@ GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRY
 
 | 范围 | 当前状态 | 完成证据/剩余动作 |
 |---|---|---|
-| 平台契约、AI 协作入口、路径与能力边界 | 集成基线 `f2f4a1f` 已快进合入本地 `main` | 产品代码和工作流与已通过三端 code-gate 及 Windows smoke 的 `b5c25b2` 一致；远端同步以 Git 引用为准，Required checks 未设置 |
+| 平台契约、AI 协作入口、路径与能力边界 | 集成基线 `f2f4a1f` 已快进合入本地 `main` | 产品代码和工作流与已通过三端 code-gate 及 Windows smoke 的 `b5c25b2` 一致；GitHub `main` 已启用 strict Required checks，当前远端最新成功门禁位于 SHA `d10507925a834a87e2c6816e395940b66b81ee0d`；当前工作区改动尚无远端门禁证据 |
 | Windows/macOS/Linux 平台能力、UTF-8 路径告警、视频代理变体 | 工作分支已有实现与回归测试 | 最新提交在三端 clippy、全量 Rust 测试及原生 Tauri 构建通过；目标设备人工验收仍未完成 |
 | Rust 1.98.1、统一桌面构建入口、SHA256 sidecar/HEIF manifest | 工作分支已配置 | 三端 HEIF 资源准备及原生应用构建通过；当前提交 `1c33ba899b3db186835667907bd9bc7ee5ada7ec` 的 Windows strict media check 通过，并在本机用 `npm run desktop:build -- --target x86_64-pc-windows-msvc --bundles msi,nsis --ci --no-sign` 成功生成 Windows MSI（110,690,304 bytes，SHA256 `69C464DC2057FBAB72EB7630E229BFFBA0F4DD31B810447E4683417D8A70D9DB`）和 NSIS（81,144,151 bytes，SHA256 `F434373FDB742D0EAB9995EFA1FFF09D42D67BF71890D0ADF2630BF0256DDB72`）；构建日志 SHA256 `6BDB2E3EC65FC782216300990FA8F14262CCBDFEBE2C74687C2A441996768C96`。构建仅用于本地链路验证；未签名、未安装、未启动、未上传、未分发，不是发布候选包。构建结束后原有 `dist/` 已恢复，临时生成内容保留在临时目录且未进入版本控制。三端同提交候选和真实产物 manifest 仍未生成 |
-| 三目标 code-gate 与手动候选包 workflow | 代码/工作流验证基线 `b5c25b2` 的 code-gate 与同 SHA Windows smoke 均已通过；候选包 workflow 尚未运行 | 完整 SHA 和运行链接见本节下方。checkout/setup-node v7 已实际执行；候选包的 upload/download v7 尚未运行验证。`smoke.yml` 的 push/PR 自动触发限于 `main`。收尾检查确认 GitHub main 未受保护且仓库 rulesets 为空，尚无 Required checks。候选 workflow 此次随集成进入主线，远端同步后再核对默认分支注册状态；本轮不派发候选包任务 |
+| 三目标 code-gate 与手动候选包 workflow | 代码/工作流验证基线 `b5c25b2` 的 code-gate 与同 SHA Windows smoke 均已通过；GitHub `main` Required checks 已配置 | 近期候选 workflow [run 36662320517](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662320517) 的 macOS/Linux 打包成功，Windows 打包成功但收集步骤因 runner 工作树不干净而拒绝登记 artifact；当前改动仍需在同一干净提交上重跑三端候选 workflow。`smoke.yml` 的 push/PR 自动触发限于 `main` |
 | 三端版本/提交/安装包摘要一致性校验 | manifest 包含 runner OS/架构、逐包大小/SHA256、必需包类型、HEIF 来源/许可证材料及逐目标构建日志 SHA256；本地合成三端产物的聚合校验测试通过，真实三端候选尚未生成 | 需在同一提交的三端 runner 生成并验证真实产物 |
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
@@ -76,7 +76,7 @@ GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRY
 - workflow run `35969019646` attempt 1 的 `SettingsPage.test.tsx` 失败发生在“初始未修改时不显示未保存状态”断言；日志实际显示该提示元素存在。它紧随本文件内的色条设置测试，而该测试曾留下 800ms 防抖 timer。`36a5d35` 将该前置测试改为假时钟、在本测试中完成防抖保存/回读，并在 `afterEach` 恢复真实时钟；这与失败路径构成具体的跨测试 timer 泄漏解释。修复版该测试文件顺序运行 3 次，均为 37 passed/2 skipped；后续完整前端及三端 run `35992128310` 通过。结论：timer 泄漏是有代码路径支持的根因判断并已做针对性隔离，但历史 attempt 本身未能在修复前稳定重现；若未来复发仍需重新诊断。
 - 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。对应源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [三端 code-gate run 36000987683](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36000987683) 已全部通过。
 - 工作分支 SHA `7474d48e7af2c4d48b922538d8956acd5496d9e7` 的首次手动 Windows smoke [run 36094987343 attempt 1](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36094987343) 在 `ViewerPage.test.tsx` 的“fallback 沉浸按 Esc 返回查看器”用例失败：Escape 后未在 waitFor 时限内恢复“返回素材库”按钮。相同 SHA 的 attempt 2 通过；本机单文件 14/14 和完整前端单测 709 passed/2 skipped 也通过，故原失败未能稳定复现。检查到键盘监听器在 passive `useEffect` 中随 `immersiveMode` 重绑，沉浸 portal 出现与新监听器生效之间存在事件空档。`0aa1039` 将监听器改为 `useLayoutEffect`，让处理器在提交后的绘制前更新；修复后本机该文件 14/14、全量前端单测 709/2、lint、typecheck 通过，且该 SHA 的 Windows smoke `36096765334` 与四 job code-gate `36096755139` 均全绿。结论：原始失败为一次真实但未复现的异步时序失败；修复针对代码中可确认的监听器空档，不把 attempt 2 当成覆盖 attempt 1 的证据。
-- 本次采用快进方式将集成基线纳入 `main`，保留全部原始提交，不 squash、不强推、不删除恢复分支，也不覆盖快照工作区中的用户改动。代码/工作流验证基线仍为 `b5c25b2`。未创建 PR、未改保护规则、未发布。分支与门禁状态见 §2.3；Required checks、候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过和主线合并都不等于可发布或平台支持等级已升级。
+- 本次采用快进方式将集成基线纳入 `main`，保留全部原始提交，不 squash、不强推、不删除恢复分支，也不覆盖快照工作区中的用户改动。代码/工作流验证基线仍为 `b5c25b2`。该次合入当时未创建 PR、未改保护规则、未发布；后续发布准备已为 `main` 配置 Required checks。分支与门禁当前状态见 §2.3；候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过和主线合并都不等于可发布或平台支持等级已升级。
 
 ### 2.5 安装测试问题修复状态（2026-09-28）
 
@@ -155,13 +155,13 @@ D9 的 Windows 全新配置、保留数据升级、卸载重装和独立配置�
 - App 管理的 Ollama 只在 Windows；macOS/Linux 保留外部兼容 AI 连接，不提供托管安装/启动入口。
 - 第一阶段不承诺跨系统搬迁素材库。
 
-该里程碑的 workflow 文件和本地实现不等于远端门禁已启用；当前提交的首次三端 runner 已全绿，但 GitHub Required checks 未配置，媒体依赖再分发复核和真实真机 UAT 也未完成。
+该里程碑的 workflow 文件和本地实现不等于发布验收完成；GitHub `main` Required checks 已配置，媒体依赖再分发复核、三端候选包和真实真机 UAT 仍未完成。
 
 ## 4. 治理收尾与后续开发边界
 
 ### 4.1 本阶段授权和边界
 
-本轮范围：**不新增功能，只优化、规范已有代码，修复适配与可靠性问题。** 用户最新要求“开始合并收尾”，已授权将验证过的集成改动合入并推送 `main`，替代此前“暂不合并”的限制。本轮不修改 branch protection，不安装、分发或发布。文档中的未来方向不是开发授权。
+本轮代码范围：**不新增功能，只优化、规范已有代码，修复适配与可靠性问题。** 用户已授权将验证过的集成改动合入主线，并另行明确要求替换上传 v1.0.2 Release。GitHub `main` Required checks 已按发布门禁启用；公开分发仍受 §2.2 的许可、三端候选和真机验收条件约束。文档中的未来方向不是开发授权。
 
 产品基线是 `main` 已有行为加 Windows 恢复快照中既有行为，不是把所有平台分支或旧计划内容无条件搬入。平台差异按 [PLATFORM.md](PLATFORM.md) 收敛；相对 Windows 的行为改变必须能对应既定能力限制或可复现缺陷。
 
@@ -174,7 +174,7 @@ D9 的 Windows 全新配置、保留数据升级、卸载重装和独立配置�
 1. 先读取 AGENTS 与相关权威文档，并核对工作树、分支、HEAD、暂存/未暂存/未跟踪项。只在集成工作树施工，两个恢复快照仅作证据。
 2. 开工列出一个具体问题、预期行为、文件白名单、三端影响、回归测试和不改项。新增文件或迁移须说明其如何服务现有行为，而非扩展产品。
 3. 一次只处理一批；如果发现另一问题，记录后排队，不顺手修复。需要改变产品含义时暂停并请求决策。
-4. 保留用户所有既有改动和暂存区；不用 reset/checkout/clean。本次提交、推送与主线合并按 §4.1 的明确授权执行；不延伸为改保护规则、安装或发布。恢复快照仅保留，不删除、不覆盖。
+4. 保留用户所有既有改动和暂存区；不用 reset/checkout/clean。本次提交、推送与主线合并按 §4.1 的明确授权执行；发布门禁范围内的 `main` Required checks 已设置，安装或公开分发须先关闭 §2.2 阻塞。恢复快照仅保留，不删除、不覆盖。
 5. 回改已发布迁移、减少测试断言、跳过失败测试、全局串行化来掩盖失败、放宽三端门禁均不属于可接受修复。
 6. 每批交付：实际 diff、基线来源、验证命令及退出码、未执行项、剩余风险。失败结果不得被之后一次成功覆盖。
 
@@ -188,10 +188,10 @@ D9 的 Windows 全新配置、保留数据升级、卸载重装和独立配置�
 | P1 429 批处理状态 | 已修复（故障路径已确认；旧实例未复现） | 基线 `683628a` 虽已将 HTTP 429 映射为 `AI_RATE_LIMITED`，但批处理仍把它和普通请求错误共用退避重试及 rejected 路径；`2e62273` 在首次/重试响应处新增该错误码的提前中断处理，记录错误并保留 pending。`http_429_stops_batch_and_preserves_pending` 覆盖不重试、当前与后续建议均保留 pending；Windows 精确用例 10/10 通过，源码 SHA `fd319eb` 的三端 code-gate 全绿。历史原始运行的随机触发条件未复现，不声称可稳定复现。 |
 | P2 平台与数据安全 | 代码复核完成 | 既有平台差异、安全路径和回归修正已纳入当前集成；目标设备人工验收仍按 §2.2 未关闭。 |
 | P3 规范和文档收口 | 已完成 | 本地 lint 无 warning；权威文档只记录当前行为、证据和开放门禁。 |
-| P4 同一源码验证 | `b5c25b2` 的四个 code-gate jobs 与同 SHA Windows smoke 全绿；本机 MSI/NSIS 构建证据仍来自 `1c33ba8` | checkout/setup-node 的 Node 24 迁移已验证；候选包 upload/download v7 尚未运行。代码级门禁完成。本机包尚未安装/启动验收，也不满足当前 SHA 的三端候选要求。完整证据和未完成发布项见 §2.3。CI 尚不是 main 的 Required check。 |
-| P5 主线合并与候选验收 | 集成基线 `f2f4a1f` 已快进合入本地 `main`；远端同步以 Git 引用为准，发布验收仍未完成 | 用户已授权合并收尾。Required checks、三端候选包 manifest、三端真机 UAT 和媒体许可复核仍需分别关闭；不得把合并或 code-gate 通过视为发布准入。 |
+| P4 同一源码验证 | `b5c25b2` 的四个 code-gate jobs 与同 SHA Windows smoke 全绿；本机 MSI/NSIS 构建证据来自各自记录的工作区 | checkout/setup-node 的 Node 24 迁移已验证；候选 workflow 仍需在当前干净提交上通过。当前 Windows Release 包仅是本机未签名验证包，尚未安装验收，也不满足当前 SHA 的三端候选要求。完整证据和未完成发布项见 §2.3。 |
+| P5 主线合并与候选验收 | 集成基线 `f2f4a1f` 已快进合入本地 `main`；发布验收仍未完成 | `main` Required checks 已配置；三端候选包 manifest、三端真机 UAT 和媒体许可复核仍需分别完成。当前工作区改动尚未形成对应的远端干净提交，不得把旧 SHA 的门禁结果视为本次发布准入。 |
 
-本阶段结束不代表项目可发布。主线同步完成后，可以从最新 `main` 创建短期功能分支开展用户明确指定的新需求，不再向历史集成分支叠加新功能。每项需求先限定范围、平台行为和验收标准，再执行定向验证与合并门禁。代码、依赖、配置或风险未变时，不为文档收尾手动重复跑全套测试；已有证据必须标明对应 SHA，自动触发的新运行不得被隐瞒或冒称通过。§2.2 的安装包、真机与许可事项继续约束发布，不自动冻结所有后续开发；AI 不得自行挑选新功能、修改保护规则或安装/分发。
+本阶段结束不代表项目可发布。主线同步完成后，可以从最新 `main` 创建短期功能分支开展用户明确指定的新需求，不再向历史集成分支叠加新功能。每项需求先限定范围、平台行为和验收标准，再执行定向验证与合并门禁。代码、依赖、配置或风险未变时，不为文档收尾手动重复跑全套测试；已有证据必须标明对应 SHA，自动触发的新运行不得被隐瞒或冒称通过。§2.2 的安装包、真机与许可事项继续约束发布，不自动冻结所有后续开发；未经用户明确要求，AI 不得自行挑选新功能、修改保护规则或安装/分发。
 ## 5. 交付流程
 
 每个功能按以下顺序推进：

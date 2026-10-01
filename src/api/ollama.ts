@@ -92,6 +92,16 @@ export function ollamaInstallStatus(): Promise<InstallStatus> {
     return invoke<InstallStatus>("ollama_install_status");
 }
 
+export interface InstallerCacheInfo {
+    path: string | null;
+    sizeBytes: number;
+}
+
+/** File metadata only; no executable, network or GPU probes. */
+export function ollamaInstallerCacheInfo(): Promise<InstallerCacheInfo> {
+    return invoke<InstallerCacheInfo>("ollama_installer_cache_info");
+}
+
 /** 一键安装：preferredSourceId = "auto" | 源 id（"auto" 时后端按内置顺序直接开下） */
 export function ollamaDownloadInstall(preferredSourceId: string = "auto"): Promise<void> {
     return invoke<void>("ollama_download_install", { preferredSourceId });

@@ -140,6 +140,9 @@ commands 不允许：
 | `credentials.rs` | 系统凭据读写 |
 | `heic_decode.rs` / `raw_decode.rs` | imaging 的专用解码下游 |
 
+后台外部进程统一通过 `utils/process.rs` 构造；Windows 使用无控制台标志，其他平台保持原生命令行为。版本/GPU健康探针使用有限时的双管道读取，超时终止并回收子进程；媒体抽帧与转码保留各自取消/超时控制。
+维护页通过 `ollama_installer_cache_info` 只读安装包文件元数据，不复用包含版本子进程与本机 HTTP 请求的 `ollama_install_status`。缓存读取失败不返回空缓存假成功。
+
 `error.rs` 是命令错误的统一序列化边界：`AppError` 返回 `{ code, message, cause? }`。
 `code` 使用稳定的机器码，业务校验优先使用 `invalid_arg` / `not_found` / `conflict` /
 `cancelled` / `timeout` / `file_locked` / `ai_rate_limited` / `unauthorized` /

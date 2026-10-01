@@ -56,7 +56,7 @@ async function ensureImportLibraryRoot(setError: (message: string) => void): Pro
     return false;
   }
   if (!settings.settings?.libraryRoot.trim()) {
-    setError("请先在设置中配置并保存总库位置，再选择或导入文件。");
+    setError("请先设置素材总库位置，再选择或导入文件。");
     return false;
   }
   return true;
@@ -358,14 +358,14 @@ export default function ImportPage() {
       {/* 右侧：拖拽区 / 清单 + 失败明细（完成计数只在左侧进度面板展示） */}
       <div className="flex min-w-0 flex-1 flex-col p-6">
         {(!settingsLoaded || settingsLoadError || !libraryRoot.trim()) && (
-          <div className="mb-3 flex max-w-2xl flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-secondary)]" role="status">
-            <p className="min-w-0 flex-1">
-              {!settingsLoaded ? "正在读取设置，请稍候。" : settingsLoadError ? `设置读取失败：${settingsLoadError}` : "请先在设置中配置并保存总库位置，再选择或导入文件。"}
+          <div className="mb-3 flex w-full min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-[var(--radius-control)] border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-secondary)]" role="status">
+            <p className="min-w-0 flex-1 break-words leading-5">
+              {settingsLoadError ? `设置读取失败：${settingsLoadError}` : !settingsLoaded ? "正在读取设置，请稍候。" : "请先设置素材总库位置，再选择或导入文件。"}
             </p>
             {settingsLoadError ? (
               <Button onClick={() => void loadSettings()}>重试</Button>
-            ) : !libraryRoot.trim() ? (
-              <Button variant="primary" onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}>前往设置</Button>
+            ) : settingsLoaded && !libraryRoot.trim() ? (
+              <Button className="shrink-0" onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}>前往设置</Button>
             ) : null}
           </div>
         )}
@@ -425,7 +425,7 @@ export default function ImportPage() {
             )}
           </div>
         )}
-        {error && !running && !error.startsWith("请先在设置中配置并保存总库位置") && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
+        {error && !running && !error.startsWith("请先设置素材总库位置") && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
 
         {plan?.items.some((item) => item.previewStatus === "limited") && (
           <div className="mb-3 w-full min-w-0 rounded-md border border-[var(--color-status)] bg-[var(--color-surface)] px-3 py-2 text-xs text-[var(--color-status)]">

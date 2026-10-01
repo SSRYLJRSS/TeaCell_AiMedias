@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "茶馆",
+  "productName": "TeaCell AI Media Manager",
   "version": "1.0.2",
   "identifier": "com.bagertea.aimdeias",
   "build": {
@@ -40,6 +40,7 @@
     "longDescription": "本地优先的图片与视频素材管理应用，支持人工确认的 AI 打标、组合筛选与超级搜索。 / A local-first photo and video asset manager with human-approved AI tagging, combined filters, and advanced search.",
     "windows": {
       "wix": {
+        "upgradeCode": "30bc1910-3467-5659-bcff-284af99c9896",
         "language": {
           "en-US": {
             "localePath": "wix/en-us.wxl"
@@ -50,6 +51,7 @@
         }
       },
       "nsis": {
+        "installerHooks": "nsis/installer-hooks.nsh",
         "languages": ["English", "SimpChinese"],
         "displayLanguageSelector": true
       }

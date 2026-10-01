@@ -363,6 +363,7 @@ pub fn run() {
             commands::ollama_pull,
             commands::ollama_open_download_page,
             commands::ollama_install_status,
+            commands::ollama_installer_cache_info,
             commands::ollama_download_install,
             commands::ollama_start_service,
             commands::ollama_runtime_status,

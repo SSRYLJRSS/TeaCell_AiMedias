@@ -6,7 +6,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -131,12 +131,11 @@ fn resolve_binary_with(
 }
 
 fn executable_responds_to_version(path: &Path) -> bool {
-    Command::new(path)
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    crate::utils::process::output_with_timeout(
+        crate::utils::process::background_command(path).arg("-version"),
+        Duration::from_secs(5),
+    )
+    .is_ok_and(|output| output.status.success())
 }
 
 fn resolve_binary(name: &str) -> Option<PathBuf> {
@@ -160,10 +159,11 @@ pub fn ffmpeg_tool_fingerprint() -> crate::error::AppResult<String> {
     let path = resolve_binary("ffmpeg").ok_or_else(|| {
         crate::error::AppError::unsupported("FFmpeg sidecar 不可用（仅开发构建允许从 PATH 回退）")
     })?;
-    let output = Command::new(&path)
-        .arg("-version")
-        .output()
-        .map_err(|e| crate::error::AppError::msg(format!("读取 FFmpeg 版本失败: {e}")))?;
+    let output = crate::utils::process::output_with_timeout(
+        crate::utils::process::background_command(&path).arg("-version"),
+        Duration::from_secs(5),
+    )
+    .map_err(|e| crate::error::AppError::msg(format!("读取 FFmpeg 版本失败: {e}")))?;
     if !output.status.success() {
         return Err(crate::error::AppError::unsupported(
             "FFmpeg sidecar 存在但无法通过版本探测",
@@ -532,7 +532,7 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
     }
     let ffprobe = resolve_binary("ffprobe").ok_or(ProbeError::BinaryMissing)?;
 
-    let mut child = Command::new(ffprobe)
+    let mut child = crate::utils::process::background_command(ffprobe)
         .args([
             "-v",
             "error",
@@ -629,7 +629,7 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
         return false;
     };
     let secs = format!("{:.3}", time_ms as f64 / 1000.0);
-    let mut child = match Command::new(ffmpeg)
+    let mut child = match crate::utils::process::background_command(ffmpeg)
         .args(["-y", "-ss", &secs, "-i"])
         .arg(path)
         .args([
@@ -691,7 +691,7 @@ pub fn transcode_variant(
     let Some(ffmpeg) = resolve_binary("ffmpeg") else {
         return Err(crate::error::AppError::msg("ffmpeg 不可用"));
     };
-    let mut child = Command::new(ffmpeg)
+    let mut child = crate::utils::process::background_command(ffmpeg)
         .args(["-y", "-i"])
         .arg(src)
         .args(proxy_codec_args(variant))
