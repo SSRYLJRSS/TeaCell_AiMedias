@@ -68,6 +68,8 @@ jobs:
         shell: msys2 {0}
         run: bash scripts/build-distribution-ffmpeg.sh artifacts/dependency-inputs artifacts/dependency-build
       - name: Collect binaries, exact sources and build evidence
+        run: node scripts/verify-distribution-media.mjs artifacts/dependency-build
+      - name: Archive binaries and source evidence
         run: node scripts/collect-distribution-dependencies.mjs ${{ matrix.target }} artifacts/dependency-inputs artifacts/dependency-build artifacts/dependencies-${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
@@ -75,3 +77,12 @@ jobs:
           path: artifacts/dependencies-${{ matrix.target }}/
           if-no-files-found: error
           retention-days: 14
+      - name: Preserve failed configuration diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-failure-${{ matrix.target }}
+          path: |
+            artifacts/dependency-inputs/sources/FFmpeg-*/ffbuild/config.log
+            artifacts/dependency-build/build-*/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore

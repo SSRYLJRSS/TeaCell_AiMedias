@@ -33,6 +33,11 @@ for name in ogg vorbis; do
   "$cmake_bin" --build "$output/build-$name" --parallel "$jobs"
   "$cmake_bin" --install "$output/build-$name"
 done
+# Upstream Vorbis CMake omits libm in the generated static pkg-config metadata.
+# Preserve the explicit system math link dependency when FFmpeg probes static archives.
+if ! $windows; then
+  printf '\nLibs.private: -lm\n' >> "$prefix/lib/pkgconfig/vorbis.pc"
+fi
 cd "$(source_dir x264)"
 host=()
 if $windows; then host=(--host=x86_64-w64-mingw32); fi
