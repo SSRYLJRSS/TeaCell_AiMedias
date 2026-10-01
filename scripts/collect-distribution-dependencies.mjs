@@ -20,6 +20,13 @@ function archive(name, directory, paths) {
   return { name, sizeBytes: statSync(file).size, sha256: hash(file) };
 }
 const heif = archive(`TeaCell_HEIF_${target}.zip`, join(build, "heif"), ["include", "lib"]);
+if (process.argv.includes("--heif-only")) {
+  const librariesSha256 = Object.fromEntries(libraries.map((file) => [file, hash(join(build, "heif", "lib", file))]));
+  copyFileSync(join(build, "heif-build-commands.json"), join(destination, "heif-build-commands.json"));
+  writeFileSync(join(destination, "dependency-manifest.json"), `${JSON.stringify({ target, commit: process.env.GITHUB_SHA, sources: manifest, heif: { ...heif, libraries, librariesSha256 } }, null, 2)}\n`);
+  console.log(`HEIF-only source build collected: ${target}`);
+  process.exit(0);
+}
 const ffmpeg = archive(`TeaCell_FFmpeg_${target}.zip`, join(build, "ffmpeg"), ["bin", "LICENSE.txt"]);
 const librariesSha256 = Object.fromEntries(libraries.map((file) => [file, hash(join(build, "heif", "lib", file))]));
 const suffix = windows ? ".exe" : "";

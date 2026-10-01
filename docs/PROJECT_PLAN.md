@@ -18,6 +18,10 @@
 
 ### 2.0 v1.0.2 品牌迁移与发布状态
 
+本轮 v1.0.2 更新按项目负责人明确授权，以 GPL-3.0-or-later 公开发布公测包并覆盖同版本附件；原 MIT 授权继续有效。修复包括入库设置提示布局、Windows 后台控制台闪现、安装器英文产品身份和许可证显示。媒体依赖改为固定源码自建，对应源码包包含应用、Cargo/npm 运行时依赖、前端上游源码和十个原生媒体组件的实际源码及构建脚本，具体流程见 [OPERATIONS.md](OPERATIONS.md#52-三端候选构建)。Windows 新 HEIF 静态库已通过严格 Rust 检查，12 个真实 8/10 位 HEIC 样本经应用 imaging 入口验证为 12 个出图、0 个黑图。逐平台构建记录、源码与安装包摘要以 [Release 附件](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2) 为准。
+
+本次公开公测授权不代表 §2.2 的人工 UAT 已通过：macOS/Linux 尚无真机验收，macOS 安装包没有签名/公证；完整用户旅程、隔离账户安装升级及性能验收仍须按原门禁完成。不得将此次公开上传记作这些验收完成。
+
 GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRYLJRSS/TeaCell_AiMedias)。v1.0.2 将产品英文全名统一为 `TeaCell AI Media Manager`，中文全名为“茶馆AI素材管理”；桌面短名称继续为“茶馆”。设置页项目、反馈和许可证链接，以及安装器元数据均指向新仓库。Windows 安装界面提供英文和简体中文；各平台包描述和 Release 附件标签采用中英双语。
 
 桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。v1.0.2 已于 2026-09-30 从提交 `d7f1dc328684457a07be257eb0d3ad8ded5e46b0` 发布：[Release 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2)，包含 Windows x64（NSIS 和中英双语 MSI）、macOS Apple Silicon DMG、Linux x64（AppImage 和 DEB）、构建/许可证证据及 SHA-256 清单。旧 v1.0.1 Release 已删除，`v1.0.1` 源码标签保留作历史定位。三端候选 manifest、依赖许可证材料、文件摘要和提交号经 `scripts/verify-candidates.mjs` 通过；同提交 [code-gate](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296905) 和 [smoke](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296889) 通过。候选工作流 [run 36662320517](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662320517) 的 Windows 原生打包成功，但 runner 在构建后因工作区状态检查未能收集 artifact；Windows 候选由干净 checkout 的本机同提交构建和收集，与 macOS/Linux runner 候选合并后完成上述三端校验。真实素材 UAT、macOS/Linux 真机验收和媒体依赖再分发许可复核仍未完成，不因发布动作或自动校验通过而视为完成。

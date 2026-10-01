@@ -40,5 +40,6 @@ build("heif", source("libheif"), ["-DBUILD_SHARED_LIBS=OFF", `-DCMAKE_PREFIX_PAT
   `-DX265_INCLUDE_DIR=${join(prefix, "include")}`, `-DX265_LIBRARY=${x265}`,
   "-DWITH_LIBDE265=ON", "-DWITH_LIBDE265_PLUGIN=OFF", "-DWITH_X265=ON", "-DWITH_X265_PLUGIN=OFF",
   ...["KVAZAAR", "UVG266", "VVDEC", "VVENC", "X264", "OpenH264_DECODER", "DAV1D", "AOM_DECODER", "AOM_ENCODER", "SvtEnc", "RAV1E", "JPEG_DECODER", "JPEG_ENCODER", "OpenJPEG_ENCODER", "OpenJPEG_DECODER", "FFMPEG_DECODER", "OPENJPH_ENCODER"].map((name) => `-DWITH_${name}=OFF`),
+  "-DWITH_LIBSHARPYUV=OFF", "-DWITH_HEADER_COMPRESSION=OFF", "-DWITH_UNCOMPRESSED_CODEC=OFF",
   "-DWITH_EXAMPLES=OFF", "-DWITH_GDK_PIXBUF=OFF", "-DBUILD_TESTING=OFF", "-DENABLE_PLUGIN_LOADING=OFF"]);
 writeFileSync(join(output, "heif-build-commands.json"), `${JSON.stringify({ platform: process.platform, arch: process.arch, cmake: calls }, null, 2)}\n`);

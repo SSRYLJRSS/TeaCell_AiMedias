@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "release": {
-    "version": "26.7.0",
-    "repositoryUrl": "https://github.com/vegidio/binaries-heif",
-    "releaseUrl": "https://github.com/vegidio/binaries-heif/releases/tag/26.7.0"
+    "version": "1.0.2",
+    "repositoryUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias",
+    "releaseUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2"
   },
   "libraries": [
     {
@@ -46,19 +46,19 @@
         "os": "win32",
         "arch": "x64"
       },
-      "assetName": "static_windows_x64.zip",
-      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_windows_x64.zip",
-      "assetSha256": "6021c0643460e525a4ece60b15eecfa4f772d7448cefb178552861c032a8a870",
-      "assetSizeBytes": 9967106,
+      "assetName": "TeaCell_HEIF_x86_64-pc-windows-msvc.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_x86_64-pc-windows-msvc.zip",
+      "assetSha256": "b82dd5571a3fd371c436de9e0336e222be0d9a9d0c20bb94cae342ecb9dacea8",
+      "assetSizeBytes": 9177900,
       "staticLibraries": [
         "heif.lib",
         "x265-static.lib",
         "libde265.lib"
       ],
       "staticLibrarySha256s": {
-        "heif.lib": "3172154a8de54edbd8f72a57ceaea3d417e6e433f63a1f29e2c8db758653b0d8",
-        "x265-static.lib": "af2e4d37d7193c152ce4ef69470449df2f94f042890e4ecebe2166881b13a250",
-        "libde265.lib": "575d5f9646b51162f739b572051ef95d281846d034cd1866f0179a079f8d8dee"
+        "heif.lib": "1150837584da787ca7f7d9d00420775a4fc094e349535bec8e355ac8ba85c0fe",
+        "x265-static.lib": "fd5d90f628a6760f7e485cdf76c4519b122e3ba9a3cd4638b02d56d77c63d30d",
+        "libde265.lib": "ab7610819c2512a1f4d531317879a14acee9deca5479d3d6a85a2eda7dd93a5f"
       }
     },
     "aarch64-apple-darwin": {
@@ -66,19 +66,19 @@
         "os": "darwin",
         "arch": "arm64"
       },
-      "assetName": "static_osx_arm64.zip",
-      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_osx_arm64.zip",
-      "assetSha256": "92be83c8ec3b7039b0721254a3b91b4adbbb16f0be349a37b5d53a5b413cbedf",
-      "assetSizeBytes": 2876516,
+      "assetName": "TeaCell_HEIF_aarch64-apple-darwin.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_aarch64-apple-darwin.zip",
+      "assetSha256": "2da4f95c3a7561045c117cea11b438f0b4cece83f29b9d8adaa96a789a88dd67",
+      "assetSizeBytes": 2493211,
       "staticLibraries": [
         "libheif.a",
         "libx265.a",
         "libde265.a"
       ],
       "staticLibrarySha256s": {
-        "libheif.a": "e0332de3d1f8f4e02eecb4bed3b42060cacc453333e7b51e9cfdf9da1121a3af",
-        "libx265.a": "4ac4c2e455623d7cd2c5951caaaa8446f9e40ff9eb4a18bfb464d161c0777d03",
-        "libde265.a": "cc245eaaef3556143cc01abb7030c1490511fe256725df3f1c87c91bfb8bef64"
+        "libheif.a": "8a22b14d3f4a04ca69551c9057121a44072d02d103225d5d91805e2bcd99f6bf",
+        "libx265.a": "77d5bfd67414fceb654815c584df5155e943614a0b5fcf4713ddfced77acf7a1",
+        "libde265.a": "62fa380f7c37afa8c83df839a2a3f8e128fc5c2421155d8c63fcf928fc3c0d56"
       }
     },
     "x86_64-unknown-linux-gnu": {
@@ -86,25 +86,25 @@
         "os": "linux",
         "arch": "x64"
       },
-      "assetName": "static_linux_x64.zip",
-      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_linux_x64.zip",
-      "assetSha256": "0c04f28819bcfe6572aa46c50535c38e3ce69ae5ba687086acd274ef10c1c785",
-      "assetSizeBytes": 3133905,
+      "assetName": "TeaCell_HEIF_x86_64-unknown-linux-gnu.zip",
+      "assetUrl": "https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/download/v1.0.2/TeaCell_HEIF_x86_64-unknown-linux-gnu.zip",
+      "assetSha256": "fbdc976fd604e705455db6b9e5a87fb967c03b5a7d161b99f1406ff7b9b54217",
+      "assetSizeBytes": 3284842,
       "staticLibraries": [
         "libheif.a",
         "libx265.a",
         "libde265.a"
       ],
       "staticLibrarySha256s": {
-        "libheif.a": "fb45fb12be934c8b763c4220065096679edaa78837ec28dd332338a335703ff7",
-        "libx265.a": "6d5c80597d0f3fca5377b92b3aa1cc7293ba4ba1522712d021a86ab01a89594d",
-        "libde265.a": "8d7e2bf695c8ab310f502aef4c4b84fed46f9e81a05e342779ed8ca88307752e"
+        "libheif.a": "ed1f8948187fde9d9ebb1adf03921865cc0e5dc04604d53fcce575cb90277491",
+        "libx265.a": "7eec19457977af9a306a04a0a15620be86f2a920c039ed2aa481c98c1292c270",
+        "libde265.a": "a59ea2aea432767fc2129b839637e01f0ecf0b6fd9bc6d53b289b14e63fbadec"
       }
     }
   },
   "headerChecks": {
     "include/libheif/heif_version.h": "LIBHEIF_VERSION \"1.23.1\"",
     "include/libde265/de265-version.h": "LIBDE265_VERSION \"1.1.1\"",
-    "include/x265_config.h": "#define X265_BUILD 216"
+    "include/x265_config.h": "#define X265_BUILD 215"
   }
 }
