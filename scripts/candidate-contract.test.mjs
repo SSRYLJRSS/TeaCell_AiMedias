@@ -29,6 +29,17 @@ test("English package identity preserves the legacy MSI upgrade family", () => {
   assert.deepEqual(filterPackageFilesByVersion(englishPackages, "1.0.2"), [englishPackages[0]]);
 });
 
+test("English install identity uses Chinese desktop and start-menu link names", () => {
+  const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  assert.equal(config.productName, "TeaCell AI Media Manager");
+  assert.equal(config.bundle.windows.nsis.template, "nsis/installer.nsi");
+  const template = readFileSync(new URL("../src-tauri/nsis/installer.nsi", import.meta.url), "utf8");
+  assert.match(template, /!define SHORTCUTNAME "茶馆"/);
+  assert.match(template, /CreateShortcut "\$DESKTOP\\\$\{SHORTCUTNAME\}\.lnk"/);
+  assert.match(template, /CreateShortcut "\$SMPROGRAMS\\\$\{SHORTCUTNAME\}\.lnk"/);
+  assert.doesNotMatch(template, /\$\{PRODUCTNAME\}\.lnk/);
+});
+
 test("candidate metadata only accepts the exact clean source commit", () => {
   const commit = "a".repeat(40);
   assert.doesNotThrow(() => assertCandidateCheckout(commit, commit, ""));

@@ -43,6 +43,8 @@ npm run desktop:build -- --target x86_64-pc-windows-msvc
 
 Windows NSIS 安装器包含英文与简体中文界面并允许选择语言；MSI 分别构建 `en-US` 与 `zh-CN` 版本。WiX locale 文件使用 Windows-936 code page，以保留中英文产品名称；不要移除 `src-tauri/wix/*.wxl` 的 locale 覆盖或把 `TauriCodepage` 改回 1252。
 
+公开 Windows NSIS 使用 `nsis/installer.nsi`（固定基于 Tauri CLI 2.11.4 上游模板）：产品注册和默认安装目录保持 `TeaCell AI Media Manager`，桌面与开始菜单链接单独使用“茶馆”。安装钩子只迁移目标确认为本应用的旧英文链接；安装目录中的 `installation-id.txt` 每次安装生成新 GUID，启动时在数据库锁外读取，再通过设置归一化事务只重置教程选择标记。卸载仅移除安装标识，保留用户数据库。NSIS 模板升级时须核对上游差异，并验证新装、重装、升级与卸载的快捷方式行为。
+
 打包产品名和新安装默认目录使用 PRD 定义的英文全名，中文 UI 短名保持不变。MSI 固定沿用旧中文产品名对应的 UpgradeCode `30bc1910-3467-5659-bcff-284af99c9896`，禁止因改名重新生成。NSIS 通过 `nsis/installer-hooks.nsh` 在当前安装用户上下文检查旧中文安装：验证发布者及卸载器、明确确认后正常卸载旧应用文件，再安装新包；无法安全识别或卸载时中止，不删除用户数据。首次从旧中文 NSIS 产品身份迁移须交互安装，静默迁移拒绝执行；改名后的后续升级仍走 Tauri 原有更新路径。安装目录可以含中文用户名、用户自选中文目录或空格，不能靠禁止中文路径掩盖编码问题。
 应用 identifier 与下文的数据根目录保持兼容，不随产品展示名变化。实际安装与旧版升级仍需按 [QA_PLAYBOOK.md](QA_PLAYBOOK.md) 验收，配置正确不代表已完成安装验收。
 

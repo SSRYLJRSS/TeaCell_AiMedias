@@ -1,6 +1,6 @@
 //! 设置：SQLite 键值表存储，整体 JSON 读写（架构 §5.6：首版本地明文）
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
@@ -695,6 +695,35 @@ pub fn normalize_settings_persist(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Installation normalization runs before settings are exposed to the frontend.
+pub fn normalize_tutorial_installation(conn: &Connection, installation_id: &str) -> AppResult<()> {
+    const INSTALLATION_KEY: &str = "tutorial_installation_id_v1";
+    let transaction = conn.unchecked_transaction()?;
+    let installation = serde_json::to_string(installation_id)?;
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [INSTALLATION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if previous.as_deref() == Some(installation.as_str()) {
+        return Ok(());
+    }
+    // Patch only this flag: preserve every other field, including future fields.
+    // Invalid JSON fails atomically instead of overwriting existing settings.
+    transaction.execute(
+        "UPDATE settings SET value = json_set(value, '$.tutorialPromptHandled', json('false')) WHERE key = ?1",
+        [KEY],
+    )?;
+    transaction.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![INSTALLATION_KEY, installation],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +953,59 @@ mod tests {
         assert!(!existing.tutorial_prompt_handled);
         let handled: Settings = serde_json::from_str(r#"{"tutorialPromptHandled":true}"#).unwrap();
         assert!(handled.tutorial_prompt_handled);
+    }
+
+    #[test]
+    fn reinstall_invites_tutorial_once_and_preserves_existing_settings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        let original = r#"{"tutorialPromptHandled":true,"libraryRoot":"D:/my-library","theme":"dark","futureField":{"keep":true}}"#;
+        conn.execute(
+            "INSERT INTO settings VALUES (?1, ?2)",
+            rusqlite::params![KEY, original],
+        )
+        .unwrap();
+        normalize_tutorial_installation(&conn, "installation-one").unwrap();
+        assert!(!get_settings(&conn).unwrap().tutorial_prompt_handled);
+        conn.execute("UPDATE settings SET value = json_set(value, '$.tutorialPromptHandled', json('true')) WHERE key = ?1", [KEY]).unwrap();
+        normalize_tutorial_installation(&conn, "installation-one").unwrap();
+        assert!(get_settings(&conn).unwrap().tutorial_prompt_handled);
+        normalize_tutorial_installation(&conn, "installation-two").unwrap();
+        assert!(!get_settings(&conn).unwrap().tutorial_prompt_handled);
+        let raw: String = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [KEY], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["libraryRoot"], "D:/my-library");
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["futureField"]["keep"], true);
+    }
+
+    #[test]
+    fn failed_tutorial_installation_normalization_preserves_settings_and_retries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO settings VALUES (?1, 'not-json')", [KEY])
+            .unwrap();
+        assert!(normalize_tutorial_installation(&conn, "new-installation").is_err());
+        let raw: String = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [KEY], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(raw, "not-json");
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM settings WHERE key = 'tutorial_installation_id_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 0);
     }
 
     #[test]
