@@ -27,7 +27,7 @@ function build(name, directory, flags) {
   cmake(["--build", buildDir, "--config", "Release", "--parallel", "4"]);
   cmake(["--install", buildDir, "--config", "Release"]);
 }
-build("de265", source("libde265"), ["-DBUILD_SHARED_LIBS=OFF", "-DENABLE_SDL=OFF", "-DENABLE_DECODER=OFF", "-DENABLE_ENCODER=OFF",
+build("de265", source("libde265"), ["-DBUILD_SHARED_LIBS=OFF", ...(windows ? ["-DFORCE_FULL_VISIBILITY=ON"] : []), "-DENABLE_SDL=OFF", "-DENABLE_DECODER=OFF", "-DENABLE_ENCODER=OFF",
   "-DENABLE_SHERLOCK265=OFF", "-DENABLE_INTERNAL_DEVELOPMENT_TOOLS=OFF", "-DENABLE_AVX512=OFF", "-DENABLE_AVX2=OFF"]);
 build("x265", join(source("x265"), "source"), ["-DENABLE_SHARED=OFF", "-DENABLE_CLI=OFF", "-DENABLE_ASSEMBLY=OFF", "-DENABLE_LIBNUMA=OFF"]);
 const de265 = join(prefix, "lib", windows ? "libde265.lib" : "libde265.a");
