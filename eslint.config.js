@@ -4,7 +4,7 @@ import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "src-tauri/**", "node_modules/**", ".qoder/**", "vite.config.ts"],
+    ignores: ["dist/**", "artifacts/**", "src-tauri/**", "node_modules/**", ".qoder/**", "vite.config.ts"],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
