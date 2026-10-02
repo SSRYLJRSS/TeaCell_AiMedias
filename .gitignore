@@ -2,8 +2,9 @@
 node_modules/
 dist/
 *.local
+*.tsbuildinfo
 
-# Rust / Tauri（通配：任何 target-* 构建产物目录都不入库，历史上曾出现 target-codex-verify 9.7G / target-test 8.4G）
+# Rust / Tauri 构建产物
 /target/
 src-tauri/target*/
 src-tauri/gen/
@@ -20,9 +21,22 @@ src-tauri/gen/
 Thumbs.db
 
 # 本地工作数据
+.freebuff/
 .workbuddy/
 .qoder/
+.claude/
+.codex/
+.dsh/
+.idea/
+
+# 本机环境配置；示例配置可提交
+.env
+.env.*
+!.env.example
+!.env.*.example
 
 # 测试输出
+coverage/
 test-output.txt
 qa2_*.txt
+*.log

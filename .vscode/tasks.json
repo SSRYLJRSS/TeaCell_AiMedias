@@ -4,7 +4,7 @@
     {
       "label": "tauri: dev",
       "type": "shell",
-      "command": "npm run tauri dev",
+      "command": "npm run desktop:dev",
       "problemMatcher": [],
       "presentation": { "reveal": "always", "panel": "dedicated" }
     },
