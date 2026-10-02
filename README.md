@@ -1,149 +1,90 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="app-icon-black-bg.png">
-  <source media="(prefers-color-scheme: light)" srcset="app-icon-white-bg.png">
-  <img src="app-icon-square.png" alt="茶馆" width="160"/>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/app-icon-black-bg.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/app-icon-white-bg.png">
+  <img src="docs/assets/app-icon-square.png" alt="茶馆" width="160"/>
 </picture>
 
 # 茶馆 AI 素材管理
 
-**让素材进得来、找得到、打得快、拿得走**
-
-一个装在你自己电脑上的图片/视频素材库。开源免费，数据不出你的硬盘，AI 打标但人说了算。
+本地图片与视频素材管理工具，支持中文搜索、标签整理和 AI 辅助打标。
 
 [![Release](https://img.shields.io/github/v/release/SSRYLJRSS/TeaCell_AiMedias?style=flat-square)](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)](#下载)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green?style=flat-square)](LICENSE)
 
-[下载](#下载) · [快速上手](#快速上手) · [常见问题](#常见问题)
+[下载](#下载) · [快速上手](#快速上手) · [开发](#开发)
 
 </div>
 
----
+## 功能
 
-> **【图片位置 1 —— 首页主图，最重要的一张】**
-> 内容：素材库主界面全宽截图。要求网格里铺满大量缩略图（百张以上，体现"几万张也扛得住"），能同时看到筛选栏和底部主导航。建议 1920 宽的完整窗口截图。
-> 加分做法：换成一段 10 秒左右的滚动浏览 GIF（自动循环那种），比静态图抓人得多。
-> 插入方式：把本说明替换为 `![素材库主界面](图片路径)`。
+- **导入**：扫描文件夹，检查重复文件，预览改名结果；支持常见图片、HEIC、RAW 和视频格式。
+- **浏览**：缩略图网格、评分、收藏、图片查看器和视频播放。
+- **搜索**：中文关键词、标签和元数据筛选；超级搜索支持必须、优先和排除条件。
+- **打标**：手工编辑标签和描述，或使用 AI 生成建议；确认后写入，支持批次撤销。
+- **导出**：复制或移动素材，按标签或日期组织目录，并生成 CSV 清单。
+- **维护**：重复与相似素材查找、回收站、数据库备份和恢复。
 
----
-
-## 这是什么
-
-摄影师、设计师、自媒体人，谁的硬盘里没躺着几千上万张素材？
-
-文件名是 `DSC_4821.jpg`，找一张图翻十分钟；想用 AI 帮忙整理，得先把照片传到别人的服务器上，传不传、传哪些，自己说了不算。
-
-茶馆把这件事拉回你自己手里：
-
-- **进得来** —— 整个文件夹拖进去就完事，自动改名、自动查重，iPhone 的 HEIC 和相机的 RAW 都认识
-- **找得到** —— 打中文关键词，秒出结果；再不行就用超级搜索，说清楚"想要什么、不要什么"就行
-- **打得快** —— AI 帮你批量打标签，但每一条都等你点头才生效，反悔了整批撤销
-- **拿得走** —— 按标签或按日期整整齐齐导出，一键复制到你想要的地方
-
-你的素材库、标签、评分，全部只存在你自己的电脑里。用 AI 打标时，只有你亲手点"生成建议"的那一张，才会把预览发给你自己填的 AI 服务；用本地模型的话，拔了网线照样能跑。
-
-> **【图片位置 2 —— 紧跟"这是什么"】**
-> 内容：AI 打标工作台截图。要求同屏能看到"AI 给出的标签建议"和"确认"按钮，最好有一条素材的描述 + 标签列表清晰可见。
-> 这张图的任务：一眼传达"AI 打标，但最终是你说了算"。
-> 插入方式：同上，替换为图片 markdown。
-
----
-
-## 能干什么
-
-**入库**
-
-- 文件夹拖进去，先看清单再确认：多少张、多大、哪些是重复的，明明白白
-- 自动改名，支持"原名 + 日期 + 编号"这类模板，导入前就能预览最终文件名
-- JPG、PNG、WebP 常见格式之外，iPhone 的 HEIC、各家相机的 RAW 都能导入
-
-**浏览和查找**
-
-- 几万张素材，滚动流畅不卡顿
-- 打分、收藏、按标签筛、按时间排，怎么顺手怎么来
-- 双击全屏看图，视频直接播，鼠标悬停还能快速预览
-- 搜中文文件名、搜标签，打两个三个字也能命中
-- 超级搜索：把条件拆成"必须要有 / 最好有 / 不要有"三栏，还能按大小、日期、分辨率筛。搜不出来的时候，它会告诉你是哪个条件把结果清零的
-
-**AI 打标**
-
-- 支持市面主流的 AI 接口，也支持装在自己电脑上的本地模型
-- AI 按条给建议：画面里有什么主体、什么场景、一句话描述，你逐条确认或整批通过
-- 打标批次可以暂停、取消、接着跑，打错了整批撤销
-- 视频也能打标：自动抽开头、中间、结尾三帧来看
-- API 密钥存进系统自带的凭据管理，不在设置文件里留明文
-
-**整理和安全**
-
-- 重复文件一键找出来，长得像的图也能认出来
-- 删除先进回收站，能恢复；真删失败会如实告诉你，绝不假装删掉
-- 数据库一键备份、一键恢复
-- 导出时按标签或日期自动建文件夹，还附一份 CSV 清单
+具体需求和格式限制见 [产品说明](docs/PRD.md)，平台差异见 [平台说明](docs/PLATFORM.md)。
 
 ## 下载
 
-到 [Releases 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/latest) 下载对应平台的安装包：
+在 [最新版本下载页](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/latest) 选择安装包：
 
-| 平台 | 文件 | 说明 |
-|------|------|------|
-| Windows 10/11 x64 | `...-Windows-x64-setup.exe` | 完整支持 |
-| macOS Apple Silicon | `...-macOS-arm64.dmg` | 预览支持 |
-| Linux x64 | `...-Linux-x64.AppImage` / `.deb` | 预览支持 |
+| 系统与架构 | 安装包 |
+|---|---|
+| Windows 10/11 x64 | `TeaCell_AI_Media_Manager_<版本>_x64-setup.exe` |
+| macOS Apple Silicon | `TeaCell_AI_Media_Manager_<版本>_aarch64.dmg` |
+| Ubuntu 24.04 x64 | `TeaCell_AI_Media_Manager_<版本>_amd64.AppImage` |
 
-> [!WARNING]
-> 公测版：macOS 与 Linux 安装包目前是预览支持，用之前先备份重要素材库。遇到问题欢迎[提 Issue](https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues)。
+当前为公测版本。macOS、Linux 尚未完成真机验收，macOS 安装包尚未签名与公证。平台支持标准见 [平台说明](docs/PLATFORM.md)，当前验证结果和待验收项见 [项目计划](docs/PROJECT_PLAN.md#20-v102-当前发布状态)。
+
+对应源码、第三方许可证、构建记录和校验值可从各版本的 Release 说明获取。
 
 ## 快速上手
 
-1. 装好打开，选一个放素材库的位置（默认在你自己的用户目录）
-2. 把文件夹拖进入库页，看一眼清单，点确认
-3. 想用 AI 打标：设置里填一个 AI 接口，或者启动你电脑上的本地模型
-4. 进打标页选一批素材，点"生成 AI 建议"，逐条确认或整批确认
-5. 搜索框打中文关键词找图，选中，一键导出
+1. 安装并打开应用，选择素材库位置。
+2. 在入库页添加文件夹，检查清单和改名结果，再确认导入。
+3. 在素材库中浏览、评分或搜索素材。
+4. 如需 AI 打标，在设置中配置服务，选择素材生成建议，检查后确认。
+5. 选中需要的素材，导出到目标文件夹。
 
-> **【图片位置 3 —— 跟在快速上手后面】**
-> 内容：入库页截图。要求能看到拖拽区域和待入库清单（数量/大小统计、改名模板预览）。
-> 这张图的任务：让新用户 3 秒知道第一步长什么样。
-> 插入方式：同上，替换为图片 markdown。
+## 数据与 AI
 
-## 常见问题
+素材、标签和索引默认保存在本机。导入、浏览、普通搜索和导出无需连接 AI 服务。
 
-**和 Eagle、Billfish 这类素材管理器比，有什么不一样？**
-开源免费，代码全部公开；AI 打的每一条标签都由你确认，标签体系完全是你的，随时改、随时合并；没有账号，没有云端，数据不离开你的电脑。
+使用云端 AI 打标时，所选素材的预览会发送到你配置的服务；视频打标会发送抽取的视频帧。使用 AI 智能搜索时，查询内容会发送到所配置的服务。本地模型可通过 Ollama 兼容服务接入，应用内托管 Ollama 的功能目前仅面向 Windows。
 
-**必须联网才能用吗？**
-不联网，导入、浏览、搜索、导出全都正常。只有 AI 打标需要连服务，用本地模型的话全程离线。
+API 密钥存储在系统凭据管理中。连接、数据目录和备份操作见 [运维手册](docs/OPERATIONS.md)。
 
-**我的图片会被上传吗？**
-不会。素材和索引都在你自己的电脑里。只有你主动触发某张图的 AI 打标时，那张图的预览才会发给你自己填的 AI 服务商。
+## 开发
 
-**相机 RAW 文件能直接看吗？**
-能。优先读相机内嵌的预览图，速度快；需要高清大图时再完整解码。
+技术栈：Tauri 2、Rust、SQLite、React 19、TypeScript、Zustand 和 Tailwind CSS v4。
 
-**有些图导入后缩略图是灰的？**
-个别特殊格式生成不了预览。入库前的清单会把这些文件列出来让你确认，不会悄悄吞掉。
-
-## 想折腾代码？
-
-项目用 Tauri 2 + Rust + React + TypeScript 写的，装好 [Node.js 22+](https://nodejs.org) 和 [Rust](https://www.rust-lang.org/tools/install) 后：
+需要 Node.js 22–24、仓库固定版本的 Rust，以及目标系统的原生构建依赖。环境配置见 [开发规范](docs/DEVELOPMENT.md#1-环境) 和 [平台说明](docs/PLATFORM.md)。
 
 ```powershell
-npm install
-npm run desktop:dev      # 跑起来看看
+npm ci
+npm run desktop:dev
 ```
 
-架构和开发规范在 [docs/](docs/) 目录里，欢迎 PR。
+桌面入口会准备并校验当前目标的 HEIF 原生依赖。测试、媒体工具准备和打包命令见 [开发规范](docs/DEVELOPMENT.md#2-日常命令)。
 
-## License
+| 目录 | 内容 |
+|---|---|
+| `src/` | 前端页面、组件、状态和 API |
+| `src-tauri/` | Rust 后端、Tauri 配置和原生依赖清单 |
+| `scripts/` | 开发、测试和发布工具 |
+| `docs/` | 产品、架构、开发和运维文档；展示图标位于 `docs/assets/` |
+| `LICENSES/` | 第三方及历史许可证 |
 
-[GNU GPL v3 或后续版本](LICENSE)。允许免费使用、修改和商用；分发本程序或其修改版本时，须保留版权及许可证说明，并按 GPL 提供对应源码与构建材料。第三方组件保留各自许可，详见 [NOTICE](NOTICE)。此前以 MIT 发布的代码保留其原授权，原许可文本保存在 [LICENSES/TeaCell-legacy-MIT.txt](LICENSES/TeaCell-legacy-MIT.txt)。
+文档阅读路径见 [文档中心](docs/README.md)。修改前请阅读 [AGENTS.md](AGENTS.md)。
 
----
+## 反馈与贡献
 
-<div align="center">
+欢迎提交 [Issue](https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues) 或 Pull Request。报告问题时请附上应用版本、操作系统、复现步骤和错误信息；不要上传 API 密钥、私有素材或完整数据库。
 
-如果茶馆对你有用，给个 Star，让更多创作者看到它。
+## 许可证
 
-</div>
+项目以 [GPL-3.0-or-later](LICENSE) 发布。分发程序或修改版本时，应保留版权和许可证说明，并提供符合 GPL 要求的对应源码与构建材料。第三方组件许可见 [NOTICE](NOTICE)。此前以 MIT 发布的代码保留原授权，文本见 [历史 MIT 许可证](LICENSES/TeaCell-legacy-MIT.txt)。
