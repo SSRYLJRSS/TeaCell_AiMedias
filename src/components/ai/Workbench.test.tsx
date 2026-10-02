@@ -1,6 +1,6 @@
 /**
  * Workbench 一句话描述字段测试（FB5-05 §7.6）：
- *  - 单行 input、maxLength 30、字符计数按 JS 字符迭代（N/30）；
+ *  - 单行 input，不限字数，不显示字数计数或上限提示；
  *  - 确认按钮在「标签为空但描述非空」时仍可点击（§7.5）；
  *  - 已确认/已拒绝张只读展示（空描述显示「未生成描述」）。
  */
@@ -73,52 +73,16 @@ function renderWorkbench(over: Partial<AiSuggestion> = {}, description = "夜晚
 }
 
 describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
-  it("描述为单行 input（maxLength 30），字符计数按 JS 字符迭代显示 N/30", () => {
-    const { rerender } = renderWorkbench({}, "夜晚树下多人合影");
+  it("描述不限字数，长文本编辑完整传递且不显示字数上限", () => {
+    const { onDescriptionChange } = renderWorkbench({}, "夜晚树下多人合影");
     const input = screen.getByRole("textbox", { name: "一句话描述" }) as HTMLInputElement;
     expect(input).toBeInTheDocument();
-    expect(input.maxLength).toBe(30);
-    // 8 个字符 → 8/30
-    expect(screen.getByText("8/30")).toBeInTheDocument();
-    // 输入触发 onChange（受控组件由父级更新 prop）
-    fireEvent.change(input, { target: { value: "海边" } });
-    rerender(
-      <Workbench
-        suggestion={mkSuggestion()}
-        aiGroup={facets}
-      manualGroup={[]}
-        tags={{ subject: ["猫"] }}
-        onTagsChange={vi.fn()}
-        description="海边"
-        onDescriptionChange={vi.fn()}
-        index={0}
-        total={1}
-        onGoto={vi.fn()}
-        onConfirm={vi.fn().mockResolvedValue(undefined)}
-        onReject={vi.fn().mockResolvedValue(undefined)}
-        onRestore={vi.fn().mockResolvedValue(undefined)}
-      />,
-    );
-    expect(screen.getByText("2/30")).toBeInTheDocument();
-    // 表情符号（多字节）也按字符计
-    rerender(
-      <Workbench
-        suggestion={mkSuggestion()}
-        aiGroup={facets}
-      manualGroup={[]}
-        tags={{ subject: ["猫"] }}
-        onTagsChange={vi.fn()}
-        description="🌅海边"
-        onDescriptionChange={vi.fn()}
-        index={0}
-        total={1}
-        onGoto={vi.fn()}
-        onConfirm={vi.fn().mockResolvedValue(undefined)}
-        onReject={vi.fn().mockResolvedValue(undefined)}
-        onRestore={vi.fn().mockResolvedValue(undefined)}
-      />,
-    );
-    expect(screen.getByText("3/30")).toBeInTheDocument();
+    expect(input).not.toHaveAttribute("maxlength");
+    expect(input.placeholder).not.toMatch(/字|30/);
+    expect(screen.queryByText(/\d+\/30/)).not.toBeInTheDocument();
+    const longDescription = "🌅女子站在湖边树下回头张望，远处的树林和水面映着柔和光线。".repeat(4);
+    fireEvent.change(input, { target: { value: longDescription } });
+    expect(onDescriptionChange).toHaveBeenCalledWith(longDescription);
   });
 
   it("标签为空但描述非空：确认按钮可点击（§7.5）", () => {

@@ -15,7 +15,7 @@ import { getFacetNumber } from "@/api/tags";
 interface ViewerTagBarProps {
   assetId: number;
   tags: Tag[];
-  /** FB5-05（§7.6.1）：一句话描述（素材字段，目标 12–30 字）。只读展示，不进标签树/统计。 */
+  /** FB5-05（§7.6.1）：一句话描述（素材字段，不限字数）。只读展示，不进标签树/统计。 */
   contentDescription?: string | null;
   onRemoveTag: (tagId: number) => void;
   onAddTag: () => void;
@@ -107,7 +107,7 @@ export default memo(function ViewerTagBar({ assetId, tags, contentDescription, o
           className="grid h-24 grid-cols-2 content-start gap-x-6 gap-y-1 overflow-y-auto overflow-x-hidden px-4"
         >
           {/* FB5-05（§7.6.1）：一句话描述行——正文第一项，col-span-2 横跨两栏；
-              普通只读文本（非 TagChip），按 12–30 字完整换行；无描述不渲染行。 */}
+              普通只读文本（非 TagChip），完整换行；无描述不渲染行。 */}
           {hasDescription && (
             <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-start gap-2 break-words">
               <span className="min-w-0 truncate text-[11px] text-[var(--color-text-secondary)]">

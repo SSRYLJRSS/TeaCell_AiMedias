@@ -50,7 +50,7 @@ export interface Asset {
   dominantHue?: number | null;
   dominantSat?: number | null;
   dominantLum?: number | null;
-  // FB5-05（§7.3）：一句话描述（目标 12–30 字符，素材字段，不进标签树/统计）
+  // FB5-05（§7.3）：一句话描述（不限字数，素材字段，不进标签树/统计）
   contentDescription?: string;
   // V18：GPS 定位（有符号十进制度，北纬东经为正；无定位为 null）
   latitude?: number | null;

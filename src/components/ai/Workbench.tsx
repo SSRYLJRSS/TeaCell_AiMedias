@@ -24,7 +24,7 @@ interface WorkbenchProps {
   manualGroup: WorkbenchFacet[];
   tags: CategorizedTags;
   onTagsChange: (t: CategorizedTags) => void;
-  /** 一句话描述（审核编辑区顶部；AI 目标 12–30 字符，手工最多 30） */
+  /** 一句话描述（审核编辑区顶部；手工编辑不限字数） */
   description: string;
   onDescriptionChange: (v: string) => void;
   index: number; // 0 基
@@ -350,7 +350,7 @@ export default function Workbench({
               </div>
             </div>
           )}
-          {/* 一句话描述。AI 目标 12–30 字；手工单行 input、maxLength 30、字符计数用 JS 字符迭代；
+          {/* 一句话描述。手工单行 input，不限字数；
               位于标签分面滚动区顶部（分面滚动时描述保持在编辑区顶部）。 */}
           <div className="mb-2 flex min-h-8 items-center gap-3 border-b border-[var(--color-border)]/70 pb-2">
             <span className="w-16 shrink-0 text-xs font-medium text-[var(--color-text-secondary)]">一句话描述</span>
@@ -360,20 +360,14 @@ export default function Workbench({
                   {description.trim() || "未生成描述"}
                 </span>
               ) : (
-                <div className="flex items-center gap-2">
-                  <input
-                    data-testid="suggestion-description"
-                    value={description}
-                    onChange={(e) => onDescriptionChange(e.target.value)}
-                    maxLength={30}
-                    placeholder="如「女子站在湖边树下回头张望」（12–30 字）"
-                    aria-label="一句话描述"
-                    className="ui-control h-7 min-w-0 flex-1 rounded-md px-2 text-sm outline-none focus:border-[var(--color-accent)]"
-                  />
-                  <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
-                    {[...description].length}/30
-                  </span>
-                </div>
+                <input
+                  data-testid="suggestion-description"
+                  value={description}
+                  onChange={(e) => onDescriptionChange(e.target.value)}
+                  placeholder="如「女子站在湖边树下回头张望」"
+                  aria-label="一句话描述"
+                  className="ui-control h-7 w-full min-w-0 rounded-md px-2 text-sm outline-none focus:border-[var(--color-accent)]"
+                />
               )}
             </div>
           </div>

@@ -471,7 +471,7 @@ pub struct AiProgress {
 /// 描述为空但标签非空 / 标签为空但描述非空，都算一次有效分析。
 #[derive(Debug, Clone, Default)]
 pub struct MediaAnalysis {
-    /// 画面内容的一句话中文描述（已规范化，最多 30 Unicode 字符；可为空）
+    /// 画面内容的一句话中文描述（仅去除首尾空白，不限字数；可为空）
     pub description: String,
     /// 人物存在状态与模型置信度。
     pub people_presence: ai::PeoplePresence,
@@ -498,7 +498,7 @@ pub struct MediaAnalysis {
 
 /// 按分面组装提示词（P1B + C-3）：使用稳定英文 facetKey 作为 JSON 键，中文显示名仅作说明；
 /// 避免模型返回中文分类名导致归类不稳定。
-/// description 内容由用户可见提示词约定；协议层不设固定字数或句式。
+/// description 的生成建议在 user 段中提供；协议层不设固定字数或句式。
 fn build_system_prompt(global_instructions: &str) -> String {
     let mut sys =
         String::from("你是图片与视频素材分析助手。根据当前请求提供的分类信息分析素材。\n");
@@ -522,7 +522,9 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
         .iter()
         .filter(|f| f.facet_kind != "number" && f.key != "custom")
         .collect();
-    let mut user = String::from("请为这份素材打标。可用分类及机器标识如下：\n");
+    let mut user = String::from("请为这份素材打标。\n");
+    user.push_str("description 请用一句中文描述画面内容，最好五十字以内。\n");
+    user.push_str("可用分类及机器标识如下：\n");
     for facet in &tag_facets {
         let limit = if facet.selection_mode == "single" {
             "单选，最多 1 项".to_string()
@@ -3167,6 +3169,7 @@ mod tests {
             ..Default::default()
         }];
         let prompt = super::build_user_prompt(&facets, &[]);
+        assert!(prompt.contains("description 请用一句中文描述画面内容，最好五十字以内。"));
         assert!(prompt.contains("给 AI 的分类说明：允许记录树木和水面，也允许使用复合词"));
         assert!(!prompt.contains("peoplePresence"));
         assert!(!prompt.contains("树木、水面、楼梯等主体物不得当场景"));
@@ -3998,10 +4001,15 @@ mod tests {
         assert_eq!(long.chars().count(), 25);
         let out = super::normalize_content_description(long);
         assert_eq!(out, long, "短文本原样保留");
-        let longer = "一个阳光明媚的海边沙滩上人们正在散步聊天的场景十分美好且热闹非凡";
-        assert!(longer.chars().count() > 30);
-        let preserved = super::normalize_content_description(longer);
-        assert_eq!(preserved, longer);
+        let longer = "一个阳光明媚的海边沙滩上人们正在散步聊天的场景十分美好且热闹非凡".repeat(3);
+        assert!(longer.chars().count() > 50);
+        let raw = serde_json::json!({"description": longer, "tags": {}, "numbers": {}});
+        let analysis = super::parse_media_analysis(&raw.to_string(), &[], 0.3).unwrap();
+        assert_eq!(analysis.description, longer);
+        let schema = super::tagging_schema(&[]);
+        assert!(schema["properties"]["description"]
+            .get("maxLength")
+            .is_none());
         // 表情符号（多字节）也不被切坏
         let emoji = "🌅海边日落很美很浪漫的景色";
         let out2 = super::normalize_content_description(emoji);

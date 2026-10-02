@@ -65,7 +65,7 @@ pub struct Asset {
     pub dominant_hue: Option<i64>,
     pub dominant_sat: Option<i64>,
     pub dominant_lum: Option<i64>,
-    // FB5-05（§7.3）：一句话描述（目标 12–30 字符；素材字段，不进标签树/统计）。
+    // FB5-05（§7.3）：一句话描述（不限字数；素材字段，不进标签树/统计）。
     // 固定追加在 palette 字段之后，避免已有固定列索引错位。
     #[serde(default)]
     pub content_description: String,
