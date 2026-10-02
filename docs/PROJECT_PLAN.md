@@ -1,6 +1,6 @@
 # 项目计划
 
-> 更新日期：2026-10-01
+> 更新日期：2026-10-02
 >
 > 本文档记录当前阶段、交付状态和下一阶段范围。产品行为见 [PRD.md](PRD.md)，技术结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -16,7 +16,7 @@
 
 ## 2. 当前交付状态
 
-### 2.0 v1.0.2 品牌迁移与发布状态
+### 2.0 v1.0.2 当前发布状态
 
 本轮 v1.0.2 更新按项目负责人明确授权，以 GPL-3.0-or-later 公开发布公测包并覆盖同版本附件；原 MIT 授权继续有效。修复包括入库设置提示布局、Windows 后台控制台闪现、安装器英文产品身份和许可证显示。媒体依赖改为固定源码自建，对应源码包包含应用、Cargo/npm 运行时依赖、前端上游源码和十个原生媒体组件的实际源码及构建脚本，具体流程见 [OPERATIONS.md](OPERATIONS.md#52-三端候选构建)。Windows 新 HEIF 静态库已通过严格 Rust 检查，12 个真实 8/10 位 HEIC 样本经应用 imaging 入口验证为 12 个出图、0 个黑图。逐平台构建记录、源码与安装包摘要以 [Release 附件](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2) 为准。
 
@@ -24,7 +24,9 @@
 
 GitHub 仓库已更名为 [`SSRYLJRSS/TeaCell_AiMedias`](https://github.com/SSRYLJRSS/TeaCell_AiMedias)。v1.0.2 将产品英文全名统一为 `TeaCell AI Media Manager`，中文全名为“茶馆AI素材管理”；桌面短名称继续为“茶馆”。设置页项目、反馈和许可证链接，以及安装器元数据均指向新仓库。Windows 安装界面提供英文和简体中文；各平台包描述和 Release 附件标签采用中英双语。
 
-桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。v1.0.2 已于 2026-09-30 从提交 `d7f1dc328684457a07be257eb0d3ad8ded5e46b0` 发布：[Release 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2)，包含 Windows x64（NSIS 和中英双语 MSI）、macOS Apple Silicon DMG、Linux x64（AppImage 和 DEB）、构建/许可证证据及 SHA-256 清单。旧 v1.0.1 Release 已删除，`v1.0.1` 源码标签保留作历史定位。三端候选 manifest、依赖许可证材料、文件摘要和提交号经 `scripts/verify-candidates.mjs` 通过；同提交 [code-gate](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296905) 和 [smoke](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662296889) 通过。候选工作流 [run 36662320517](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36662320517) 的 Windows 原生打包成功，但 runner 在构建后因工作区状态检查未能收集 artifact；Windows 候选由干净 checkout 的本机同提交构建和收集，与 macOS/Linux runner 候选合并后完成上述三端校验。真实素材 UAT、macOS/Linux 真机验收和媒体依赖再分发许可复核仍未完成，不因发布动作或自动校验通过而视为完成。
+桌面应用标识符、Rust library crate 名、应用数据目录和系统凭据 service 名继续保留旧值，以便原安装能够读取既有数据库和凭据；这些属于迁移兼容标识，不是面向用户的产品名称。当前 v1.0.2 已从提交 `f728630b331f84f54479652a392542767b0f7fa4` 覆盖更新，[描述编辑与生成建议的产品行为](PRD.md#35-ai-打标)已包含在三端安装包中。主 [Release 页面](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/v1.0.2) 每个平台只提供一个安装包：Windows x64 NSIS、macOS Apple Silicon DMG、Linux x64 AppImage。完整对应源码、构建/许可证证据及 SHA256 清单同步更新到[开发构建材料页](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/tag/build-materials-v1.0.2)，上一构建 `beee2ca` 的完整源码另存保留。源码包的 38,976 个文件通过逐文件校验与离线依赖解析；本次上传的 7 个文件及清单的 14 项摘要与 GitHub 远端记录一致，`v1.0.2` 源码标签指向本次构建提交。
+
+三端候选 manifest、依赖许可证材料、文件摘要和提交号经 `scripts/verify-candidates.mjs` 通过；同提交 [code-gate](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36955156477) 和 [smoke](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36955160155) 全部通过。候选工作流 [run 36955164355](https://github.com/SSRYLJRSS/TeaCell_AiMedias/actions/runs/36955164355) 的 Windows 原生打包成功，但构建后 Git 状态检查拒绝收集，自动汇总 job 因此失败，不能记为该工作流通过。Windows 发布包采用本机同提交的原生构建：确认打包工具重写行尾后的 Cargo 清单规范化内容哈希仍与 HEAD 相同，刷新 Git 索引状态且确认没有暂存差异后，由未修改的严格收集器登记；随后与远端 macOS/Linux 包完成完整三端汇总校验。失败记录和替代构建来源均保存在发布构建证据中。真实素材 UAT、macOS/Linux 真机验收和媒体依赖再分发许可复核仍未完成，不因发布动作或自动校验通过而视为完成。
 
 ### 2.1 已完成的功能基线
 
