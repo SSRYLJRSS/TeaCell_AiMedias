@@ -17,10 +17,6 @@
 
 </div>
 
-<p align="center">
-  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
-</p>
-
 ## 功能
 
 - **导入**：扫描文件夹，检查重复文件，预览改名结果；支持常见图片、HEIC、RAW 和视频格式。
@@ -35,11 +31,35 @@
 ### 界面
 
 <p align="center">
-  <img src="docs/assets/screenshot-montage.jpg" alt="素材库、超级搜索、打标工作台与入库页" width="100%"/>
+  <img src="docs/assets/screenshot-library.jpg" alt="素材库" width="100%"/>
 </p>
 
 <p align="center">
-  <sub>左上 素材库 · 右上 打标工作台 · 左下 超级搜索 · 右下 入库页</sub>
+  <sub>素材库：缩略图网格，支持评分、收藏和按来源、标签筛选</sub>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshot-tagging.jpg" alt="打标工作台" width="100%"/>
+</p>
+
+<p align="center">
+  <sub>打标工作台：批量编辑标签和描述，AI 建议需确认后写入</sub>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshot-search.jpg" alt="超级搜索" width="100%"/>
+</p>
+
+<p align="center">
+  <sub>超级搜索：组合必须、优先和排除条件，跨关键词与元数据筛选</sub>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshot-import.jpg" alt="入库页" width="100%"/>
+</p>
+
+<p align="center">
+  <sub>入库页：扫描文件夹，检查重复和改名结果后再确认导入</sub>
 </p>
 
 ## 下载
