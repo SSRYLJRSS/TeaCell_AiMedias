@@ -17,10 +17,6 @@
 
 </div>
 
-<p align="center">
-  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
-</p>
-
 ## 功能
 
 - **导入**：扫描文件夹，检查重复文件，预览改名结果；支持常见图片、HEIC、RAW 和视频格式。
@@ -34,13 +30,11 @@
 
 ### 界面
 
-<p align="center">
-  <img src="docs/assets/screenshot-montage.jpg" alt="素材库、超级搜索、打标工作台与入库页" width="100%"/>
-</p>
 
 <p align="center">
-  <sub>左上 素材库 · 右上 打标工作台 · 左下 超级搜索 · 右下 入库页</sub>
+  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
 </p>
+
 
 ## 下载
 
