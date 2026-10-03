@@ -17,6 +17,10 @@
 
 </div>
 
+<p align="center">
+  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
+</p>
+
 ## 功能
 
 - **导入**：扫描文件夹，检查重复文件，预览改名结果；支持常见图片、HEIC、RAW 和视频格式。
@@ -27,6 +31,35 @@
 - **维护**：重复与相似素材查找、回收站、数据库备份和恢复。
 
 具体需求和格式限制见 [产品说明](docs/PRD.md)，平台差异见 [平台说明](docs/PLATFORM.md)。
+
+### 界面
+
+<table>
+<tr>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-search.jpg" alt="超级搜索" width="100%"/>
+  <br/>
+  <sub>超级搜索：必须、优先、排除三栏条件</sub>
+</td>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-tagging.jpg" alt="AI 打标工作台" width="100%"/>
+  <br/>
+  <sub>打标工作台：AI 建议逐条确认后写入</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-import.jpg" alt="入库清单" width="100%"/>
+  <br/>
+  <sub>入库：清单、改名预览和重复检查</sub>
+</td>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/app-icon-square.png" alt="茶馆" width="72"/>
+  <br/>
+  <sub>免费开源，数据留在本机</sub>
+</td>
+</tr>
+</table>
 
 ## 下载
 
