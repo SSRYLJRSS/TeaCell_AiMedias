@@ -17,9 +17,7 @@
 
 </div>
 
-<p align="center">
-  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
-</p>
+
 
 ## 功能
 
@@ -35,13 +33,8 @@
 ### 界面
 
 <p align="center">
-  <img src="docs/assets/screenshot-montage.jpg" alt="素材库、超级搜索、打标工作台与入库页" width="100%"/>
+  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
 </p>
-
-<p align="center">
-  <sub>左上 素材库 · 右上 打标工作台 · 左下 超级搜索 · 右下 入库页</sub>
-</p>
-
 ## 下载
 
 在 [最新版本下载页](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/latest) 选择安装包：
