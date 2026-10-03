@@ -1,121 +1,123 @@
-# 茶包素材 BagerTea AiMedias
+<div align="center">
 
-本地优先的图片与视频素材管理桌面应用。项目使用 Tauri 2、Rust、SQLite FTS5、React 19、TypeScript、Zustand 和 Tailwind CSS v4。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/app-icon-black-bg.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/app-icon-white-bg.png">
+  <img src="docs/assets/app-icon-square.png" alt="茶馆" width="160"/>
+</picture>
 
-当前版本：公测版 `1.0`（技术版本 `1.0.0`）。功能代码已完成到搜索计划 V3、分面 V2、本地模型部署和查看器/去重/备份等能力；真实素材 UAT 与发布证据仍需按测试文档补齐。
+# 茶馆 AI 素材管理
 
-平台口径：Windows 10/11 x64 是当前正式支持平台；macOS Apple Silicon 与 Linux x64 是同一 `main` 提交上的预览平台。核心闭环统一为“导入 → 浏览 → 搜索 → 查看 → 导出”，平台暂不支持的能力必须在界面中明确说明。
+本地图片与视频素材管理工具，支持中文搜索、标签整理和 AI 辅助打标。
 
-## 能力概览
+[![Release](https://img.shields.io/github/v/release/SSRYLJRSS/TeaCell_AiMedias?style=flat-square)](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green?style=flat-square)](LICENSE)
 
-- 图片/视频两段式入库，支持总库/分库托管、批量改名、占位图优先和后台高清缩略图。
-- JPG/PNG/WebP/TIFF/BMP/TGA，以及 HEIC/HEIF 和 25+ RAW 扩展名；RAW 内嵌预览优先，真解码仅进入高清层。
-- 虚拟滚动素材库、多选、排序、筛选、收藏评级、查看器、视频播放和悬浮预览。
-- FTS5 中文文件名/标签搜索，支持逐字切分、短语和短查询兜底。
-- 超级搜索使用 SearchPlanV3，支持必须、优先、排除、元数据、数值分面、AI 解析和诊断。
-- 稳定分面协议，区分 AI 可打标分面与仅手工分面，支持别名、治理、合并、撤销和数值分面。
-- 云端 OpenAI 兼容/Anthropic 接口与 Ollama 本地模型；AI 建议默认人工确认后写入。
-- 重复文件与感知相似图检测、同源文件组、回收站、批量删除和恢复。
-- 本地复制/移动导出、目录布局、CSV 清单、数据库备份恢复和运行日志。
+[下载](#下载) · [快速上手](#快速上手) · [开发](#开发)
 
-素材库和索引默认保存在本机 SQLite。使用云端 AI 时，只有发起请求的素材预览会发送到用户配置的服务商；API Key 使用系统凭据存储，不写入设置 JSON。
+</div>
 
-## 当前状态
+<p align="center">
+  <img src="docs/assets/screenshot-library.jpg" alt="素材库主界面" width="100%"/>
+</p>
 
-功能代码已完成，但**尚不能标记为可放行**。按[项目计划](docs/PROJECT_PLAN.md)的发布阻塞项，放行前还需完成：
+## 功能
 
-- **真实素材 UAT**：超级搜索 relevance 排序、`mustNot` 排除、`should` 全不命中仍保留、位置权重和 hydrate 后 plan JSON，都需要真实数据证据。
-- **核心用户旅程**：用真实素材走通导入、浏览、AI 打标、搜索、查看器、评级、导出、删除恢复和备份恢复。
-- **格式与性能复测**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
-- **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、三目标 CI、候选包门和人工 UAT 必须全部留下结果记录。
+- **导入**：扫描文件夹，检查重复文件，预览改名结果；支持常见图片、HEIC、RAW 和视频格式。
+- **浏览**：缩略图网格、评分、收藏、图片查看器和视频播放。
+- **搜索**：中文关键词、标签和元数据筛选；超级搜索支持必须、优先和排除条件。
+- **打标**：手工编辑标签和描述，或使用 AI 生成建议；确认后写入，支持批次撤销。
+- **导出**：复制或移动素材，按标签或日期组织目录，并生成 CSV 清单。
+- **维护**：重复与相似素材查找、回收站、数据库备份和恢复。
 
-自动化全绿不等同于产品可发布，真实素材验收是独立门禁。数据位置、备份恢复和发布步骤见[运维手册](docs/OPERATIONS.md)。
+具体需求和格式限制见 [产品说明](docs/PRD.md)，平台差异见 [平台说明](docs/PLATFORM.md)。
 
-## 技术结构
+### 界面
 
-```text
-React pages/components
-  -> stores
-  -> src/api
-  -> Tauri invoke / events
-  -> Rust commands
-  -> services
-  -> db / filesystem
-```
+<table>
+<tr>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-search.jpg" alt="超级搜索" width="100%"/>
+  <br/>
+  <sub>超级搜索：必须、优先、排除三栏条件</sub>
+</td>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-tagging.jpg" alt="AI 打标工作台" width="100%"/>
+  <br/>
+  <sub>打标工作台：AI 建议逐条确认后写入</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/screenshot-import.jpg" alt="入库清单" width="100%"/>
+  <br/>
+  <sub>入库：清单、改名预览和重复检查</sub>
+</td>
+<td width="50%" valign="top" align="center">
+  <img src="docs/assets/app-icon-square.png" alt="茶馆" width="72"/>
+  <br/>
+  <sub>免费开源，数据留在本机</sub>
+</td>
+</tr>
+</table>
 
-- 前端：`src/`
-- Rust/Tauri：`src-tauri/`
-- HEIC 预编译库：按目标放在 `src-tauri/native/heif/<target>/`；Windows 兼容旧的根目录 `heif-bin/`
-- 文档：`docs/`
-- AI 协作入口：[AGENTS.md](AGENTS.md)
+## 下载
 
-## 快速开始
+在 [最新版本下载页](https://github.com/SSRYLJRSS/TeaCell_AiMedias/releases/latest) 选择安装包：
 
-环境要求：
+| 系统与架构 | 安装包 |
+|---|---|
+| Windows 10/11 x64 | `TeaCell_AI_Media_Manager_<版本>_x64-setup.exe` |
+| macOS Apple Silicon | `TeaCell_AI_Media_Manager_<版本>_aarch64.dmg` |
+| Ubuntu 24.04 x64 | `TeaCell_AI_Media_Manager_<版本>_amd64.AppImage` |
 
-- Windows 10/11 为主力平台。
-- Node.js 22（`package.json` 的 `engines` 约束为 `>=22 <25`）。
-- Rust stable MSVC 工具链和 Visual Studio C++ Build Tools。
-- 开发时 `ffmpeg`/`ffprobe` 可由 PATH 提供；发布包必须先按 `src-tauri/binaries/manifest.json` 准备并校验三目标 sidecar。
+当前为公测版本。macOS、Linux 尚未完成真机验收，macOS 安装包尚未签名与公证。平台支持标准见 [平台说明](docs/PLATFORM.md)，当前验证结果和待验收项见 [项目计划](docs/PROJECT_PLAN.md#20-v102-当前发布状态)。
+
+对应源码、第三方许可证、构建记录和校验值可从各版本的 Release 说明获取。
+
+## 快速上手
+
+1. 安装并打开应用，选择素材库位置。
+2. 在入库页添加文件夹，检查清单和改名结果，再确认导入。
+3. 在素材库中浏览、评分或搜索素材。
+4. 如需 AI 打标，在设置中配置服务，选择素材生成建议，检查后确认。
+5. 选中需要的素材，导出到目标文件夹。
+
+## 数据与 AI
+
+素材、标签和索引默认保存在本机。导入、浏览、普通搜索和导出无需连接 AI 服务。
+
+使用云端 AI 打标时，所选素材的预览会发送到你配置的服务；视频打标会发送抽取的视频帧。使用 AI 智能搜索时，查询内容会发送到所配置的服务。本地模型可通过 Ollama 兼容服务接入，应用内托管 Ollama 的功能目前仅面向 Windows。
+
+API 密钥存储在系统凭据管理中。连接、数据目录和备份操作见 [运维手册](docs/OPERATIONS.md)。
+
+## 开发
+
+技术栈：Tauri 2、Rust、SQLite、React 19、TypeScript、Zustand 和 Tailwind CSS v4。
+
+需要 Node.js 22–24、仓库固定版本的 Rust，以及目标系统的原生构建依赖。环境配置见 [开发规范](docs/DEVELOPMENT.md#1-环境) 和 [平台说明](docs/PLATFORM.md)。
 
 ```powershell
-npm install
+npm ci
 npm run desktop:dev
 ```
 
-构建安装包：
+桌面入口会准备并校验当前目标的 HEIF 原生依赖。测试、媒体工具准备和打包命令见 [开发规范](docs/DEVELOPMENT.md#2-日常命令)。
 
-```powershell
-npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
-npm run desktop:build -- --target x86_64-pc-windows-msvc
+| 目录 | 内容 |
+|---|---|
+| `src/` | 前端页面、组件、状态和 API |
+| `src-tauri/` | Rust 后端、Tauri 配置和原生依赖清单 |
+| `scripts/` | 开发、测试和发布工具 |
+| `docs/` | 产品、架构、开发和运维文档；展示图标位于 `docs/assets/` |
+| `LICENSES/` | 第三方及历史许可证 |
 
-# 仅做不构建的环境检查
-npm run desktop:check -- --target x86_64-pc-windows-msvc
-```
+文档阅读路径见 [文档中心](docs/README.md)。修改前请阅读 [AGENTS.md](AGENTS.md)。
 
-## 开发命令
+## 反馈与贡献
 
-```powershell
-npm run lint
-npm run typecheck
-npm run test:unit
-npm run build
+欢迎提交 [Issue](https://github.com/SSRYLJRSS/TeaCell_AiMedias/issues) 或 Pull Request。报告问题时请附上应用版本、操作系统、复现步骤和错误信息；不要上传 API 密钥、私有素材或完整数据库。
 
-cd src-tauri
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
+## 许可证
 
-完整本地冒烟：
-
-```powershell
-pwsh ./scripts/smoke.ps1
-```
-
-## 文档入口
-
-- [文档中心](docs/README.md)
-- [产品需求](docs/PRD.md)
-- [项目计划](docs/PROJECT_PLAN.md)
-- [架构说明](docs/ARCHITECTURE.md)
-- [开发规范](docs/DEVELOPMENT.md)
-- [平台契约](docs/PLATFORM.md)
-- [UI 规范](docs/UI_DESIGN_SYSTEM.md)
-- [协议契约](docs/CONTRACTS.md)
-- [测试策略](docs/TEST_STRATEGY.md)
-- [真机验收手册](docs/QA_PLAYBOOK.md)
-- [性能手册](docs/PERFORMANCE.md)
-- [运维手册](docs/OPERATIONS.md)
-- [排障手册](docs/TROUBLESHOOTING.md)
-
-## 发布约束
-
-- 普通改动必须通过 lint、typecheck、前端单测、Rust fmt、clippy 和 cargo test。
-- 交付版本必须通过 `scripts/smoke.ps1` 和真实素材 UAT。
-- 已发布数据库迁移不得回改；结构变化必须新增或追加幂等迁移。
-- 破坏性操作必须可确认、可回滚或明确报告失败，禁止假成功和静默数据丢失。
-
-## License
-
-[MIT License](LICENSE)。项目自有代码允许自由使用、修改、再发布和商业使用；第三方图像/视频编解码依赖仍按各自许可证执行，对外分发前必须复核 [架构说明](docs/ARCHITECTURE.md) 中的许可提示。
+项目以 [GPL-3.0-or-later](LICENSE) 发布。分发程序或修改版本时，应保留版权和许可证说明，并提供符合 GPL 要求的对应源码与构建材料。第三方组件许可见 [NOTICE](NOTICE)。此前以 MIT 发布的代码保留原授权，文本见 [历史 MIT 许可证](LICENSES/TeaCell-legacy-MIT.txt)。
