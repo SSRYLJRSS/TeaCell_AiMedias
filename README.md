@@ -34,32 +34,13 @@
 
 ### 界面
 
-<table>
-<tr>
-<td width="50%" valign="top" align="center">
-  <img src="docs/assets/screenshot-search.jpg" alt="超级搜索" width="100%"/>
-  <br/>
-  <sub>超级搜索：必须、优先、排除三栏条件</sub>
-</td>
-<td width="50%" valign="top" align="center">
-  <img src="docs/assets/screenshot-tagging.jpg" alt="AI 打标工作台" width="100%"/>
-  <br/>
-  <sub>打标工作台：AI 建议逐条确认后写入</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top" align="center">
-  <img src="docs/assets/screenshot-import.jpg" alt="入库清单" width="100%"/>
-  <br/>
-  <sub>入库：清单、改名预览和重复检查</sub>
-</td>
-<td width="50%" valign="top" align="center">
-  <img src="docs/assets/app-icon-square.png" alt="茶馆" width="72"/>
-  <br/>
-  <sub>免费开源，数据留在本机</sub>
-</td>
-</tr>
-</table>
+<p align="center">
+  <img src="docs/assets/screenshot-montage.jpg" alt="素材库、超级搜索、打标工作台与入库页" width="100%"/>
+</p>
+
+<p align="center">
+  <sub>左上 素材库 · 右上 打标工作台 · 左下 超级搜索 · 右下 入库页</sub>
+</p>
 
 ## 下载
 
