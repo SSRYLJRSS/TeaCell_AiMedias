@@ -199,6 +199,106 @@ pub struct ResolvedSuperSearchProfile {
     pub source: SuperSearchProfileSource,
 }
 
+/// Rust-only model route resolved from the independent Agent usage binding.
+/// The credential is intentionally private and the type is not serializable.
+pub struct ResolvedAgentModelConnection {
+    pub connection: crate::db::ai_connections::AiConnection,
+    credential: Option<String>,
+}
+
+impl ResolvedAgentModelConnection {
+    pub fn credential(&self) -> Option<&str> {
+        self.credential.as_deref()
+    }
+}
+
+/// Resolve the explicit Agent connection and its credential without falling back
+/// to legacy settings, super-search, or tagging. When a run already captured a
+/// connection snapshot, pass its ID/revision so any binding edit fails closed.
+pub fn resolve_agent_model_connection_with_credential<B: CredentialBackend + ?Sized>(
+    db: &Database,
+    backend: &B,
+    expected_snapshot: Option<(&str, &str)>,
+) -> AppResult<ResolvedAgentModelConnection> {
+    let _operations = lock_operations()?;
+    let connection = resolve_agent_model_connection_metadata_inner(db, expected_snapshot)?;
+
+    // Keyring I/O happens after releasing the database guard, while the
+    // credential-operation lock prevents the row/ref and secret from racing a save.
+    let credential = connection
+        .api_key_ref
+        .as_deref()
+        .map(|reference| backend.get(reference))
+        .transpose()?
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+
+    Ok(ResolvedAgentModelConnection {
+        connection,
+        credential,
+    })
+}
+
+/// Resolve the explicit Agent binding and validate its current connection without
+/// touching the system keyring. Lease creation and limiter setup use this path;
+/// secrets are read only after a concrete request passes those checks.
+pub fn resolve_agent_model_connection_metadata(
+    db: &Database,
+    expected_snapshot: Option<(&str, &str)>,
+) -> AppResult<crate::db::ai_connections::AiConnection> {
+    let _operations = lock_operations()?;
+    resolve_agent_model_connection_metadata_inner(db, expected_snapshot)
+}
+
+fn resolve_agent_model_connection_metadata_inner(
+    db: &Database,
+    expected_snapshot: Option<(&str, &str)>,
+) -> AppResult<crate::db::ai_connections::AiConnection> {
+    let connection = {
+        let conn = db.lock()?;
+        let connection_id =
+            crate::db::ai_connections::binding_id(&conn, "agent")?.ok_or_else(|| {
+                AppError::not_found("Agent 尚未绑定专用 AI 服务，请先选择 Agent 服务")
+            })?;
+        let connection = crate::db::ai_connections::get(&conn, &connection_id)?
+            .ok_or_else(|| AppError::not_found("Agent 绑定的 AI 服务不存在，请重新选择"))?;
+        validate_agent_model_connection(&connection)?;
+        connection
+    };
+    if let Some((expected_id, expected_revision)) = expected_snapshot {
+        if connection.id != expected_id || connection.config_revision != expected_revision {
+            return Err(AppError::conflict(
+                "Agent 服务配置在本次回答期间已变化；当前请求已停止，请检查服务后重新发送",
+            ));
+        }
+    }
+    Ok(connection)
+}
+
+fn validate_agent_model_connection(
+    connection: &crate::db::ai_connections::AiConnection,
+) -> AppResult<()> {
+    if !connection.enabled {
+        return Err(AppError::conflict(
+            "Agent 绑定的 AI 服务已停用，请启用或重新选择服务",
+        ));
+    }
+    if connection.base_url.trim().is_empty() || connection.model.trim().is_empty() {
+        return Err(AppError::invalid_arg(
+            "Agent 绑定的 AI 服务缺少地址或模型，请先完善连接配置",
+        ));
+    }
+    if !matches!(
+        connection.protocol.as_str(),
+        "openai_chat" | "anthropic_messages"
+    ) {
+        return Err(AppError::unsupported(
+            "Agent 当前不支持该 AI 服务协议，请选择 OpenAI Chat 或 Anthropic Messages",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the actual super-search connection. An explicit binding wins; otherwise
 /// only enabled cloud connections are considered. The legacy active profile and
 /// unbound local connections are deliberately outside this policy.
@@ -664,6 +764,125 @@ mod tests {
         let resolved = resolve_super_search_profile_with_credential(&db, &backend).unwrap();
         assert_eq!(resolved.connection_id, "z-configured");
         assert_eq!(resolved.profile.api_key, "sk-configured");
+    }
+
+    #[test]
+    fn agent_requires_its_own_explicit_binding_and_never_uses_tagging_or_search() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "tagging-only", "cloud", Some("tagging-only"));
+        let backend = MemoryBackend::default();
+        backend.save("tagging-only", "fixture-secret").unwrap();
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "tagging", "tagging-only").unwrap();
+            ai_connections::bind_usage(&conn, "super_search", "tagging-only").unwrap();
+        }
+
+        let error = resolve_agent_model_connection_with_credential(&db, &backend, None)
+            .err()
+            .expect("Agent must not inherit another usage or legacy profile");
+        assert_eq!(error.code(), "NOT_FOUND");
+        assert!(error.to_string().contains("Agent 尚未绑定"));
+    }
+
+    #[test]
+    fn agent_uses_only_its_binding_and_keeps_the_credential_in_rust() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "tagging", "cloud", Some("tagging"));
+        add_test_connection(&db, "agent", "cloud", Some("agent"));
+        let backend = MemoryBackend::default();
+        backend.save("tagging", "tagging-secret").unwrap();
+        backend.save("agent", "agent-fixture-secret").unwrap();
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "tagging", "tagging").unwrap();
+            ai_connections::bind_usage(&conn, "agent", "agent").unwrap();
+        }
+
+        let resolved = resolve_agent_model_connection_with_credential(&db, &backend, None).unwrap();
+        assert_eq!(resolved.connection.id, "agent");
+        assert_eq!(resolved.connection.protocol, "openai_chat");
+        assert_eq!(resolved.credential(), Some("agent-fixture-secret"));
+    }
+
+    #[test]
+    fn disabled_agent_binding_fails_closed_without_selecting_another_usage() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "disabled-agent", "cloud", None);
+        add_test_connection(&db, "enabled-tagging", "cloud", None);
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "agent", "disabled-agent").unwrap();
+            ai_connections::bind_usage(&conn, "tagging", "enabled-tagging").unwrap();
+            conn.execute(
+                "UPDATE ai_connections SET enabled=0 WHERE id='disabled-agent'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error =
+            resolve_agent_model_connection_with_credential(&db, &MemoryBackend::default(), None)
+                .err()
+                .expect("disabled Agent binding must stay an explicit failure");
+        assert_eq!(error.code(), "CONFLICT");
+        assert!(error.to_string().contains("Agent 绑定的 AI 服务已停用"));
+    }
+
+    #[test]
+    fn agent_connection_snapshot_rejects_rebinding_and_revision_changes() {
+        let db = Arc::new(Database::new(init_memory().unwrap()));
+        add_test_connection(&db, "first", "cloud", Some("first"));
+        add_test_connection(&db, "second", "cloud", Some("second"));
+        let backend = MemoryBackend::default();
+        backend.save("first", "first-fixture-secret").unwrap();
+        backend.save("second", "second-fixture-secret").unwrap();
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "agent", "first").unwrap();
+        }
+        let captured = resolve_agent_model_connection_with_credential(&db, &backend, None).unwrap();
+        let old_revision = captured.connection.config_revision.clone();
+
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::upsert(
+                &conn,
+                "first",
+                "first edited",
+                "cloud",
+                "openai_chat",
+                "https://example.invalid/v1",
+                "test-model",
+                Some("first"),
+            )
+            .unwrap();
+        }
+        let error = resolve_agent_model_connection_with_credential(
+            &db,
+            &backend,
+            Some(("first", &old_revision)),
+        )
+        .err()
+        .expect("a saved config revision must invalidate the active run snapshot");
+        assert_eq!(error.code(), "CONFLICT");
+
+        let current = {
+            let conn = db.lock().unwrap();
+            ai_connections::get(&conn, "first").unwrap().unwrap()
+        };
+        {
+            let conn = db.lock().unwrap();
+            ai_connections::bind_usage(&conn, "agent", "second").unwrap();
+        }
+        let error = resolve_agent_model_connection_with_credential(
+            &db,
+            &backend,
+            Some(("first", &current.config_revision)),
+        )
+        .err()
+        .expect("a new binding must not redirect an already-started run");
+        assert_eq!(error.code(), "CONFLICT");
     }
 
     // These tests use the real OS credential store rather than an in-memory mock. Serialize them

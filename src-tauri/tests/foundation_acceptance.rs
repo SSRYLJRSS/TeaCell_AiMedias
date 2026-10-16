@@ -5,10 +5,10 @@
 //!   F 波次 → 组 1/2/3/5/10/12；A 波次 → 组 4/5；S 波次 → 组 6/9/11；
 //!   C 波次 → 组 7；全部绿 + 四关全绿 → foundation-verified。
 
-use bagertea_ai_media_v2_lib::db::{
+use teacell_ai_media_manager_lib::db::{
     ai, asset_tags, assets, init_memory, migrations, query_expr, schema_features, tag_facets, tags,
 };
-use bagertea_ai_media_v2_lib::error::AppResult;
+use teacell_ai_media_manager_lib::error::AppResult;
 
 fn mem() -> rusqlite::Connection {
     init_memory().expect("内存库初始化失败")
@@ -583,7 +583,7 @@ fn detect_conflicts_finds_all_six_types() {
 /// F3-b：next_prefix 十一个必测边界。
 #[test]
 fn next_prefix_boundaries() {
-    use bagertea_ai_media_v2_lib::db::tags::next_prefix;
+    use teacell_ai_media_manager_lib::db::tags::next_prefix;
     assert_eq!(next_prefix("term123"), Some("term124".to_string()), "ASCII");
     assert_eq!(next_prefix("青"), Some("靓".to_string()), "中文");
     assert_eq!(
@@ -620,7 +620,7 @@ fn next_prefix_boundaries() {
 /// F3-b：next_prefix 不变式 —— 每个探针都落在 [prefix, next) 区间；兄弟落在区间外。
 #[test]
 fn next_prefix_covers_all_children() {
-    use bagertea_ai_media_v2_lib::db::tags::next_prefix;
+    use teacell_ai_media_manager_lib::db::tags::next_prefix;
     let prefixes = [
         "term123",
         "青",
@@ -657,7 +657,7 @@ fn next_prefix_covers_all_children() {
 /// F3：find_by_term 别名命中（同义词）；旧表路径与 tag_terms 路径行为一致。
 #[test]
 fn find_by_term_alias_hits_synonym() {
-    use bagertea_ai_media_v2_lib::db::tags;
+    use teacell_ai_media_manager_lib::db::tags;
     let c = mem();
     let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
     tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
@@ -683,7 +683,7 @@ fn find_by_term_alias_hits_synonym() {
 /// F3：find_by_term 无 ORDER BY 兜底也唯一（分面内一个 term 最多命中一个标签）。
 #[test]
 fn find_by_term_is_deterministic() {
-    use bagertea_ai_media_v2_lib::db::tags;
+    use teacell_ai_media_manager_lib::db::tags;
     let c = mem();
     // 启用 tag_terms 后：ux_terms 唯一索引保证唯一
     let t1 = tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
@@ -712,7 +712,7 @@ fn enable_terms(conn: &rusqlite::Connection) {
 
 /// F4 辅助：插入一张图片素材，返回 id。
 fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
-    assets::insert(
+    let id = assets::insert(
         conn,
         path,
         path.rsplit('/').next().unwrap_or("a.jpg"),
@@ -721,7 +721,34 @@ fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
         "image/jpeg",
         1700000000000,
     )
-    .expect("插入素材失败")
+    .expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .expect("登记测试总仓失败");
+    let library = teacell_ai_media_manager_lib::db::libraries::current(conn)
+        .expect("读取测试总仓失败")
+        .expect("测试总仓缺失");
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .expect("登记测试托管定位失败");
+    id
 }
 
 /// F4：status × cfg_* 组合下，数据层消费点（侧栏树 list_tree / 提示词 build_prompt_context /
@@ -924,7 +951,7 @@ fn facet_capability_matrix() {
 /// （SEARCHABLE_TAG / FTS 触发器只读 cfg_searchable，不看 f.status）。
 #[test]
 fn deactivated_facet_tags_still_searchable() {
-    use bagertea_ai_media_v2_lib::db::search;
+    use teacell_ai_media_manager_lib::db::search;
     let c = mem();
     tag_facets::create(&c, "mood_x", "情绪", "", "multi", None, "all").unwrap();
     let t = tags::create_in_facet(&c, "松弛感", None, Some("mood_x")).unwrap();
@@ -1334,8 +1361,10 @@ fn prefix_mode_unavailable_without_terms() {
 // ═══════════════ F6：词表治理 ═══════════════
 
 /// 辅助：单素材批次 → 返回第一条 suggestion。
-fn f6_one_suggestion(c: &rusqlite::Connection) -> bagertea_ai_media_v2_lib::db::ai::AiSuggestion {
-    use bagertea_ai_media_v2_lib::db::ai;
+fn f6_one_suggestion(
+    c: &rusqlite::Connection,
+) -> teacell_ai_media_manager_lib::db::ai::AiSuggestion {
+    use teacell_ai_media_manager_lib::db::ai;
     let aid = f4_insert_asset(c, "d:/f6.jpg");
     let batch = ai::create_batch(c, &[aid], "cloud").unwrap();
     let s = ai::list_suggestions(c, batch.id).unwrap();
@@ -1346,7 +1375,7 @@ fn f6_one_suggestion(c: &rusqlite::Connection) -> bagertea_ai_media_v2_lib::db::
 /// F6-a：词表里没有的词，候选留在 ai_suggestion_items（tag_id NULL），tags 表不动。
 #[test]
 fn ai_new_term_stays_in_suggestion_items() {
-    use bagertea_ai_media_v2_lib::db::ai;
+    use teacell_ai_media_manager_lib::db::ai;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tags = ai::CategorizedTags::from([("scene".to_string(), vec!["太空漫步".to_string()])]);
@@ -1371,7 +1400,7 @@ fn ai_new_term_stays_in_suggestion_items() {
 /// F6-a/F6-c：用户把候选「一个人」合并到已有词「单人」→ 目标补 synonym 别名（不是 old_name）。
 #[test]
 fn candidate_merge_writes_synonym_not_old_name() {
-    use bagertea_ai_media_v2_lib::db::ai;
+    use teacell_ai_media_manager_lib::db::ai;
     let c = mem();
     let target = tags::create_in_facet(&c, "单人", None, Some("scene")).unwrap();
     let sug = f6_one_suggestion(&c);
@@ -1624,8 +1653,8 @@ fn analysis_result_roundtrips() {
 /// A1：对象形态（{"t","c"}）解析 → typed proposals → items 落库 confidence=0.9。
 #[test]
 fn confidence_object_form_reaches_db() {
-    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
+    use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+    use teacell_ai_media_manager_lib::services::ai_cloud::parse_media_analysis;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let facets = [FacetPromptContext {
@@ -1664,8 +1693,8 @@ fn confidence_object_form_reaches_db() {
 /// analysis_json 存 AnalysisResult 序列化且可往返。
 #[test]
 fn raw_response_stored_verbatim() {
-    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
+    use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+    use teacell_ai_media_manager_lib::services::ai_cloud::parse_media_analysis;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let facets = [FacetPromptContext {
@@ -1717,8 +1746,8 @@ fn raw_response_stored_verbatim() {
 /// A2：请求配置 hash —— 同输入同 hash（16 位），改任一项（模型/maxTokens/system）则变。
 #[test]
 fn request_config_hash_is_stable() {
-    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-    use bagertea_ai_media_v2_lib::services::ai_cloud::{
+    use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+    use teacell_ai_media_manager_lib::services::ai_cloud::{
         build_batch_request_config, stable_config_hash, TextJsonTier,
     };
     let facets = [FacetPromptContext {
@@ -1771,8 +1800,8 @@ fn request_config_hash_is_stable() {
 /// description/selectionMode/maxItems/appliesTo）+ 忠实记录 system 段与模型参数。
 #[test]
 fn request_config_json_contains_all_inputs() {
-    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-    use bagertea_ai_media_v2_lib::services::ai_cloud::{
+    use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+    use teacell_ai_media_manager_lib::services::ai_cloud::{
         build_batch_request_config, TextJsonTier, PROMPT_VERSION,
     };
     let facets = [FacetPromptContext {
@@ -1942,7 +1971,7 @@ fn replace_ai_only_deletes_unreviewed() {
 /// A3：ReplaceAiOnly 重跑**不删** ai_reviewed 行（用户已审核，铁律 10）。
 #[test]
 fn replace_ai_only_keeps_reviewed() {
-    use bagertea_ai_media_v2_lib::db::asset_tags;
+    use teacell_ai_media_manager_lib::db::asset_tags;
     let c = mem();
     let aid = f4_insert_asset(&c, "d:/a3_reviewed.jpg");
     let tag = tags::create_in_facet(&c, "已审核标签", None, Some("scene")).unwrap();
@@ -1957,7 +1986,7 @@ fn replace_ai_only_keeps_reviewed() {
 /// A3：ReplaceAiOnly 重跑**不删** manual 行（人工确认，铁律 10）。
 #[test]
 fn replace_ai_only_keeps_manual() {
-    use bagertea_ai_media_v2_lib::db::asset_tags;
+    use teacell_ai_media_manager_lib::db::asset_tags;
     let c = mem();
     let aid = f4_insert_asset(&c, "d:/a3_manual.jpg");
     let tag = tags::create_in_facet(&c, "手工标签", None, Some("scene")).unwrap();
@@ -1971,7 +2000,7 @@ fn replace_ai_only_keeps_manual() {
 /// A3：确认建议 → 该素材本批次的 AI 来源行提升为 ai_reviewed（此后重跑不再清它）。
 #[test]
 fn confirm_promotes_to_ai_reviewed() {
-    use bagertea_ai_media_v2_lib::db::asset_tags;
+    use teacell_ai_media_manager_lib::db::asset_tags;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
@@ -1992,7 +2021,7 @@ fn confirm_promotes_to_ai_reviewed() {
 ///（D-1/D-2：撤销 AI 批次不会误删手工确认后的标签）。
 #[test]
 fn manual_override_promotes_to_manual() {
-    use bagertea_ai_media_v2_lib::db::asset_tags;
+    use teacell_ai_media_manager_lib::db::asset_tags;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
@@ -2015,8 +2044,8 @@ fn manual_override_promotes_to_manual() {
 /// A3：undo_batch 撤销批次 —— ai_reviewed 行随批次删（D-3 语义），manual 行不动。
 #[test]
 fn undo_batch_respects_review_state() {
-    use bagertea_ai_media_v2_lib::db::asset_tags;
-    use bagertea_ai_media_v2_lib::db::tag_ops;
+    use teacell_ai_media_manager_lib::db::asset_tags;
+    use teacell_ai_media_manager_lib::db::tag_ops;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let t1 = tags::create_in_facet(&c, "AI标签甲", None, Some("scene")).unwrap();
@@ -2053,7 +2082,7 @@ fn undo_batch_respects_review_state() {
 /// 精确命中词表也只建立 pending 建议，必须人工确认后才写 asset_tags。
 #[test]
 fn exact_term_stays_pending() {
-    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    use teacell_ai_media_manager_lib::db::ai::ConfidencePolicy;
     let c = mem();
     enable_terms(&c);
     // feature 开时 create_in_facet 会把 canonical 词写进 tag_terms → 精确命中成立
@@ -2091,7 +2120,7 @@ fn exact_term_stays_pending() {
 /// A4：完全新词 → 只进 pending（不进 tags、不建词、不写 asset_tags）；自动建词默认关。
 #[test]
 fn new_term_goes_to_pending() {
-    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    use teacell_ai_media_manager_lib::db::ai::ConfidencePolicy;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["太空漫步".to_string()])]);
@@ -2135,7 +2164,7 @@ fn new_term_goes_to_pending() {
 /// suggested_tags 同步剔除（「确认全部」不会复活低置信词）。
 #[test]
 fn low_confidence_dropped_entirely() {
-    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    use teacell_ai_media_manager_lib::db::ai::ConfidencePolicy;
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["低可信词".to_string()])]);
@@ -2182,8 +2211,8 @@ fn low_confidence_dropped_entirely() {
 /// 当前版本固定人工审核：默认策略不自动写已有词、不自动建新词，也不静默过滤建议。
 #[test]
 fn auto_adopt_off_by_default() {
-    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
-    use bagertea_ai_media_v2_lib::db::settings::AiSettings;
+    use teacell_ai_media_manager_lib::db::ai::ConfidencePolicy;
+    use teacell_ai_media_manager_lib::db::settings::AiSettings;
     let p = ConfidencePolicy::default();
     assert_eq!(p.min_suggest, 0.30, "低置信度默认阈值");
     let s = AiSettings::default();
@@ -2196,10 +2225,12 @@ fn auto_adopt_off_by_default() {
 /// ALL_SORT_KEYS 与 AI 侧 is_valid_sort_by / validate_intent 三处一致（rating 全合法）。
 #[test]
 fn whitelist_single_source() {
-    use bagertea_ai_media_v2_lib::db::search_query::{
+    use teacell_ai_media_manager_lib::db::search_query::{
         is_metadata_key, is_supported_metadata_key, ALL_METADATA_KEYS, ALL_SORT_KEYS,
     };
-    use bagertea_ai_media_v2_lib::services::super_search_ai::{validate_intent, SearchIntentV2};
+    use teacell_ai_media_manager_lib::services::super_search_ai::{
+        validate_intent, SearchIntentV2,
+    };
     // 正向：全集每个 key 都必须有 key_spec（加 key 忘 spec → 编译期断言失败）
     for k in ALL_METADATA_KEYS {
         assert!(is_metadata_key(k), "白名单常量自身应认识 {k}");
@@ -2213,7 +2244,7 @@ fn whitelist_single_source() {
     // 排序白名单三处一致：AI 侧 is_valid_sort_by / validate_intent / assets VALID_SORT（引用同常量）
     for k in ALL_SORT_KEYS {
         assert!(
-            bagertea_ai_media_v2_lib::services::super_search_ai::is_valid_sort_by(k),
+            teacell_ai_media_manager_lib::services::super_search_ai::is_valid_sort_by(k),
             "ALL_SORT_KEYS 里的 {k} 必须被 is_valid_sort_by 接受"
         );
     }
@@ -2222,7 +2253,7 @@ fn whitelist_single_source() {
         "rating 必须在排序白名单（R0-4 回归）"
     );
     assert!(
-        !bagertea_ai_media_v2_lib::services::super_search_ai::is_valid_sort_by("magic"),
+        !teacell_ai_media_manager_lib::services::super_search_ai::is_valid_sort_by("magic"),
         "白名单之外必须拒绝"
     );
     // validate_intent 走同一常量：rating 合法、magic 拒绝
@@ -2243,7 +2274,7 @@ fn whitelist_single_source() {
 /// S5：Exact 只命中 canonical；同一词以 synonym 存在时 Exact 不中、Alias 中。
 #[test]
 fn term_match_exact_only_canonical() {
-    use bagertea_ai_media_v2_lib::db::tags::{find_by_term, TermMatch};
+    use teacell_ai_media_manager_lib::db::tags::{find_by_term, TermMatch};
     let c = mem();
     enable_terms(&c);
     let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
@@ -2268,7 +2299,7 @@ fn term_match_exact_only_canonical() {
 /// S5：Contains 上限 10 —— 超出的截断并记 warning（「只用了前 N 个」）。
 #[test]
 fn term_match_contains_respects_cap() {
-    use bagertea_ai_media_v2_lib::db::tags::{expand_term_query, TermMatch};
+    use teacell_ai_media_manager_lib::db::tags::{expand_term_query, TermMatch};
     let c = mem();
     enable_terms(&c);
     for i in 0..12 {
@@ -2301,7 +2332,7 @@ fn term_match_contains_respects_cap() {
 /// S5：Fuzzy 两级 —— 缩候选 + 编辑距离 ≤1，命中真实标签（指导书四行真值表）。
 #[test]
 fn term_match_fuzzy_two_stage() {
-    use bagertea_ai_media_v2_lib::db::tags::{expand_term_query, TermMatch};
+    use teacell_ai_media_manager_lib::db::tags::{expand_term_query, TermMatch};
     let c = mem();
     enable_terms(&c);
     for name in ["一个", "一个人", "单人", "女性", "女孩", "青少年", "森林"] {
@@ -2348,8 +2379,8 @@ fn term_match_fuzzy_two_stage() {
 /// 前缀「海」命中「海边/海景」；未命中词查编译为 1=0（0 结果而非全库）。
 #[test]
 fn term_query_expands_in_tag_leaf() {
-    use bagertea_ai_media_v2_lib::db::query_expr::{compile_expr, LeafCond, QueryExpr};
-    use bagertea_ai_media_v2_lib::db::tags::TermMatch;
+    use teacell_ai_media_manager_lib::db::query_expr::{compile_expr, LeafCond, QueryExpr};
+    use teacell_ai_media_manager_lib::db::tags::TermMatch;
     let c = mem();
     enable_terms(&c);
     let t1 = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
@@ -2387,11 +2418,11 @@ fn term_query_expands_in_tag_leaf() {
 /// ④ 编译 warnings 为空（标签都在、无剔除）；⑤ min=0 时 should 只影响顺序不影响集合。
 #[test]
 fn e2e_grass_required_sky_preferred_night_excluded() {
-    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
-    use bagertea_ai_media_v2_lib::db::search_plan::{
+    use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr};
+    use teacell_ai_media_manager_lib::db::search_plan::{
         run_search_plan, Ranking, SearchPlanV3, ShouldClause,
     };
-    use bagertea_ai_media_v2_lib::db::tags::TermMatch;
+    use teacell_ai_media_manager_lib::db::tags::TermMatch;
     let c = mem();
     let grass = tags::create_in_facet(&c, "草地", None, Some("scene")).unwrap();
     let sky = tags::create_in_facet(&c, "蓝天", None, Some("scene")).unwrap();
@@ -2464,7 +2495,7 @@ fn e2e_grass_required_sky_preferred_night_excluded() {
 /// R2-1：表达式编译 warning（标签不属于声明分面被剔除）→ 到达 list DTO。
 #[test]
 fn dropped_tag_produces_visible_warning() {
-    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+    use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr};
     let c = mem();
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
     // 声明 color 分面但标签属于 scene → 剔除 + warning（不再是静默日志）
@@ -2493,7 +2524,7 @@ fn dropped_tag_produces_visible_warning() {
 /// R2-1：分面不存在/停用（FacetHasAny）→ 编译 warning 进 DTO（用户看得到，不只日志）。
 #[test]
 fn compile_warnings_reach_dto() {
-    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+    use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr};
     let c = mem();
     let expr = QueryExpr::Leaf {
         cond: LeafCond::FacetHasAny {
@@ -2517,7 +2548,7 @@ fn compile_warnings_reach_dto() {
 /// R2-2：file_size 疑似写成 MB（< 1024 字节）→ warning 但仍执行（不报错）。
 #[test]
 fn suspicious_file_size_warns_but_executes() {
-    use bagertea_ai_media_v2_lib::db::search_query::MetadataFilter;
+    use teacell_ai_media_manager_lib::db::search_query::MetadataFilter;
     let c = mem();
     let _aid = f4_insert_asset(&c, "d:/r22.jpg");
     let filter = assets::AssetFilter {
@@ -2622,7 +2653,7 @@ fn palette_top3_query_uses_index() {
 /// C-1：同时含红和蓝（前三色）→ INTERSECT 表达；metadata key palette_top3 in [红,蓝] 编译一致。
 #[test]
 fn palette_intersect_two_colors() {
-    use bagertea_ai_media_v2_lib::db::search_query::{compile_metadata, MetadataFilter};
+    use teacell_ai_media_manager_lib::db::search_query::{compile_metadata, MetadataFilter};
     let c = mem();
     let a = f4_insert_asset(&c, "d:/c1_ab.jpg");
     let b = f4_insert_asset(&c, "d:/c1_b.jpg");
@@ -2687,7 +2718,7 @@ fn palette_intersect_two_colors() {
 /// U-3：palette_top3 eq 红 + min=0.5 → 只命中红占比 ≥50% 的素材（关系表 ratio 维度的编译链路）。
 #[test]
 fn palette_top3_ratio_min_filters() {
-    use bagertea_ai_media_v2_lib::db::search_query::{compile_metadata, MetadataFilter};
+    use teacell_ai_media_manager_lib::db::search_query::{compile_metadata, MetadataFilter};
     let c = mem();
     let hi = f4_insert_asset(&c, "d:/c1_hi.jpg");
     let lo = f4_insert_asset(&c, "d:/c1_lo.jpg");
@@ -2742,14 +2773,15 @@ fn alias_reaches_fts_after_gate_enabled() {
     asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
 
     // 修复前：FTS 词源仍读 tag_aliases，别名进不了 FTS → 此处必 miss
-    let hits = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶饮料").unwrap();
+    let hits =
+        teacell_ai_media_manager_lib::db::search::search_asset_ids_all(&c, "茶饮料").unwrap();
     assert_eq!(
         hits,
         vec![aid],
         "gate 开启后新增别名应能经 FTS 命中：{hits:?}"
     );
     // canonical 路径不受影响（回源仍是 tags.name）
-    let canon = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶").unwrap();
+    let canon = teacell_ai_media_manager_lib::db::search::search_asset_ids_all(&c, "茶").unwrap();
     assert_eq!(canon, vec![aid]);
 }
 

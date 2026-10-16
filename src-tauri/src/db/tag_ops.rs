@@ -3,6 +3,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use super::libraries::VERIFIED_ASSET_SCOPE;
 use crate::error::AppResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,14 +45,15 @@ pub(crate) fn record(
 /// 最近打标列表（打标页左栏）：按时间倒序，JOIN 标签名/素材名供展示
 pub fn recent(conn: &Connection, limit: i64) -> AppResult<Vec<TagOp>> {
     let limit = limit.clamp(1, 500);
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT o.id, o.asset_id, o.tag_id, o.op, o.actor, o.batch_id, o.created_at,
                 t.name, a.file_name
            FROM tag_ops o
            JOIN tags t ON t.id = o.tag_id
            JOIN assets a ON a.id = o.asset_id
-          ORDER BY o.id DESC LIMIT ?1",
-    )?;
+          WHERE {VERIFIED_ASSET_SCOPE}
+          ORDER BY o.id DESC LIMIT ?1"
+    ))?;
     let rows = stmt
         .query_map([limit], |r| {
             Ok(TagOp {

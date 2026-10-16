@@ -2,7 +2,10 @@
  *  入库任务按 taskId 隔离（旧任务事件不污染新任务）；后端只发阶段进度，前端按权重计算整体展示进度。
  *  入库完成（done）后保留最终状态，直到下一次新入库开始；失败保留文字与状态（不纯红）。 */
 import { create } from "zustand";
-import { onImportProgress, type ImportPhase, type ImportProgress } from "@/api/import";
+import { onImportProgress } from "@/api/import";
+import type { ImportPhase, ImportProgress } from "@/types/import";
+import { getOperation } from "@/api/plans";
+import type { OperationSnapshot } from "@/types/plans";
 import { onExportProgress } from "@/api/export";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { logger } from "@/utils/logger";
@@ -34,10 +37,14 @@ export interface TaskItem {
   done?: boolean;
   /** 入库专用明细；导出任务不设置 */
   importProgress?: ImportTaskProgress;
+  /** 固定计划入库的持久状态；按 operationId 查询，不依赖页面生命周期。 */
+  operationSnapshot?: OperationSnapshot;
 }
 
 interface TaskState {
   tasks: TaskItem[];
+  /** Latest durable snapshots outlive the short-lived global task cards. */
+  operationSnapshots: Record<string, OperationSnapshot>;
 }
 
 /** 阶段权重（指导书 §4.5）：只作 UI 展示决策，不写入 Rust，也不作为业务完成条件。 */
@@ -88,11 +95,116 @@ function importDetail(p: ImportProgress): string {
 
 export const useTaskStore = create<TaskState>(() => ({
   tasks: [],
+  operationSnapshots: {},
 }));
 
 /** 完成条停留时长（毫秒）：让用户看到 100% 后再消失。 */
 const LINGER_MS = 1500;
 const lingerTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const operationPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const operationPollInFlight = new Set<string>();
+
+function isOperationTerminal(snapshot: OperationSnapshot): boolean {
+  return snapshot.state !== "queued" && snapshot.state !== "running";
+}
+
+function operationStateLabel(snapshot: OperationSnapshot): string {
+  switch (snapshot.state) {
+    case "queued": return "排队中";
+    case "running": return snapshot.phase === "cancelling" ? "取消中…" : "正在入库";
+    case "succeeded": return "入库完成";
+    case "partially_succeeded": return `部分完成 · 成功 ${snapshot.completed} · 失败 ${snapshot.failed}`;
+    case "failed": return snapshot.errorCode ? `入库失败 · ${snapshot.errorCode}` : "入库失败";
+    case "cancelled": return "已取消";
+    case "interrupted": return "应用关闭时中断，可恢复";
+    case "outcome_unknown": return "结果待核对，请先恢复或核对";
+  }
+}
+
+function upsertOperationSnapshot(snapshot: OperationSnapshot): OperationSnapshot {
+  const id = snapshot.operationId;
+  const done = isOperationTerminal(snapshot);
+  let acceptedSnapshot = snapshot;
+  useTaskStore.setState((s) => {
+    const previousSnapshot = s.operationSnapshots[id];
+    if (previousSnapshot && snapshot.revision < previousSnapshot.revision) {
+      acceptedSnapshot = previousSnapshot;
+      return s;
+    }
+    const others = s.tasks.filter((task) => task.id !== id && !(task.kind === "import" && task.done));
+    const previous = s.tasks.find((task) => task.id === id);
+    const total = snapshot.total ?? previous?.importProgress?.phaseTotal ?? null;
+    const task: TaskItem = {
+      ...previous,
+      id,
+      kind: "import",
+      label: "入库",
+      overall: total && total > 0 ? Math.min(1, snapshot.completed / total) : (done && snapshot.state === "succeeded" ? 1 : null),
+      detail: operationStateLabel(snapshot),
+      error: snapshot.state === "failed" || snapshot.state === "cancelled" || snapshot.state === "interrupted" || snapshot.state === "outcome_unknown"
+        ? operationStateLabel(snapshot)
+        : snapshot.state === "partially_succeeded" ? operationStateLabel(snapshot) : null,
+      done,
+      operationSnapshot: snapshot,
+      importProgress: previous?.importProgress,
+    };
+    return {
+      tasks: [...others, task],
+      operationSnapshots: { ...s.operationSnapshots, [id]: snapshot },
+    };
+  });
+  return acceptedSnapshot;
+}
+
+function scheduleOperationPoll(operationId: string, delayMs = 1200) {
+  const previous = operationPollTimers.get(operationId);
+  if (previous) clearTimeout(previous);
+  operationPollTimers.set(operationId, setTimeout(() => {
+    operationPollTimers.delete(operationId);
+    void refreshTrackedOperation(operationId);
+  }, delayMs));
+}
+
+async function refreshTrackedOperation(operationId: string): Promise<void> {
+  if (operationPollInFlight.has(operationId)) return;
+  operationPollInFlight.add(operationId);
+  try {
+    const snapshot = await getOperation(operationId);
+    const latest = upsertOperationSnapshot(snapshot);
+    if (!isOperationTerminal(latest)) {
+      scheduleOperationPoll(operationId);
+    } else {
+      const pending = operationPollTimers.get(operationId);
+      if (pending) clearTimeout(pending);
+      operationPollTimers.delete(operationId);
+    }
+  } catch (error) {
+    logger.warn("刷新入库操作状态失败，可在工作台重试", { operationId, error: error instanceof Error ? error.message : String(error) });
+    const latest = useTaskStore.getState().operationSnapshots[operationId];
+    if (latest && !isOperationTerminal(latest)) scheduleOperationPoll(operationId);
+  } finally {
+    operationPollInFlight.delete(operationId);
+  }
+}
+
+/** 持久化操作快照并在 queued/running 时按精确 operationRef 轮询后端。 */
+export function trackImportOperation(snapshot: OperationSnapshot): void {
+  const latest = upsertOperationSnapshot(snapshot);
+  if (latest.revision > snapshot.revision) {
+    if (isOperationTerminal(latest)) {
+      const pending = operationPollTimers.get(snapshot.operationId);
+      if (pending) clearTimeout(pending);
+      operationPollTimers.delete(snapshot.operationId);
+    } else if (!operationPollTimers.has(snapshot.operationId) && !operationPollInFlight.has(snapshot.operationId)) {
+      scheduleOperationPoll(snapshot.operationId, 0);
+    }
+    return;
+  }
+  const pending = operationPollTimers.get(snapshot.operationId);
+  if (pending) clearTimeout(pending);
+  operationPollTimers.delete(snapshot.operationId);
+  if (!isOperationTerminal(snapshot)) scheduleOperationPoll(snapshot.operationId, 0);
+}
 
 function scheduleLinger(id: string) {
   const prev = lingerTimers.get(id);
@@ -107,6 +219,39 @@ function scheduleLinger(id: string) {
 }
 
 export function upsertImport(p: ImportProgress) {
+  if (p.operationId) {
+    useTaskStore.setState((s) => {
+      const id = p.operationId!;
+      const previous = s.tasks.find((task) => task.id === id);
+      const snapshot = previous?.operationSnapshot ?? s.operationSnapshots[id];
+      if (!previous && snapshot && isOperationTerminal(snapshot)) return s;
+      const task: TaskItem = {
+        ...previous,
+        id,
+        kind: "import",
+        label: "入库",
+        overall: snapshot?.total && snapshot.total > 0
+          ? Math.min(1, snapshot.completed / snapshot.total)
+          : previous?.overall ?? importOverall(p.phase, p.phaseCurrent, p.phaseTotal),
+        detail: snapshot ? operationStateLabel(snapshot) : (p.message && p.phase !== "done" ? p.message : importDetail(p)),
+        error: previous?.error ?? (p.phase === "failed" || p.phase === "cancelled" ? p.message ?? PHASE_LABELS[p.phase] : null),
+        done: snapshot ? isOperationTerminal(snapshot) : false,
+        operationSnapshot: snapshot,
+        importProgress: {
+          phase: p.phase,
+          phaseCurrent: p.phaseCurrent,
+          phaseTotal: p.phaseTotal,
+          file: p.file,
+          imported: p.imported,
+          duplicates: p.duplicates,
+          failed: p.failed,
+        },
+      };
+      const others = s.tasks.filter((entry) => entry.id !== id && !(entry.kind === "import" && entry.done));
+      return { tasks: [...others, task] };
+    });
+    return;
+  }
   const overall = importOverall(p.phase, p.phaseCurrent, p.phaseTotal);
   const done = p.phase === "done" || p.phase === "review" || p.phase === "failed" || p.phase === "cancelled";
   useTaskStore.setState((s) => {
@@ -152,7 +297,7 @@ export function latestImportTask(tasks: TaskItem[]): TaskItem | undefined {
 export function clearActiveImportTask() {
   useTaskStore.setState((s) => {
     for (let i = s.tasks.length - 1; i >= 0; i--) {
-      if (s.tasks[i].kind === "import" && !s.tasks[i].done) {
+      if (s.tasks[i].kind === "import" && !s.tasks[i].done && !s.tasks[i].operationSnapshot) {
         return { tasks: s.tasks.filter((_, index) => index !== i) };
       }
     }
@@ -181,7 +326,7 @@ export function markImportCancelling() {
   useTaskStore.setState((s) => {
     const tasks = [...s.tasks];
     for (let i = tasks.length - 1; i >= 0; i--) {
-      if (tasks[i].kind === "import" && !tasks[i].done) {
+      if (tasks[i].kind === "import" && !tasks[i].done && !tasks[i].operationSnapshot) {
         tasks[i] = { ...tasks[i], detail: "取消中…" };
         break;
       }

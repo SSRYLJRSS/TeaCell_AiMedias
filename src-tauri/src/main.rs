@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bagertea_ai_media_v2_lib::run()
+    teacell_ai_media_manager_lib::run()
 }

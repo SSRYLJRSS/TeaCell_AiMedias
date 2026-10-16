@@ -9,9 +9,10 @@ import {
   aiListSuggestions,
   aiRejectSuggestion,
   aiRestoreSuggestion,
-  aiStartBatch,
+  aiStartTagging,
 } from "@/api/ai";
 import type { AiBatch, AiSuggestion, CategorizedTags } from "@/types/ai";
+import type { TaggingOperation } from "@/types/ai";
 
 interface AiState {
   batches: AiBatch[];
@@ -34,13 +35,14 @@ interface AiState {
   lastProgressAssetId: number | null;
   /** 素材库「打标」带过来的选中素材（跨页传递） */
   pendingAssetIds: number[];
+  setError: (error: string | null) => void;
   setPendingAssets: (ids: number[]) => void;
   refreshBatches: () => Promise<void>;
   openBatch: (batchId: number) => Promise<void>;
   /** 只建批次不调 AI：跳转后图片立即上胶片条，AI 建议与手工填写共用工作台 */
   createBatch: () => Promise<void>;
-  /** 云端批次手动启动（左栏「开始打标」按钮） */
-  startBatch: (limit?: number) => Promise<void>;
+  /** 启动页面已准备并批准的 operation；审批流程由页面编排。 */
+  startTagging: (operation: TaggingOperation, limit?: number) => Promise<void>;
   /** 撤销拒绝（v2.11） */
   restore: (id: number) => Promise<void>;
   cancel: () => Promise<void>;
@@ -61,6 +63,8 @@ export const useAiStore = create<AiState>((set, get) => ({
   lastProgressAssetId: null,
   pendingAssetIds: [],
 
+  setError: (error) => set({ error }),
+
   setPendingAssets: (ids) => set({ pendingAssetIds: ids }),
 
   createBatch: async () => {
@@ -78,10 +82,14 @@ export const useAiStore = create<AiState>((set, get) => ({
     }
   },
 
-  startBatch: async (limit) => {
+  startTagging: async (operation, limit) => {
     const state = get();
-    const batchId = state.currentBatchId;
+    const batchId = operation.batchId;
     if (!batchId) return;
+    if (state.currentBatchId !== batchId) {
+      set({ error: "当前批次已切换，打标操作未启动。" });
+      return;
+    }
     const batchProcessedAtStart = state.batches.find((batch) => batch.id === batchId)?.processed ?? 0;
     // 页面可立即显示启动状态；真实本次总数由后端在过滤 pending 后的首个事件提供。
     set({
@@ -99,7 +107,7 @@ export const useAiStore = create<AiState>((set, get) => ({
       },
     });
     try {
-      const batch = await aiStartBatch(batchId, limit);
+      const batch = await aiStartTagging(operation.operationId, operation.stepId);
       set((s) => ({
         batches: s.batches.map((b) => (b.id === batch.id ? batch : b)),
         runProgress:

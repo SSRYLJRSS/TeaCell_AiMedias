@@ -1,11 +1,18 @@
 //! AI 连接档案表（指导书 §6.3）：ai_connections（连接档案）+ ai_usage_bindings（用途绑定）。
 //!  - `api_key_ref` 只保存凭据引用（= connection_id），明文 API Key 存系统凭据（credentials.rs）；
-//!  - 用途绑定：super_search / tagging 各自指向一个 connection_id，可同可异；
+//!  - 用途绑定：super_search / tagging / agent 各自独立指向一个 connection_id；
 //!  - 协议 protocol ∈ openai_chat | anthropic_messages（apiMode 迁移见 §6.4）。
 
 use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+
+pub const SUPPORTED_USAGES: [&str; 3] = ["super_search", "tagging", "agent"];
+
+pub fn is_supported_usage(usage: &str) -> bool {
+    SUPPORTED_USAGES.contains(&usage)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiConnection {
@@ -16,6 +23,8 @@ pub struct AiConnection {
     pub base_url: String,
     pub model: String,
     pub api_key_ref: Option<String>,
+    /// 每次配置保存都会轮换；用于拒绝使用过期连接快照的模型请求。
+    pub config_revision: String,
     /// 外部 AI 服务限流配置；0 表示不限。
     pub max_concurrency: i64,
     pub requests_per_minute: i64,
@@ -28,7 +37,7 @@ pub struct AiConnection {
 /// 按 id 读取连接档案。
 pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, config_revision,
                 max_concurrency, requests_per_minute, requests_per_hour,
                 enabled, created_at, updated_at
          FROM ai_connections WHERE id = ?1",
@@ -42,7 +51,7 @@ pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
 
 pub fn list(conn: &Connection) -> AppResult<Vec<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, config_revision,
                 max_concurrency, requests_per_minute, requests_per_hour,
                 enabled, created_at, updated_at
          FROM ai_connections ORDER BY created_at",
@@ -64,12 +73,13 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
         base_url: row.get(4)?,
         model: row.get(5)?,
         api_key_ref: row.get(6)?,
-        max_concurrency: row.get(7)?,
-        requests_per_minute: row.get(8)?,
-        requests_per_hour: row.get(9)?,
-        enabled: row.get::<_, i64>(10)? != 0,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        config_revision: row.get(7)?,
+        max_concurrency: row.get(8)?,
+        requests_per_minute: row.get(9)?,
+        requests_per_hour: row.get(10)?,
+        enabled: row.get::<_, i64>(11)? != 0,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -77,7 +87,7 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
 pub fn binding_for(conn: &Connection, usage: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, c.deployment, c.protocol, c.base_url, c.model, c.api_key_ref,
-                c.max_concurrency, c.requests_per_minute, c.requests_per_hour,
+                c.config_revision, c.max_concurrency, c.requests_per_minute, c.requests_per_hour,
                 c.enabled, c.created_at, c.updated_at
          FROM ai_usage_bindings b JOIN ai_connections c ON c.id = b.connection_id
          WHERE b.usage = ?1 AND c.enabled = 1",
@@ -228,16 +238,18 @@ pub fn upsert_with_limits(
         }
     }
     let now = chrono::Utc::now().timestamp_millis();
+    let config_revision = Uuid::new_v4().simple().to_string();
     conn.execute(
         "INSERT INTO ai_connections
-           (id, name, deployment, protocol, base_url, model, api_key_ref,
+           (id, name, deployment, protocol, base_url, model, api_key_ref, config_revision,
             max_concurrency, requests_per_minute, requests_per_hour,
             enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, deployment = excluded.deployment, protocol = excluded.protocol,
            base_url = excluded.base_url, model = excluded.model,
            api_key_ref = COALESCE(excluded.api_key_ref, ai_connections.api_key_ref),
+           config_revision = excluded.config_revision,
            max_concurrency = excluded.max_concurrency,
            requests_per_minute = excluded.requests_per_minute,
            requests_per_hour = excluded.requests_per_hour,
@@ -250,6 +262,7 @@ pub fn upsert_with_limits(
             base_url,
             model,
             api_key_ref,
+            config_revision,
             max_concurrency,
             requests_per_minute,
             requests_per_hour,
@@ -261,8 +274,10 @@ pub fn upsert_with_limits(
 
 /// 绑定用途 → 连接（幂等 upsert）。
 pub fn bind_usage(conn: &Connection, usage: &str, connection_id: &str) -> AppResult<()> {
-    if !matches!(usage, "super_search" | "tagging") {
-        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    if !is_supported_usage(usage) {
+        return Err(AppError::invalid_arg(
+            "非法用途（super_search|tagging|agent）",
+        ));
     }
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
@@ -275,8 +290,10 @@ pub fn bind_usage(conn: &Connection, usage: &str, connection_id: &str) -> AppRes
 
 /// 清除某个用途绑定。
 pub fn unbind_usage(conn: &Connection, usage: &str) -> AppResult<()> {
-    if !matches!(usage, "super_search" | "tagging") {
-        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    if !is_supported_usage(usage) {
+        return Err(AppError::invalid_arg(
+            "非法用途（super_search|tagging|agent）",
+        ));
     }
     conn.execute(
         "DELETE FROM ai_usage_bindings WHERE usage = ?1",
@@ -287,8 +304,10 @@ pub fn unbind_usage(conn: &Connection, usage: &str) -> AppResult<()> {
 
 /// 读取某个用途当前绑定的连接 id（未绑定返回 None）。
 pub fn binding_id(conn: &Connection, usage: &str) -> AppResult<Option<String>> {
-    if !matches!(usage, "super_search" | "tagging") {
-        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    if !is_supported_usage(usage) {
+        return Err(AppError::invalid_arg(
+            "非法用途（super_search|tagging|agent）",
+        ));
     }
     Ok(conn
         .query_row(
@@ -332,6 +351,24 @@ mod tests {
         assert_eq!(c.protocol, "openai_chat");
         assert!(c.enabled);
         assert_eq!(c.api_key_ref.as_deref(), Some("c1"));
+        assert!(!c.config_revision.is_empty());
+        let original_revision = c.config_revision;
+        upsert(
+            &conn,
+            "c1",
+            "通义改名",
+            "cloud",
+            "openai_chat",
+            "https://a/v1",
+            "qwen-max",
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            get(&conn, "c1").unwrap().unwrap().config_revision,
+            original_revision,
+            "每次配置保存都必须废止旧的 Agent connection snapshot"
+        );
 
         bind_usage(&conn, "tagging", "c1").unwrap();
         let b = binding_for(&conn, "tagging").unwrap().unwrap();
@@ -346,11 +383,14 @@ mod tests {
         upsert(&conn, "c2", "B", "local", "openai_chat", "u2", "m", None).unwrap();
         bind_usage(&conn, "super_search", "c1").unwrap();
         bind_usage(&conn, "tagging", "c2").unwrap();
+        assert!(binding_for(&conn, "agent").unwrap().is_none());
+        bind_usage(&conn, "agent", "c1").unwrap();
         assert_eq!(
             binding_for(&conn, "super_search").unwrap().unwrap().id,
             "c1"
         );
         assert_eq!(binding_for(&conn, "tagging").unwrap().unwrap().id, "c2");
+        assert_eq!(binding_for(&conn, "agent").unwrap().unwrap().id, "c1");
         // 修改 super_search 不影响 tagging
         bind_usage(&conn, "super_search", "c2").unwrap();
         assert_eq!(
@@ -358,6 +398,8 @@ mod tests {
             "c2"
         );
         assert_eq!(binding_for(&conn, "tagging").unwrap().unwrap().id, "c2");
+        assert_eq!(binding_for(&conn, "agent").unwrap().unwrap().id, "c1");
+        assert!(bind_usage(&conn, "unknown", "c1").is_err());
     }
 
     #[test]

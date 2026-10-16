@@ -162,7 +162,7 @@ fn source_identity(src: &Path, imported_hash: Option<&str>) -> AppResult<SourceI
 
 fn load_video_source(db: &Database, asset_id: i64) -> AppResult<(String, PathBuf, Option<String>)> {
     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-    let asset = assets::get(&conn, asset_id)?;
+    let asset = assets::get_managed(&conn, asset_id)?;
     Ok((asset.mime_type, PathBuf::from(asset.file_path), asset.hash))
 }
 
@@ -592,6 +592,33 @@ mod tests {
         source
     }
 
+    fn mark_managed_fixture(c: &Connection, asset_id: i64) {
+        c.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(c).unwrap().unwrap();
+        c.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.mp4',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset_id
+            ],
+        )
+        .unwrap();
+    }
+
     fn insert_video(c: &Connection, source: &Path) -> i64 {
         let source_path = crate::utils::path::encode_native_path(source).unwrap();
         c.execute(
@@ -600,8 +627,13 @@ mod tests {
             [&source_path],
         )
         .unwrap();
-        c.query_row("SELECT id FROM assets", [], |r| r.get(0))
-            .unwrap()
+        let id = c
+            .query_row("SELECT id FROM assets ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        mark_managed_fixture(c, id);
+        id
     }
 
     #[test]
@@ -706,6 +738,7 @@ mod tests {
             rusqlite::params![moved_path, id],
         )
         .unwrap();
+        mark_managed_fixture(&conn, id);
         drop(conn);
         let fourth = generate("tool-v2");
         assert_eq!(transcodes.load(Ordering::SeqCst), 4);
@@ -849,6 +882,7 @@ mod tests {
             c.query_row("SELECT id FROM assets", [], |r| r.get(0))
                 .unwrap()
         };
+        mark_managed_fixture(&c, id);
         drop(c);
         let workspace = tempfile::tempdir().unwrap();
         let dir = workspace.path().join("proxies");

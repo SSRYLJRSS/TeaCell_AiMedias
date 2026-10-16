@@ -368,6 +368,7 @@ pub fn compile_search_plan_with(
         );
     }
     parts.push("a.deleted_at IS NULL".to_string());
+    parts.push(super::libraries::VERIFIED_ASSET_SCOPE.to_string());
     base_sql = parts.join(" AND ");
     if base_sql.is_empty() {
         base_sql = "1=1".to_string();
@@ -584,13 +585,15 @@ pub fn run_retriever(conn: &Connection, r: &Retriever) -> AppResult<Vec<i64>> {
             let Some(Value::Text(term)) = pred.params.first() else {
                 return Ok(Vec::new());
             };
-            let mut stmt = conn.prepare(
+            let scope = super::libraries::VERIFIED_ASSET_SCOPE;
+            let sql = format!(
                 "SELECT a.id
                    FROM assets a
                    JOIN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?1
                           ORDER BY bm25(assets_fts) LIMIT 200) f ON f.rowid = a.id
-                  WHERE a.deleted_at IS NULL",
-            )?;
+                  WHERE a.deleted_at IS NULL AND {scope}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map([term.as_str()], |r| r.get::<_, i64>(0))?
                 .filter_map(|r| r.ok())
@@ -617,12 +620,14 @@ pub fn run_retriever(conn: &Connection, r: &Retriever) -> AppResult<Vec<i64>> {
             let Some(hit) = lookup.hits.into_iter().next() else {
                 return Ok(Vec::new());
             };
-            let mut stmt = conn.prepare(
+            let scope = super::libraries::VERIFIED_ASSET_SCOPE;
+            let sql = format!(
                 "SELECT a.id
                    FROM assets a JOIN asset_tags at ON at.asset_id = a.id
-                  WHERE at.tag_id = ?1 AND a.deleted_at IS NULL
-                  ORDER BY a.id DESC LIMIT 10",
-            )?;
+                  WHERE at.tag_id = ?1 AND a.deleted_at IS NULL AND {scope}
+                  ORDER BY a.id DESC LIMIT 10"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map([hit.tag_id], |r| r.get::<_, i64>(0))?
                 .filter_map(|r| r.ok())
@@ -1325,8 +1330,37 @@ mod tests {
     use crate::db::init_memory;
     use crate::db::{asset_tags, assets, tags};
 
+    fn verify_fixture(c: &Connection, asset_id: i64) -> i64 {
+        c.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(c).unwrap().unwrap();
+        c.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset_id
+            ],
+        )
+        .unwrap();
+        asset_id
+    }
     fn insert_asset(c: &Connection, path: &str) -> i64 {
-        assets::insert(c, path, "a.jpg", "jpg", 1024, "image/jpeg", 1700000000000).unwrap()
+        let id =
+            assets::insert(c, path, "a.jpg", "jpg", 1024, "image/jpeg", 1700000000000).unwrap();
+        verify_fixture(c, id)
     }
     fn tag(c: &Connection, facet: &str, name: &str) -> i64 {
         tags::create_in_facet(c, name, None, Some(facet))
@@ -1463,8 +1497,8 @@ mod tests {
         // 每个分面 EXISTS 片段应各出现一次（含后代子查询体只出现一次）
         assert_eq!(
             compiled.sql.matches("EXISTS").count(),
-            1 + 2,
-            "filter 1 + should 2 各一次"
+            1 + 1 + 2,
+            "managed scope 1 + filter 1 + should 2 各一次"
         );
     }
 
@@ -1545,7 +1579,7 @@ mod tests {
         c
     }
     fn s4_asset(c: &Connection, file_name: &str) -> i64 {
-        assets::insert(
+        let id = assets::insert(
             c,
             &format!("d:/{file_name}"),
             file_name,
@@ -1554,7 +1588,8 @@ mod tests {
             "image/jpeg",
             1700000000000,
         )
-        .unwrap()
+        .unwrap();
+        verify_fixture(c, id)
     }
 
     /// S4：TagAlias 检索 —— 搜「海滨」经 tag_terms 命中「海边」→ 返回其素材。
@@ -2338,7 +2373,8 @@ mod tests {
     /// 唯一 file_name 的素材插入（通用 insert_asset 的 file_name 恒为 "a.jpg"，
     /// 会触发 set_facet_number 的同源扇出把值写到所有素材上 —— 数值测试必须唯一）。
     fn insert_asset_named(c: &Connection, path: &str, name: &str) -> i64 {
-        assets::insert(c, path, name, "jpg", 1024, "image/jpeg", 1700000000000).unwrap()
+        let id = assets::insert(c, path, name, "jpg", 1024, "image/jpeg", 1700000000000).unwrap();
+        verify_fixture(c, id)
     }
 
     /// 编译层基础：gte / eq / between 三种 op 各自正确过滤（EXISTS 对 asset_facet_numbers）。

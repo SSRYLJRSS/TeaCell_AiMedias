@@ -661,6 +661,11 @@ pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
         s.ai.normalize();
         normalize_appearance(&mut s);
         normalize_log_level(&mut s);
+        if let Ok(Some(library)) = super::libraries::current(conn) {
+            if !library.root_path.trim().is_empty() {
+                s.library_root = library.root_path;
+            }
+        }
         return Ok(s);
     }
     let mut d = Settings::default();
@@ -669,10 +674,18 @@ pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
 }
 
 pub fn save_settings(conn: &Connection, s: &Settings) -> AppResult<()> {
+    let mut persisted = s.clone();
+    // The managed library locator is authoritative. Generic settings writers
+    // cannot silently replace it; only the maintenance/configuration service may.
+    if let Ok(Some(library)) = super::libraries::current(conn) {
+        if !library.root_path.trim().is_empty() {
+            persisted.library_root = library.root_path;
+        }
+    }
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![KEY, serde_json::to_string(s)?],
+        rusqlite::params![KEY, serde_json::to_string(&persisted)?],
     )?;
     Ok(())
 }
@@ -982,6 +995,28 @@ mod tests {
         assert_eq!(value["libraryRoot"], "D:/my-library");
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["futureField"]["keep"], true);
+    }
+
+    #[test]
+    fn empty_library_locator_does_not_erase_legacy_settings_root() {
+        let conn = crate::db::init_memory().unwrap();
+        let settings = Settings {
+            library_root: "D:/legacy-library".into(),
+            ..Default::default()
+        };
+        save_settings(&conn, &settings).unwrap();
+
+        assert_eq!(
+            get_settings(&conn).unwrap().library_root,
+            "D:/legacy-library"
+        );
+        let raw: String = conn
+            .query_row("SELECT value FROM settings WHERE key=?1", [KEY], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["libraryRoot"], "D:/legacy-library");
     }
 
     #[test]

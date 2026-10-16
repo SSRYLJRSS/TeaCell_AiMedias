@@ -1,14 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/api/plans", () => ({ getOperation: vi.fn() }));
 import {
   useTaskStore,
   importOverall,
   upsertImport,
   clearActiveImportTask,
+  trackImportOperation,
 } from "@/stores/taskStore";
-import type { ImportProgress } from "@/api/import";
+import type { ImportProgress } from "@/types/import";
+import type { OperationSnapshot } from "@/types/plans";
+import { getOperation } from "@/api/plans";
 
 beforeEach(() => {
-  useTaskStore.setState({ tasks: [] });
+  useTaskStore.setState({ tasks: [], operationSnapshots: {} });
 });
 
 afterEach(() => {
@@ -129,5 +133,172 @@ describe("全局任务条（taskStore）", () => {
       expect(overall).toBeGreaterThanOrEqual(prev);
       prev = overall;
     }
+  });
+
+  it("固定计划事件按 operationId 归组，单步 done 不会结束整个操作", () => {
+    upsertImport(ev({ taskId: "step-a", operationId: "op-1", phase: "processing", phaseCurrent: 2, phaseTotal: 5 }));
+    upsertImport(ev({ taskId: "step-b", operationId: "op-1", phase: "done", phaseCurrent: 5, phaseTotal: 5 }));
+
+    const tasks = useTaskStore.getState().tasks;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe("op-1");
+    expect(tasks[0].done).toBe(false);
+    expect(tasks[0].importProgress?.phase).toBe("done");
+  });
+
+  it("持久操作完成态按 operationId 更新并保留失败结果", () => {
+    const snapshot: OperationSnapshot = {
+      schemaVersion: 1,
+      operationId: "op-terminal",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 3,
+      state: "partially_succeeded",
+      phase: "complete",
+      completed: 4,
+      failed: 1,
+      total: 5,
+      canCancel: false,
+      canResume: false,
+    };
+    trackImportOperation(snapshot);
+
+    const task = useTaskStore.getState().tasks[0];
+    expect(task.id).toBe("op-terminal");
+    expect(task.done).toBe(true);
+    expect(task.operationSnapshot).toEqual(snapshot);
+    expect(task.error).toContain("部分完成");
+    expect(getOperation).not.toHaveBeenCalled();
+  });
+
+  it("新任务替换完成条时仍保留旧 operation 的最新持久快照", () => {
+    const terminal: OperationSnapshot = {
+      schemaVersion: 1,
+      operationId: "op-preserved",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 4,
+      state: "succeeded",
+      phase: "complete",
+      completed: 2,
+      failed: 0,
+      total: 2,
+      canCancel: false,
+      canResume: false,
+    };
+    trackImportOperation(terminal);
+
+    upsertImport(ev({ operationId: "op-next", phase: "processing", phaseCurrent: 1, phaseTotal: 3 }));
+
+    expect(useTaskStore.getState().tasks.map((task) => task.id)).toEqual(["op-next"]);
+    expect(useTaskStore.getState().operationSnapshots[terminal.operationId]).toEqual(terminal);
+  });
+
+  it("已移除终态操作收到迟到导入进度时不复活旧任务卡", () => {
+    const terminal: OperationSnapshot = {
+      schemaVersion: 1,
+      operationId: "op-removed-terminal",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 4,
+      state: "succeeded",
+      phase: "complete",
+      completed: 2,
+      failed: 0,
+      total: 2,
+      canCancel: false,
+      canResume: false,
+    };
+    trackImportOperation(terminal);
+    upsertImport(ev({ operationId: "op-next-active", phase: "processing", phaseCurrent: 1, phaseTotal: 3 }));
+
+    upsertImport(ev({ operationId: terminal.operationId, phase: "processing", phaseCurrent: 0, phaseTotal: 2 }));
+
+    expect(useTaskStore.getState().tasks.map((task) => task.id)).toEqual(["op-next-active"]);
+    expect(useTaskStore.getState().operationSnapshots[terminal.operationId]).toEqual(terminal);
+  });
+
+  it("活动操作只按自己的 operationRef 轮询", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getOperation).mockResolvedValue({
+      schemaVersion: 1,
+      operationId: "op-exact",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 2,
+      state: "succeeded",
+      phase: "complete",
+      completed: 1,
+      failed: 0,
+      total: 1,
+      canCancel: false,
+      canResume: false,
+    });
+    trackImportOperation({
+      schemaVersion: 1,
+      operationId: "op-exact",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 1,
+      state: "running",
+      phase: "executing",
+      completed: 0,
+      failed: 0,
+      total: 1,
+      canCancel: true,
+      canResume: false,
+    });
+
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(getOperation).toHaveBeenCalledWith("op-exact");
+    expect(useTaskStore.getState().tasks[0].operationSnapshot?.state).toBe("succeeded");
+  });
+
+  it("恢复后的新快照不被迟到旧终态覆盖，且在途旧查询结束后继续轮询", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getOperation).mockClear();
+    let finishOldRead!: (snapshot: OperationSnapshot) => void;
+    vi.mocked(getOperation)
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOldRead = resolve; }))
+      .mockImplementation(() => new Promise(() => {}));
+
+    const running: OperationSnapshot = {
+      schemaVersion: 1,
+      operationId: "op-resume-race",
+      library: { libraryId: "lib-1", libraryEpoch: "epoch-1" },
+      revision: 8,
+      state: "running",
+      phase: "executing",
+      completed: 1,
+      failed: 0,
+      total: 2,
+      canCancel: true,
+      canResume: false,
+    };
+    trackImportOperation(running);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getOperation).toHaveBeenCalledTimes(1);
+
+    const resumed: OperationSnapshot = {
+      ...running,
+      revision: 9,
+      state: "queued",
+      phase: "ready",
+      canCancel: true,
+      canResume: false,
+    };
+    trackImportOperation(resumed);
+    await vi.advanceTimersByTimeAsync(0);
+    finishOldRead({
+      ...running,
+      revision: 7,
+      state: "interrupted",
+      phase: "reconciling",
+      canCancel: false,
+      canResume: true,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(useTaskStore.getState().operationSnapshots[resumed.operationId]).toEqual(resumed);
+    expect(useTaskStore.getState().tasks[0].operationSnapshot).toEqual(resumed);
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(getOperation).toHaveBeenCalledTimes(2);
   });
 });

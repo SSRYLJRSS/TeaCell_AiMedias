@@ -6,6 +6,7 @@ dist/
 
 # Rust / Tauri 构建产物
 /target/
+**/target/
 src-tauri/target*/
 src-tauri/gen/
 

@@ -27,6 +27,7 @@ import { listAiConnections, getAiUsageBindings, getSuperSearchServiceResolution,
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
+import LegacyAssetPanel from "@/components/settings/LegacyAssetPanel";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { useSelectionStore } from "@/stores/selectionStore";
@@ -1197,6 +1198,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{dimResult}</p>
               )}
               {/* W5c：数据库备份/恢复（指导书 §W5c）——你的库唯一的副本入口 */}
+            </Group>
+            <Group title="历史库外记录">
+              <LegacyAssetPanel />
             </Group>
             <Group title="备份与恢复">
               <Field

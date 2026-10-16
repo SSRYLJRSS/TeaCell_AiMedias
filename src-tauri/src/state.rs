@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use rusqlite::Connection;
 
 use crate::db::schema_features::SchemaFeatureStatus;
+use crate::services::agent_runtime::AgentRuntime;
 use crate::services::ollama_runtime::OllamaRuntimeState;
+use crate::services::operations::OperationQueue;
 
 /// Database connection access is serialized with a lifecycle gate.
 /// Ordinary callers take a shared lifecycle lease plus the connection mutex;
@@ -131,10 +133,15 @@ impl DatabaseMaintenanceGuard<'_> {
 
 pub struct AppState {
     pub db: Arc<Database>,
+    /// One Rust-owned Pi Host process; actual network access remains disabled until A3-02.
+    pub agent_runtime: AgentRuntime,
     /// 应用数据目录（$APP_DATA_DIR/bagertea_ai_media_v2）
     pub data_dir: PathBuf,
-    /// 入库取消标志
-    pub import_cancel: Arc<AtomicBool>,
+    /// 本次 GUI 运行实例的可信身份，不能来自前端参数。
+    pub authorization_instance_id: String,
+    /// 本次 WebView 会话身份；应用重启后重新生成。
+    pub authorization_session_id: String,
+    pub import_prepare_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// W5c：入库进行中标志（restore_db 用它阻断恢复；取消标志语义不同，不能复用）
     pub import_running: Arc<AtomicBool>,
     /// 导出任务取消标志注册表（task_id → flag）
@@ -157,14 +164,19 @@ pub struct AppState {
     /// F1-e：schema_features 缓存（启动读一次，apply_tag_constraints 后刷新）。
     /// 命令层读它判断 tag_unique_terms 等能力是否生效（设置页展示 + feature gate）。
     pub schema_features: Arc<Mutex<Vec<SchemaFeatureStatus>>>,
+    /// A1-05：长业务任务单活动槽；查询、浏览和聊天不经过该队列。
+    pub operation_queue: Arc<OperationQueue>,
 }
 
 impl AppState {
     pub fn new(conn: Connection, data_dir: PathBuf) -> Self {
         Self {
             db: Arc::new(Database::new(conn)),
+            agent_runtime: AgentRuntime::default(),
             data_dir,
-            import_cancel: Arc::new(AtomicBool::new(false)),
+            authorization_instance_id: format!("instance_{}", uuid::Uuid::new_v4().simple()),
+            authorization_session_id: format!("session_{}", uuid::Uuid::new_v4().simple()),
+            import_prepare_cancels: Arc::new(Mutex::new(HashMap::new())),
             import_running: Arc::new(AtomicBool::new(false)),
             export_cancel: Arc::new(Mutex::new(HashMap::new())),
             ai_cancel: Arc::new(Mutex::new(HashMap::new())),
@@ -175,6 +187,7 @@ impl AppState {
             video_proxy_cancel: Arc::new(Mutex::new(HashMap::new())),
             ollama_runtime: Arc::new(Mutex::new(OllamaRuntimeState::new())),
             schema_features: Arc::new(Mutex::new(Vec::new())),
+            operation_queue: Arc::new(OperationQueue::default()),
         }
     }
 

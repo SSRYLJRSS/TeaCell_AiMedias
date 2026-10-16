@@ -27,7 +27,7 @@ export interface AiConnection {
   enabled: boolean;
 }
 
-export type AiUsage = "super_search" | "tagging";
+export type AiUsage = "super_search" | "tagging" | "agent";
 
 export interface SuperSearchServiceResolution {
   ready: boolean;
@@ -74,7 +74,7 @@ export function deleteAiConnection(id: string): Promise<void> {
   return invoke<void>("delete_ai_connection", { id });
 }
 
-/** 绑定用途 → 连接（null/空 = 解绑，回退默认档案）。修改一个用途不影响另一个（§6.2）。 */
+/** 绑定用途 → 连接（null/空 = 仅解绑）。每种用途的解析策略独立；Agent 不继承默认、搜索或打标服务。 */
 export function setAiUsageBinding(usage: AiUsage, connectionId: string | null): Promise<void> {
   return invoke<void>("set_ai_usage_binding", { usage, connectionId });
 }

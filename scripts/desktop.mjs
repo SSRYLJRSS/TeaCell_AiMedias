@@ -3,11 +3,12 @@
 /** Shared desktop entry point: target-specific native dependencies and bundled media tools. */
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyHeifCache } from "./heif-contract.mjs";
+import { assertProductIdentity } from "./product-identity.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tauri = join(root, "src-tauri");
@@ -46,6 +47,11 @@ function validateVersions() {
   const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
   const tauriConfig = JSON.parse(readFileSync(join(tauri, "tauri.conf.json"), "utf8"));
   const cargoToml = readFileSync(join(tauri, "Cargo.toml"), "utf8");
+  try {
+    assertProductIdentity(packageJson, tauriConfig, cargoToml);
+  } catch (error) {
+    die(`产品名称校验失败：${error.message}`);
+  }
   const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
   const versions = [packageJson.version, tauriConfig.version, cargoVersion];
   if (versions.some((version) => !version) || new Set(versions).size !== 1) {
@@ -124,14 +130,37 @@ function prepareHeifLibraries(target) {
   }
 }
 
-function runTauri(mode, target, passthrough, env) {
+function prepareAgentHost(target) {
+  if (target !== "x86_64-pc-windows-msvc") return null;
+  const script = join(root, "scripts", "prepare-agent-host.mjs");
+  const result = spawnSync(process.execPath, [script, "--target", target], {
+    cwd: root,
+    encoding: "utf8",
+    env: process.env,
+  });
+  if (result.error || result.status !== 0) {
+    die(`Agent Host资源准备失败；请核对固定Node/Pi版本、Node归档、许可证和依赖：${(result.stderr ?? "").trim()}`);
+  }
+  let prepared;
+  try { prepared = JSON.parse((result.stdout ?? "").trim()); }
+  catch { die("Agent Host资源准备结果无效"); }
+  if (!prepared.overlay || !existsSync(prepared.overlay)) die("Agent Host Tauri资源overlay未生成");
+  console.log(`[desktop] agent-host resources: ${prepared.agentFileCount} files, ${prepared.agentResourceBytes} bytes`);
+  console.log(`[desktop] Visual C++ runtime: ${prepared.vcRuntimeVersion}, ${prepared.vcRuntimeFileCount} files, ${prepared.vcRuntimeBytes} bytes`);
+  console.log(`[desktop] agent-host overlay: ${prepared.overlay}`);
+  return prepared.overlay;
+}
+
+function runTauri(mode, target, passthrough, env, agentHostOverlay) {
   const cli = join(root, "node_modules", "@tauri-apps", "cli", "tauri.js");
   if (!existsSync(cli)) die("Tauri CLI 缺失，请先运行 npm ci");
   const args = [mode, "--target", target];
-  if (mode === "build") args.push("--config", "src-tauri/tauri.sidecar.conf.json");
+  if (mode === "build") args.push("--config", agentHostOverlay ?? "src-tauri/tauri.sidecar.conf.json");
   args.push(...passthrough);
   const buildLogPath = mode === "build" ? process.env.CANDIDATE_BUILD_LOG : null;
   const captureOutput = Boolean(buildLogPath);
+  const buildRecordPath = join(root, "artifacts", "agent-host-build", "last-successful-desktop-build.json");
+  if (mode === "build" && agentHostOverlay) rmSync(buildRecordPath, { force: true });
   const result = spawnSync(process.execPath, [cli, ...args], {
     cwd: root,
     stdio: captureOutput ? ["inherit", "pipe", "pipe"] : "inherit",
@@ -154,6 +183,10 @@ function runTauri(mode, target, passthrough, env) {
     if (stderr) process.stderr.write(stderr);
   }
   if (result.error || result.status !== 0) die(`tauri ${mode} 失败（${result.error?.message ?? result.status ?? "signal"}）`);
+  if (mode === "build" && agentHostOverlay) {
+    mkdirSync(dirname(buildRecordPath), { recursive: true });
+    writeFileSync(buildRecordPath, `${JSON.stringify({ schemaVersion: 1, target, overlay: agentHostOverlay }, null, 2)}\n`, { flag: "wx" });
+  }
 }
 
 function main() {
@@ -194,9 +227,10 @@ function main() {
   if (effectiveStrict && sidecars.some((item) => item.problems.length)) {
     die(`严格校验失败；先运行 npm run prepare-media-tools -- --target ${target}`);
   }
+  const agentHostOverlay = prepareAgentHost(target);
   if (mode === "check") return;
   if (!heifCurrent) die(`HEIF 原生依赖校验失败；先运行 npm run prepare-heif-libraries -- --target ${target}`);
-  runTauri(mode, target, passthrough, configureTargetEnv(target));
+  runTauri(mode, target, passthrough, configureTargetEnv(target), agentHostOverlay);
 }
 
 main();

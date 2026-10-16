@@ -4,11 +4,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
-use bagertea_ai_media_v2_lib::db::{self, assets, export};
-use bagertea_ai_media_v2_lib::error::AppResult;
-use bagertea_ai_media_v2_lib::services::{export_local, importer, thumbnail::ThumbnailService};
-use bagertea_ai_media_v2_lib::state::Database;
+use teacell_ai_media_manager_lib::db::assets::AssetFilter;
+use teacell_ai_media_manager_lib::db::{self, assets, export};
+use teacell_ai_media_manager_lib::error::AppResult;
+use teacell_ai_media_manager_lib::services::{export_local, importer, thumbnail::ThumbnailService};
+use teacell_ai_media_manager_lib::state::Database;
 
 fn default_import_options(temp_dir: &std::path::Path) -> AppResult<importer::ImportOptions> {
     let library_root = temp_dir.join("library");

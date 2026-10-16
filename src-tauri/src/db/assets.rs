@@ -1,13 +1,18 @@
 //! 素材仓储：CRUD + 分页查询（类型/未打标/标签树/搜索 四路筛选，标签聚合返回）
 
-use rusqlite::{types::Value, Connection, Row};
+use rusqlite::{types::Value, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use super::search_query::MetadataFilter;
 use super::search_query::{self};
 use super::sql_utils::offset_placeholders;
-use super::{search, tags::Tag, tags::FACET_EFFECTIVE};
+use super::{
+    libraries::{self, VERIFIED_ASSET_SCOPE},
+    search,
+    tags::Tag,
+    tags::FACET_EFFECTIVE,
+};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,10 +141,33 @@ pub struct PaletteStatus {
 /// 幂等可重复执行；返回写入行数。
 pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM asset_palette_colors", [])?;
+    // V23 runs before the V27 protection tables exist. Keep that historical
+    // migration path able to rebuild the derived table, while all runtime
+    // rebuilds only touch the currently verified managed scope.
+    let managed_scope = {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type='table' AND name IN ('libraries','managed_asset_locations')",
+            [],
+            |row| row.get(0),
+        )?;
+        (count == 2).then_some(VERIFIED_ASSET_SCOPE)
+    };
+    let scope_filter = managed_scope
+        .map(|scope| format!(" AND {scope}"))
+        .unwrap_or_default();
+    tx.execute(
+        &format!(
+            "DELETE FROM asset_palette_colors
+              WHERE asset_id IN (SELECT a.id FROM assets a WHERE 1=1{scope_filter})"
+        ),
+        [],
+    )?;
     let rows: Vec<(i64, Option<String>)> = {
-        let mut stmt =
-            tx.prepare("SELECT id, palette_json FROM assets WHERE deleted_at IS NULL")?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT a.id, a.palette_json FROM assets a
+              WHERE a.deleted_at IS NULL{scope_filter}"
+        ))?;
         let r = stmt
             .query_map([], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
@@ -171,18 +199,19 @@ pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
 const PRIMARY_COLOR_MIN_RATIO: f64 = 0.10;
 
 fn primary_color_items(conn: &Connection) -> AppResult<Vec<MetadataFacetItem>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT color_bucket, COUNT(*) AS count
            FROM (
-             SELECT asset_id, color_bucket
-               FROM asset_palette_colors
-              WHERE rank < 3
-              GROUP BY asset_id, color_bucket
+             SELECT apc.asset_id, apc.color_bucket
+               FROM asset_palette_colors apc
+               JOIN assets a ON a.id = apc.asset_id
+              WHERE apc.rank < 3 AND {VERIFIED_ASSET_SCOPE}
+              GROUP BY apc.asset_id, apc.color_bucket
              HAVING SUM(ratio) >= ?1
            )
           GROUP BY color_bucket
-          ORDER BY count DESC, color_bucket",
-    )?;
+          ORDER BY count DESC, color_bucket"
+    ))?;
     let rows = stmt.query_map([PRIMARY_COLOR_MIN_RATIO], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -428,6 +457,7 @@ fn build_where(
     } else {
         cond.push_str(" AND a.deleted_at IS NULL");
     }
+    cond.push_str(&format!(" AND {VERIFIED_ASSET_SCOPE}"));
     // 布尔表达式树分支（P4 query_expr）：有 expr 时以表达式为准，忽略扁平字段。
     // 此处仅追加 expr 编译片段；回收站隔离已在上方作为基础条件。
     if let Some(expr) = &filter.expr {
@@ -708,6 +738,16 @@ pub fn list_ids(conn: &Connection, filter: &AssetFilter) -> AppResult<Vec<i64>> 
     Ok(ids)
 }
 
+/// Maintenance callers that already hold the trusted operation context can use
+/// this fixed scope without rebuilding an AssetFilter.
+pub fn list_managed_ids(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a WHERE {VERIFIED_ASSET_SCOPE} ORDER BY a.id"
+    ))?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub fn list(conn: &Connection, filter: &AssetFilter) -> AppResult<AssetPage> {
     filter.validate()?;
     let search_pred = build_search_predicate(conn, filter)?;
@@ -750,7 +790,9 @@ pub(crate) fn by_ids_ordered(conn: &Connection, ids: &[i64]) -> AppResult<Vec<As
         return Ok(Vec::new());
     }
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT {COLUMNS} FROM assets a WHERE a.id IN ({placeholders})");
+    let sql = format!(
+        "SELECT {COLUMNS} FROM assets a WHERE a.id IN ({placeholders}) AND {VERIFIED_ASSET_SCOPE}"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let mut items: Vec<Asset> = stmt
         .query_map(rusqlite::params_from_iter(ids.iter()), from_row)?
@@ -771,7 +813,7 @@ fn metadata_items(
     let sql = format!(
         "SELECT {value_expr} AS value, {label_expr} AS label, COUNT(*) AS count
            FROM assets a
-          WHERE a.deleted_at IS NULL AND {present_expr}
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE} AND {present_expr}
           GROUP BY value
           ORDER BY count DESC, label COLLATE NOCASE
           LIMIT 80"
@@ -938,7 +980,9 @@ fn list_folder_items(
     conn: &Connection,
     library_root: Option<&str>,
 ) -> AppResult<Vec<MetadataFacetItem>> {
-    let mut stmt = conn.prepare("SELECT file_path FROM assets WHERE deleted_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.file_path FROM assets a WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let paths = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1061,6 +1105,19 @@ pub fn get(conn: &Connection, id: i64) -> AppResult<Asset> {
     Ok(asset)
 }
 
+/// Ordinary file resolution must not expose assets that lost managed ownership.
+pub fn get_managed(conn: &Connection, id: i64) -> AppResult<Asset> {
+    let mut asset = conn.query_row(
+        &format!("SELECT {COLUMNS} FROM assets a WHERE a.id = ?1 AND {VERIFIED_ASSET_SCOPE}"),
+        [id],
+        from_row,
+    )?;
+    let mut items = vec![asset.clone()];
+    fill_tags(conn, &mut items)?;
+    asset.tags = items.pop().map(|a| a.tags).unwrap_or_default();
+    Ok(asset)
+}
+
 // 8 参数为素材入库字段的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
 #[allow(clippy::too_many_arguments)]
 pub fn insert(
@@ -1098,7 +1155,10 @@ pub fn soft_delete(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let now = chrono::Utc::now().timestamp_millis();
     let n = conn.execute(
-        &format!("UPDATE assets SET deleted_at = ?1 WHERE id IN ({list}) AND deleted_at IS NULL"),
+        &format!(
+            "UPDATE assets AS a SET deleted_at = ?1
+              WHERE a.id IN ({list}) AND a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
         [now],
     )?;
     Ok(n as u64)
@@ -1112,7 +1172,8 @@ pub fn restore(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let n = conn.execute(
         &format!(
-            "UPDATE assets SET deleted_at = NULL WHERE id IN ({list}) AND deleted_at IS NOT NULL"
+            "UPDATE assets AS a SET deleted_at = NULL
+              WHERE a.id IN ({list}) AND a.deleted_at IS NOT NULL AND {VERIFIED_ASSET_SCOPE}"
         ),
         [],
     )?;
@@ -1121,9 +1182,11 @@ pub fn restore(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
 
 /// R-22 查超期回收站项（deleted_at < cutoff），返回 (id, file_path) 供锁外删文件
 pub fn list_expired_trash(conn: &Connection, cutoff_ms: i64) -> AppResult<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path FROM assets WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_path FROM assets a
+          WHERE a.deleted_at IS NOT NULL AND a.deleted_at < ?1
+            AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let rows = stmt.query_map([cutoff_ms], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -1172,6 +1235,33 @@ pub fn find_by_path(conn: &Connection, file_path: &str) -> AppResult<Option<i64>
     let mut stmt = conn.prepare("SELECT id FROM assets WHERE file_path = ?1")?;
     let mut rows = stmt.query([file_path])?;
     Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+}
+
+pub fn find_managed_by_path(conn: &Connection, file_path: &str) -> AppResult<Option<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a WHERE a.file_path = ?1 AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
+    let mut rows = stmt.query([file_path])?;
+    Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+}
+
+/// Return the durable library registration at an exact managed path together
+/// with its stored dedup digest. Startup import recovery uses this to tell a
+/// published file whose asset row was committed from one awaiting registration.
+pub fn managed_registration_by_path(
+    conn: &Connection,
+    file_path: &str,
+) -> AppResult<Option<(i64, Option<String>, bool)>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT a.id,a.hash,CASE WHEN {VERIFIED_ASSET_SCOPE} THEN 1 ELSE 0 END
+                   FROM assets a WHERE a.file_path=?1"
+            ),
+            [file_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+        )
+        .optional()?)
 }
 
 /// 媒体探测回写（指导书 §7.4/§7.5）：结构字段 + metadata_scanned_at / metadata_error。
@@ -1227,22 +1317,23 @@ pub fn update_media_metadata(conn: &Connection, id: i64, m: &MediaProbeUpdate) -
 
 /// 列出缺少媒体元数据的视频（用于「仅缺字段」回填范围）。视频 = MIME video/* 或已有 duration。
 pub fn list_video_ids_needing_metadata(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM assets
-          WHERE deleted_at IS NULL
-            AND (mime_type LIKE 'video/%' OR duration_ms IS NOT NULL)
-            AND (duration_ms IS NULL OR video_codec IS NULL)",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND (a.mime_type LIKE 'video/%' OR a.duration_ms IS NOT NULL)
+            AND (a.duration_ms IS NULL OR a.video_codec IS NULL)"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// 列出全部视频的 id（用于「全部视频」回填范围）。
 pub fn list_video_ids(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM assets
-          WHERE deleted_at IS NULL AND (mime_type LIKE 'video/%' OR duration_ms IS NOT NULL)",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND (a.mime_type LIKE 'video/%' OR a.duration_ms IS NOT NULL)"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -1251,19 +1342,22 @@ pub fn list_video_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 /// 图片缺 latitude / taken_at（R0-2：JPG 拍摄时间解析修复前全部为空，需补）；
 /// 视频缺 latitude / taken_at（两者任一缺失即需补）。
 pub fn list_ids_needing_geo_taken(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM assets
-          WHERE deleted_at IS NULL
-            AND ((mime_type LIKE 'image/%' AND (latitude IS NULL OR taken_at IS NULL))
-              OR (mime_type LIKE 'video/%' AND (latitude IS NULL OR taken_at IS NULL)))",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND ((a.mime_type LIKE 'image/%' AND (a.latitude IS NULL OR a.taken_at IS NULL))
+              OR (a.mime_type LIKE 'video/%' AND (a.latitude IS NULL OR a.taken_at IS NULL)))"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// 定位回填 scope=all：全部未删除素材（不复用色板候选谓词，避免漏掉无封面视频）。
 pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM assets WHERE deleted_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -1278,6 +1372,7 @@ pub fn set_rating(conn: &Connection, ids: &[i64], rating: i64) -> AppResult<u64>
     if !(0..=5).contains(&rating) {
         return Err(AppError::msg("评级只允许 0–5（0 = 清除）"));
     }
+    libraries::ensure_managed_assets(conn, ids)?;
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let n = conn.execute(
         &format!("UPDATE assets SET rating = ?1 WHERE id IN ({list})"),
@@ -1294,6 +1389,7 @@ pub fn set_user_rotation(conn: &Connection, ids: &[i64], rotation: i64) -> AppRe
     if ![0, 90, 180, 270].contains(&rotation) {
         return Err(AppError::msg("旋转角只允许 0/90/180/270"));
     }
+    libraries::ensure_managed_assets(conn, ids)?;
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let n = conn.execute(
         &format!("UPDATE assets SET user_rotation = ?1 WHERE id IN ({list})"),
@@ -1304,12 +1400,12 @@ pub fn set_user_rotation(conn: &Connection, ids: &[i64], rotation: i64) -> AppRe
 
 /// W1-4：图片宽高缺失候选（RAW 无法被 image_dimensions 解码的历史存量）。
 pub fn list_ids_needing_dimensions(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM assets
-          WHERE deleted_at IS NULL
-            AND mime_type LIKE 'image/%'
-            AND (width IS NULL OR height IS NULL)",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND a.mime_type LIKE 'image/%'
+            AND (a.width IS NULL OR a.height IS NULL)"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -1360,6 +1456,27 @@ pub fn hash_exists(conn: &Connection, hash: &str) -> AppResult<bool> {
         r.get(0)
     })?;
     Ok(n > 0)
+}
+
+/// Duplicate imports may only be suppressed by an asset that is still verified
+/// in the current managed library generation.
+pub fn hash_exists_managed(conn: &Connection, hash: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM assets a WHERE a.hash = ?1 AND {VERIFIED_ASSET_SCOPE}"),
+        [hash],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Duplicate mapping: the asset id that already owns this content hash in the
+/// current verified library generation, if any.
+pub fn find_managed_by_hash(conn: &Connection, hash: &str) -> AppResult<Option<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a WHERE a.hash = ?1 AND {VERIFIED_ASSET_SCOPE} ORDER BY a.id LIMIT 1"
+    ))?;
+    let mut rows = stmt.query([hash])?;
+    Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
 }
 
 pub fn set_placeholder_path(conn: &Connection, id: i64, path: &str) -> AppResult<()> {
@@ -1425,21 +1542,25 @@ pub fn set_palette(
 /// 只取图片，以及有 hd 封面的视频 —— 视频的 placeholder 可能是 write_generic 写的
 /// 纯 UI 占位图（暖灰底 + 品牌蓝块，thumbnail.rs），拿它算"主色"会写进一个
 /// 与素材无关的 dominant_hue，污染按颜色检索（FX-13）。
-const PALETTE_CANDIDATE_PRED: &str = "deleted_at IS NULL AND (\
-       mime_type LIKE 'image/%' \
-    OR (mime_type LIKE 'video/%' AND hd_thumbnail_path IS NOT NULL))";
+const PALETTE_CANDIDATE_PRED: &str = "a.deleted_at IS NULL AND (\
+       a.mime_type LIKE 'image/%' \
+    OR (a.mime_type LIKE 'video/%' AND a.hd_thumbnail_path IS NOT NULL))";
 
 /// FB4-03（§5.3）：色板状态统计。只取计数所需字段（候选行仅查询 palette_json，
 /// 不构造完整 Asset）；ready 在 Rust 侧逐行调用 parse_palette_json 精确统计，
 /// 不能只用 `palette_json IS NOT NULL` 近似（损坏 JSON / 空数组会被误判为已生成）。
 pub fn get_palette_status(conn: &Connection) -> AppResult<PaletteStatus> {
     let total_assets: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL",
+        &format!(
+            "SELECT COUNT(*) FROM assets a
+              WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
         [],
         |r| r.get(0),
     )?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT palette_json FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
+        "SELECT a.palette_json FROM assets a
+          WHERE {PALETTE_CANDIDATE_PRED} AND {VERIFIED_ASSET_SCOPE}"
     ))?;
     let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
     let mut eligible: i64 = 0;
@@ -1466,7 +1587,8 @@ pub fn get_palette_status(conn: &Connection) -> AppResult<PaletteStatus> {
 /// 与状态统计共用同一 parser 与候选谓词，杜绝「状态说 missing>0，回算却 total=0」。
 pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, palette_json FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
+        "SELECT a.id, a.palette_json FROM assets a
+          WHERE {PALETTE_CANDIDATE_PRED} AND {VERIFIED_ASSET_SCOPE}"
     ))?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
@@ -1486,16 +1608,20 @@ pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
 pub fn list_ids_needing_phash(conn: &Connection, scope: &str, ids: &[i64]) -> AppResult<Vec<i64>> {
     match scope {
         "missing" => {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%' AND phash IS NULL",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT a.id FROM assets a
+                  WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+                    AND a.mime_type LIKE 'image/%' AND a.phash IS NULL"
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.filter_map(|r| r.ok()).collect())
         }
         "all" => {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT a.id FROM assets a
+                  WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+                    AND a.mime_type LIKE 'image/%'"
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.filter_map(|r| r.ok()).collect())
         }
@@ -1505,7 +1631,9 @@ pub fn list_ids_needing_phash(conn: &Connection, scope: &str, ids: &[i64]) -> Ap
             }
             let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
             let mut stmt = conn.prepare(&format!(
-                "SELECT id FROM assets WHERE id IN ({list}) AND mime_type LIKE 'image/%'"
+                "SELECT a.id FROM assets a
+                  WHERE a.id IN ({list}) AND {VERIFIED_ASSET_SCOPE}
+                    AND a.mime_type LIKE 'image/%'"
             ))?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1531,8 +1659,9 @@ pub fn get_asset_palette_patches(
         .collect::<Vec<_>>()
         .join(",");
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, palette_json, dominant_hue, dominant_sat, dominant_lum
-           FROM assets WHERE id IN ({placeholders})"
+        "SELECT a.id, a.palette_json, a.dominant_hue, a.dominant_sat, a.dominant_lum
+           FROM assets a
+          WHERE a.id IN ({placeholders}) AND {VERIFIED_ASSET_SCOPE}"
     ))?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
         Ok(AssetPalettePatch {
@@ -1550,7 +1679,8 @@ pub fn get_asset_palette_patches(
 /// 语义是"全部可算色板的素材"而非"全部素材"：与 list_ids_needing_palette 同谓词（FX-13）。
 pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
+        "SELECT a.id FROM assets a
+          WHERE {PALETTE_CANDIDATE_PRED} AND {VERIFIED_ASSET_SCOPE}"
     ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1558,8 +1688,11 @@ pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 
 /// 列出全部未删除图片，用于图片尺寸回填的 all 范围。
 pub fn list_image_ids(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn
-        .prepare("SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND a.mime_type LIKE 'image/%'"
+    ))?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
@@ -1588,13 +1721,25 @@ pub fn update_file_path_and_name(
 
 /// B27：清空所有素材的占位图路径（清缓存时回写 DB，避免 DB 指向已删文件）
 pub fn clear_all_placeholder_paths(conn: &Connection) -> AppResult<()> {
-    conn.execute("UPDATE assets SET placeholder_path = NULL", [])?;
+    conn.execute(
+        &format!(
+            "UPDATE assets AS a SET placeholder_path = NULL
+              WHERE {VERIFIED_ASSET_SCOPE}"
+        ),
+        [],
+    )?;
     Ok(())
 }
 
 /// B27：清空所有素材的高清缩略图路径（清缓存时回写 DB）
 pub fn clear_all_hd_thumbnail_paths(conn: &Connection) -> AppResult<()> {
-    conn.execute("UPDATE assets SET hd_thumbnail_path = NULL", [])?;
+    conn.execute(
+        &format!(
+            "UPDATE assets AS a SET hd_thumbnail_path = NULL
+              WHERE {VERIFIED_ASSET_SCOPE}"
+        ),
+        [],
+    )?;
     Ok(())
 }
 
@@ -1603,11 +1748,12 @@ pub fn list_content_descriptions(
     conn: &Connection,
     limit: i64,
 ) -> AppResult<Vec<(i64, String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_name, content_description FROM assets
-          WHERE deleted_at IS NULL AND content_description IS NOT NULL AND content_description != ''
-          ORDER BY id LIMIT ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_name, a.content_description FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+            AND a.content_description IS NOT NULL AND a.content_description != ''
+          ORDER BY a.id LIMIT ?1"
+    ))?;
     let rows = stmt.query_map([limit], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -1623,11 +1769,41 @@ mod tests {
     use super::*;
 
     fn mem() -> Connection {
-        crate::db::init_memory().unwrap()
+        let conn = crate::db::init_memory().unwrap();
+        conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        conn
     }
 
     fn ins(c: &Connection, path: &str, mime: &str) -> i64 {
-        insert(c, path, "a", "jpg", 100, mime, 1).unwrap()
+        let id = insert(c, path, "a", "jpg", 100, mime, 1).unwrap();
+        mark_verified_fixture(c, id);
+        id
+    }
+
+    fn mark_verified_fixture(c: &Connection, id: i64) {
+        let library = crate::db::libraries::current(c).unwrap().unwrap();
+        c.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                id
+            ],
+        )
+        .unwrap();
     }
 
     /// FX-13：回算候选不含无封面视频，也不含非图非视频。

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use crate::db::{backup, init};
+use crate::db::{backup, init_for_restore};
 use crate::error::{AppError, AppResult};
 use crate::state::DatabaseMaintenanceGuard;
 
@@ -106,6 +106,7 @@ fn prepare_restore_with(
             "备份暂存副本校验失败，当前数据库未改动：{error}"
         )));
     }
+    crate::db::prepare_restored_copy(&staged_path)?;
 
     Ok(PreparedRestore {
         data_dir: data_dir.to_path_buf(),
@@ -119,7 +120,12 @@ pub fn install_prepared_restore(
     maintenance: &DatabaseMaintenanceGuard<'_>,
     prepared: PreparedRestore,
 ) -> AppResult<()> {
-    install_prepared_restore_under_gate(maintenance, &prepared, &mut SystemRestoreFileOps, init)
+    install_prepared_restore_under_gate(
+        maintenance,
+        &prepared,
+        &mut SystemRestoreFileOps,
+        init_for_restore,
+    )
 }
 
 fn install_prepared_restore_under_gate(
@@ -278,6 +284,12 @@ fn restore_old_copy(
             old_path.display()
         )));
     }
+    if let Err(error) = crate::db::prepare_restored_copy(&rollback_path) {
+        maintenance.block_access();
+        return Err(AppError::msg(format!(
+            "{cause}；回滚副本保护初始化失败：{error}。原库保留，数据库操作已封锁。"
+        )));
+    }
     if let Err(error) = ops.rename(&rollback_path, db_path) {
         if ops.exists(&rollback_path) {
             if let Err(cleanup_error) = ops.remove_file(&rollback_path) {
@@ -357,7 +369,7 @@ fn unique_path(data_dir: &Path, stem: &str, extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::assets;
+    use crate::db::{assets, init};
     use crate::state::Database;
     use std::io;
 
@@ -465,6 +477,38 @@ mod tests {
         drop(maintenance);
         assert!(data_dir.path().join("library.db.old").is_file());
         assert!(backup::validate_backup(&data_dir.path().join("library.db.old")).is_ok());
+    }
+
+    #[test]
+    fn public_restore_installs_fresh_unverified_locator_before_opening_access() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database = open_current_database(data_dir.path());
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("backup.db");
+        create_backup(&source, true);
+        let source_conn = Connection::open(&source).unwrap();
+        let old =
+            crate::db::libraries::initialize_candidate(&source_conn, "C:/fixture-root").unwrap();
+        drop(source_conn);
+        let prepared = prepare_restore(data_dir.path(), &source).unwrap();
+        let maintenance = database.maintenance().unwrap();
+        install_prepared_restore(&maintenance, prepared).unwrap();
+        let installed = maintenance
+            .with_connection(|conn| Ok(crate::db::libraries::current(conn)?.unwrap()))
+            .unwrap();
+        assert_eq!(installed.library_id, old.library_id);
+        assert_ne!(installed.library_epoch, old.library_epoch);
+        assert_eq!(
+            installed.health,
+            crate::db::libraries::LibraryHealth::Unverified
+        );
+        assert!(installed.root_identity.is_none());
+        assert_eq!(
+            maintenance
+                .with_connection(|conn| Ok(asset_count(conn)))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

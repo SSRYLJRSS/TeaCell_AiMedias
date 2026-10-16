@@ -19,7 +19,7 @@ import { useAppearance } from "@/hooks/useAppearance";
 import { CELL_STEPS } from "@/types/settings";
 import { currentAppearance, useSettingsStore } from "@/stores/settingsStore";
 import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
-import type { ImportPlan, ImportPlanItem } from "@/api/import";
+import type { ImportPlan, ImportPlanItem } from "@/types/import";
 
 type ViewMode = "list" | "grid";
 
@@ -29,9 +29,9 @@ export function formatSize(bytes: number): string {
   return `${Math.round(bytes / 1024)} KB`;
 }
 
-function fileName(path: string): string {
+function fileName(path: string, displayName?: string): string {
   // X-18：分隔符按平台判定，Unix 反斜杠是合法文件名字符
-  return displayBasename(path);
+  return displayName || displayBasename(path);
 }
 
 /** 懒加载缩略图：进入视口才请求，淡入过渡；失败显示类型占位。
@@ -60,7 +60,7 @@ function LazyThumb({ path, kind, className, fit = "cover" }: { path: string; kin
   }, []);
 
   useEffect(() => {
-    if (!visible) return;
+    if (!visible || !path) return;
     let cancelled = false;
     void getPreviewUrl(path).then((u) => {
       if (cancelled) return;
@@ -71,6 +71,10 @@ function LazyThumb({ path, kind, className, fit = "cover" }: { path: string; kin
       cancelled = true;
     };
   }, [visible, path]);
+
+  useEffect(() => {
+    if (!path) setFailed(true);
+  }, [path]);
 
   return (
     <div ref={ref} className={clsx("overflow-hidden bg-[var(--color-surface)]", className)}>
@@ -161,11 +165,12 @@ interface PendingItemProps {
   item: ImportPlanItem;
   running: boolean;
   onRemove: (path: string) => void;
+  onRemoveCandidate?: (item: ImportPlanItem) => void;
   onOpenItem: (path: string) => void;
 }
 
 /** §10 PendingItem：relative + 封面 absolute inset-0 + 视频层仅 active 挂载 + 角标 + 文件名 */
-function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) {
+function PendingItem({ item, running, onRemove, onRemoveCandidate, onOpenItem }: PendingItemProps) {
   const hover = useHoverIntent({ disabled: running });
   const cancelHover = hover.cancel;
   // FB2-02（§9.4）：入库网格卡片比例与填充沿用 appearance.grid（决策 4：一个设置管两页）
@@ -177,7 +182,7 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
     () => {
       /* 单击暂不动作（预览已在 hover 内） */
     },
-    () => onOpenItem(item.path),
+    () => { if (item.path) onOpenItem(item.path); },
   );
   // 入库开始：强制释放预览（视频层卸载 + pause）
   useEffect(() => {
@@ -197,7 +202,7 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
       {/* 封面/占位图 absolute inset-0（§10 结构；§9.2 基类不含 relative） */}
       <LazyThumb path={item.path} kind={item.kind} fit={fit} className="absolute inset-0" />
       {/* 视频层 absolute inset-0，仅 active 时挂载（快速扫过不创建实例） */}
-      {isVideo && hover.active && <PendingVideoLayer item={item} />}
+      {isVideo && Boolean(item.path) && hover.active && <PendingVideoLayer item={item} />}
       {/* 角标 */}
       {isVideo && (
         <span className="absolute top-1 left-1 rounded bg-black/55 px-1 py-0.5 text-[9px] text-white">视频</span>
@@ -212,8 +217,8 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
       )}
       {/* 文件名/错误原因 */}
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-3 pb-1">
-        <span className="min-w-0 flex-1 truncate text-[11px] text-white" title={item.path}>
-          {fileName(item.path)}
+        <span className="min-w-0 flex-1 truncate text-[11px] text-white" title={item.displayName || item.path}>
+          {fileName(item.path, item.displayName)}
         </span>
         <span className="shrink-0 text-[10px] text-white/70">{formatSize(item.size)}</span>
       </div>
@@ -222,7 +227,8 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
           aria-label="移除"
           onClick={(e) => {
             e.stopPropagation();
-            onRemove(item.path);
+            if (onRemoveCandidate) onRemoveCandidate(item);
+            else onRemove(item.path);
           }}
           className="absolute top-1 right-1 hidden h-5 w-5 items-center justify-center rounded-full bg-black/55 text-xs text-white transition-opacity group-hover:flex"
         >
@@ -254,6 +260,7 @@ interface PendingListProps {
   items: ImportPlan["items"];
   running: boolean;
   onRemove: (path: string) => void;
+  onRemoveCandidate?: (item: ImportPlanItem) => void;
   /** 添加文件（页面上层调用 API，本组件不直接 invoke） */
   onAddFiles?: () => void;
   /** 添加文件夹（目录选择器） */
@@ -269,6 +276,7 @@ export default function PendingList({
   items,
   running,
   onRemove,
+  onRemoveCandidate,
   onAddFiles,
   onAddFolder,
   onClear,
@@ -415,14 +423,14 @@ export default function PendingList({
           <div>
             {items.map((i) => (
               <div
-                key={i.path}
+                key={i.itemRef ?? i.path}
                 className="flex items-center gap-2.5 border-b border-[var(--color-border)] px-3 py-1.5 text-sm transition-colors duration-150 last:border-b-0 hover:bg-[var(--color-surface)]"
               >
                 <span className="shrink-0 rounded bg-[var(--color-surface)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-secondary)]">
                   {i.kind === "video" ? "视频" : "图片"}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-[var(--color-text)]" title={i.path}>
-                  {fileName(i.path)}
+                <span className="min-w-0 flex-1 truncate text-[var(--color-text)]" title={i.displayName || i.path}>
+                  {fileName(i.path, i.displayName)}
                 </span>
                 <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">{formatSize(i.size)}</span>
                 {i.previewStatus === "limited" && (
@@ -433,7 +441,10 @@ export default function PendingList({
                 {!running && (
                   <button
                     aria-label="移除"
-                    onClick={() => onRemove(i.path)}
+                    onClick={() => {
+                      if (onRemoveCandidate) onRemoveCandidate(i);
+                      else onRemove(i.path);
+                    }}
                     className="shrink-0 text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-danger)]"
                   >
                     ×
@@ -450,10 +461,11 @@ export default function PendingList({
           >
             {items.map((i) => (
               <PendingItem
-                key={i.path}
                 item={i}
+                key={i.itemRef ?? i.path}
                 running={running}
                 onRemove={onRemove}
+                onRemoveCandidate={onRemoveCandidate}
                 onOpenItem={(p) => {
                   if (onOpenItem) onOpenItem(p);
                   else onOpenItemFallback?.(p);

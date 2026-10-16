@@ -6,6 +6,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::db::libraries::VERIFIED_ASSET_SCOPE;
 use crate::db::query_expr::{normalize_expr, LeafCond, QueryExpr};
 use crate::db::search_query::{self, MetadataFilter};
 use crate::db::settings::AiSettings;
@@ -1960,27 +1961,40 @@ pub fn library_capabilities(conn: &Connection) -> AppResult<String> {
         }
     }
     let (total, imgs, vids): (i64, i64, i64) = conn.query_row(
-        "SELECT COUNT(*),
-                SUM(CASE WHEN mime_type LIKE 'image/%' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN mime_type LIKE 'video/%' THEN 1 ELSE 0 END)
-           FROM assets WHERE deleted_at IS NULL",
+        &format!(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN a.mime_type LIKE 'image/%' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN a.mime_type LIKE 'video/%' THEN 1 ELSE 0 END)
+               FROM assets a WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
         [],
         |r| Ok((r.get(0)?, r.get(1).unwrap_or(0), r.get(2).unwrap_or(0))),
     )?;
     let gps: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL",
+        &format!(
+            "SELECT COUNT(*) FROM assets a
+              WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+                AND a.latitude IS NOT NULL AND a.longitude IS NOT NULL"
+        ),
         [],
         |r| r.get(0),
     )?;
     let (taken_n, min_d, max_d): (i64, Option<String>, Option<String>) = conn.query_row(
-        "SELECT COUNT(*), MIN(strftime('%Y-%m-%d', taken_at/1000,'unixepoch','localtime')),
-                MAX(strftime('%Y-%m-%d', taken_at/1000,'unixepoch','localtime'))
-           FROM assets WHERE deleted_at IS NULL AND taken_at IS NOT NULL",
+        &format!(
+            "SELECT COUNT(*), MIN(strftime('%Y-%m-%d', a.taken_at/1000,'unixepoch','localtime')),
+                    MAX(strftime('%Y-%m-%d', a.taken_at/1000,'unixepoch','localtime'))
+               FROM assets a
+              WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+                AND a.taken_at IS NOT NULL"
+        ),
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let (sz_min, sz_max): (Option<i64>, Option<i64>) = conn.query_row(
-        "SELECT MIN(file_size), MAX(file_size) FROM assets WHERE deleted_at IS NULL",
+        &format!(
+            "SELECT MIN(a.file_size), MAX(a.file_size) FROM assets a
+              WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -2006,10 +2020,11 @@ pub fn library_capabilities(conn: &Connection) -> AppResult<String> {
         _ => line.push_str("- 文件大小：无样本\n"),
     }
     let exts: Vec<(String, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT COALESCE(lower(file_ext),'?') AS e, COUNT(*) c FROM assets
-              WHERE deleted_at IS NULL GROUP BY e ORDER BY c DESC LIMIT 3",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(lower(a.file_ext),'?') AS e, COUNT(*) c FROM assets a
+              WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}
+              GROUP BY e ORDER BY c DESC LIMIT 3"
+        ))?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .filter_map(|r| r.ok())
@@ -4531,10 +4546,37 @@ mod tests {
         lat: Option<f64>,
         lon: Option<f64>,
     ) {
-        conn.execute(
+        let asset_id = conn
+            .query_row(
             "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at, taken_at, latitude, longitude)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1700000000000, 1700000000000, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 1700000000000, 1700000000000, ?6, ?7, ?8)
+             RETURNING id",
             rusqlite::params![path, path.rsplit('/').next().unwrap(), "jpg", size, mime, taken, lat, lon],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(conn).unwrap().unwrap();
+        conn.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset_id
+            ],
         )
         .unwrap();
     }
@@ -4853,13 +4895,39 @@ mod tests {
     // ═══════════════ S3：V3 intent → SearchPlanV3（build_plan_from_v3，真实 DB） ═══════════════
 
     fn v3_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
-        conn.query_row(
+        let asset_id = conn
+            .query_row(
             "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at)
              VALUES (?1, ?2, 'jpg', 1000, 'image/jpeg', 1700000000000, 1700000000000) RETURNING id",
             rusqlite::params![path, path.rsplit('/').next().unwrap()],
             |r| r.get(0),
         )
-        .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(conn).unwrap().unwrap();
+        conn.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset_id
+            ],
+        )
+        .unwrap();
+        asset_id
     }
 
     /// S3：required（filter）∧ preferred（should，不淘汰）∧ exclusions（must_not）

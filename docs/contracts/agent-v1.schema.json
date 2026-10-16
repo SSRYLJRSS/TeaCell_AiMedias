@@ -1,0 +1,1208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "ResourceRef": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"
+    },
+    "ShortText": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^[^\\u0000]*$",
+      "x-maxUtf8Bytes": 256
+    },
+    "Instructions": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000]*$",
+      "x-maxUtf8Bytes": 4096
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "bool": {
+      "type": "boolean"
+    },
+    "WorkflowParameterKey": {
+      "type": "string",
+      "enum": [
+        "sourceRef",
+        "selectionRef",
+        "collectionRef",
+        "destinationRef",
+        "serviceRef",
+        "taggingInstructions",
+        "renamePattern"
+      ]
+    },
+    "CallerKind": {
+      "type": "string",
+      "enum": [
+        "gui",
+        "pi",
+        "mcp"
+      ]
+    },
+    "AccessKind": {
+      "type": "string",
+      "enum": [
+        "query",
+        "prepare",
+        "submit",
+        "cancel",
+        "resume",
+        "approve"
+      ]
+    },
+    "ApprovalRequirement": {
+      "type": "string",
+      "enum": [
+        "none",
+        "plan",
+        "permanent_trash",
+        "resume_review",
+        "trusted_review"
+      ]
+    },
+    "ReviewKind": {
+      "type": "string",
+      "enum": [
+        "ordinary",
+        "permanent_trash"
+      ]
+    },
+    "ExportLayout": {
+      "type": "string",
+      "enum": [
+        "flat",
+        "by_tag",
+        "by_date"
+      ]
+    },
+    "OperationState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "succeeded",
+        "partially_succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "outcome_unknown"
+      ]
+    },
+    "OperationPhase": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "executing",
+        "waiting_review",
+        "waiting_tags",
+        "cancelling",
+        "reconciling",
+        "complete"
+      ]
+    },
+    "PlanReviewStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "expired",
+        "invalidated",
+        "consumed"
+      ]
+    },
+    "AgentErrorCode": {
+      "type": "string",
+      "enum": [
+        "INVALID_INPUT",
+        "UNSUPPORTED_PROTOCOL",
+        "UNSUPPORTED_CAPABILITY",
+        "UNSUPPORTED_PLATFORM",
+        "UNAUTHORIZED",
+        "GRANT_REVOKED",
+        "REFERENCE_EXPIRED",
+        "LIBRARY_CHANGED",
+        "LIBRARY_OFFLINE",
+        "OWNERSHIP_UNVERIFIED",
+        "APPROVAL_REQUIRED",
+        "PLAN_EXPIRED",
+        "PLAN_CHANGED",
+        "IDEMPOTENCY_CONFLICT",
+        "RESOURCE_CONFLICT",
+        "MAINTENANCE_ACTIVE",
+        "SERVICE_UNAVAILABLE",
+        "BUDGET_EXCEEDED",
+        "OUTCOME_UNKNOWN",
+        "CANCELLED",
+        "INTERNAL"
+      ]
+    },
+    "CapabilityId": {
+      "type": "string",
+      "enum": [
+        "assets.search",
+        "imports.prepare",
+        "imports.submit",
+        "tagging.prepare",
+        "tagging.submit",
+        "exports.prepare",
+        "exports.submit",
+        "assets.move.prepare",
+        "assets.move.submit",
+        "assets.trash.prepare",
+        "assets.trash.submit",
+        "assets.restore.prepare",
+        "assets.restore.submit",
+        "trash.empty.prepare",
+        "trash.empty.submit",
+        "operations.get",
+        "operations.cancel",
+        "operations.resume",
+        "plans.approve",
+        "workflows.load",
+        "workflows.prepare",
+        "workflows.submit"
+      ]
+    },
+    "WorkflowParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/WorkflowParameterKey"
+        },
+        "required": {
+          "$ref": "#/$defs/bool"
+        },
+        "description": {
+          "$ref": "#/$defs/ShortText"
+        }
+      },
+      "required": [
+        "key",
+        "required",
+        "description"
+      ]
+    },
+    "WorkflowStepSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityId"
+        },
+        "dependsOn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewKind": {
+          "$ref": "#/$defs/ReviewKind"
+        }
+      },
+      "required": [
+        "capability",
+        "reviewKind"
+      ]
+    },
+    "WorkflowPlanPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "workflowRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "version": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "plan": {
+          "$ref": "#/$defs/PlanPreview"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowStepSummary"
+          },
+          "maxItems": 8
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "workflowRef",
+        "version",
+        "plan",
+        "steps"
+      ]
+    },
+    "MoneyLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "$ref": "#/$defs/ShortText"
+        },
+        "amountMicrounits": {
+          "$ref": "#/$defs/u32"
+        }
+      },
+      "required": [
+        "currency",
+        "amountMicrounits"
+      ]
+    },
+    "BudgetSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxRequests": {
+          "$ref": "#/$defs/u32"
+        },
+        "maxTokens": {
+          "$ref": "#/$defs/u32"
+        },
+        "maxSeconds": {
+          "$ref": "#/$defs/u32"
+        },
+        "maxItems": {
+          "$ref": "#/$defs/u32"
+        },
+        "monetaryLimit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "maxRequests",
+        "maxTokens",
+        "maxSeconds",
+        "maxItems"
+      ]
+    },
+    "PlanScopeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scopeRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "sourceRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selectionRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targetRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serviceRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serviceRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShortText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "scopeRef"
+      ]
+    },
+    "SubmissionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "operation": {
+          "$ref": "#/$defs/OperationSnapshot"
+        },
+        "replayed": {
+          "$ref": "#/$defs/bool"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operation",
+        "replayed"
+      ]
+    },
+    "AssetSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "assetRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "displayName": {
+          "$ref": "#/$defs/ShortText"
+        },
+        "previewRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "assetRef",
+        "displayName"
+      ]
+    },
+    "SearchPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "library": {
+          "$ref": "#/$defs/LibraryScope"
+        },
+        "selectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "total": {
+          "$ref": "#/$defs/u32"
+        },
+        "truncated": {
+          "$ref": "#/$defs/bool"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssetSummary"
+          },
+          "maxItems": 100
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "library",
+        "selectionRef",
+        "total",
+        "truncated",
+        "items"
+      ]
+    },
+    "PlanPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "planId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "capability": {
+          "$ref": "#/$defs/CapabilityId"
+        },
+        "library": {
+          "$ref": "#/$defs/LibraryScope"
+        },
+        "reviewStatus": {
+          "$ref": "#/$defs/PlanReviewStatus"
+        },
+        "reviewKind": {
+          "$ref": "#/$defs/ReviewKind"
+        },
+        "itemCount": {
+          "$ref": "#/$defs/u32"
+        },
+        "summary": {
+          "$ref": "#/$defs/Instructions"
+        },
+        "reviewRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "expiresAtUnixSeconds": {
+          "$ref": "#/$defs/u32"
+        },
+        "scope": {
+          "$ref": "#/$defs/PlanScopeSummary"
+        },
+        "budget": {
+          "$ref": "#/$defs/BudgetSummary"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "planId",
+        "capability",
+        "library",
+        "reviewStatus",
+        "reviewKind",
+        "itemCount",
+        "summary",
+        "reviewRef",
+        "expiresAtUnixSeconds",
+        "scope",
+        "budget"
+      ]
+    },
+    "OperationSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "operationId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "library": {
+          "$ref": "#/$defs/LibraryScope"
+        },
+        "revision": {
+          "$ref": "#/$defs/u32"
+        },
+        "state": {
+          "$ref": "#/$defs/OperationState"
+        },
+        "phase": {
+          "$ref": "#/$defs/OperationPhase"
+        },
+        "completed": {
+          "$ref": "#/$defs/u32"
+        },
+        "failed": {
+          "$ref": "#/$defs/u32"
+        },
+        "total": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resultSelectionRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "errorCode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "canCancel": {
+          "$ref": "#/$defs/bool"
+        },
+        "canResume": {
+          "$ref": "#/$defs/bool"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationId",
+        "library",
+        "revision",
+        "state",
+        "phase",
+        "completed",
+        "failed",
+        "canCancel",
+        "canResume"
+      ]
+    },
+    "ApprovalResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "planId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "reviewStatus": {
+          "$ref": "#/$defs/PlanReviewStatus"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "planId",
+        "reviewStatus"
+      ]
+    },
+    "WorkflowSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "workflowRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "version": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/ShortText"
+        },
+        "description": {
+          "$ref": "#/$defs/Instructions"
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowParameter"
+          },
+          "maxItems": 7
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowStepSummary"
+          },
+          "maxItems": 8
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "workflowRef",
+        "version",
+        "name",
+        "description",
+        "parameters",
+        "steps"
+      ]
+    },
+    "SubmitPlanInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "planId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "planId",
+        "idempotencyKey"
+      ]
+    },
+    "OperationInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "operationId": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationId"
+      ]
+    },
+    "LibraryScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "libraryId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "libraryEpoch": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "libraryId",
+        "libraryEpoch"
+      ]
+    },
+    "SearchAssetsInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "text": {
+          "$ref": "#/$defs/Instructions"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "text"
+      ]
+    },
+    "PrepareImportInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "sourceRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "collectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "renamePattern": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShortText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "sourceRef",
+        "collectionRef"
+      ]
+    },
+    "PrepareTaggingInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "selectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "serviceRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "instructions": {
+          "$ref": "#/$defs/Instructions"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "selectionRef",
+        "serviceRef",
+        "instructions"
+      ]
+    },
+    "PrepareExportInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "selectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "destinationRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "layout": {
+          "$ref": "#/$defs/ExportLayout"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "selectionRef",
+        "destinationRef",
+        "layout"
+      ]
+    },
+    "PrepareMoveInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "selectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "collectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "selectionRef",
+        "collectionRef"
+      ]
+    },
+    "PrepareSelectionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "selectionRef": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "selectionRef"
+      ]
+    },
+    "ApprovePlanInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "planId": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "reviewRef": {
+          "$ref": "#/$defs/ResourceRef"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "planId",
+        "reviewRef"
+      ]
+    },
+    "LoadWorkflowInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "workflowRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "version": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "workflowRef",
+        "version"
+      ]
+    },
+    "PrepareWorkflowInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "workflowRef": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "version": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/u32"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "inputs": {
+          "$ref": "#/$defs/WorkflowInputs"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "workflowRef",
+        "version",
+        "inputs"
+      ]
+    },
+    "WorkflowInputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sourceRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selectionRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collectionRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinationRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serviceRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "taggingInstructions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Instructions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "renamePattern": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShortText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": []
+    }
+  },
+  "x-capabilities": {
+    "assets.search": {
+      "input": {
+        "$ref": "#/$defs/SearchAssetsInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SearchPage"
+      }
+    },
+    "imports.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareImportInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "imports.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "tagging.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareTaggingInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "tagging.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "exports.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareExportInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "exports.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "assets.move.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareMoveInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "assets.move.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "assets.trash.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareSelectionInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "assets.trash.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "assets.restore.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareSelectionInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "assets.restore.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "trash.empty.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareSelectionInput"
+      },
+      "output": {
+        "$ref": "#/$defs/PlanPreview"
+      }
+    },
+    "trash.empty.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    },
+    "operations.get": {
+      "input": {
+        "$ref": "#/$defs/OperationInput"
+      },
+      "output": {
+        "$ref": "#/$defs/OperationSnapshot"
+      }
+    },
+    "operations.cancel": {
+      "input": {
+        "$ref": "#/$defs/OperationInput"
+      },
+      "output": {
+        "$ref": "#/$defs/OperationSnapshot"
+      }
+    },
+    "operations.resume": {
+      "input": {
+        "$ref": "#/$defs/OperationInput"
+      },
+      "output": {
+        "$ref": "#/$defs/OperationSnapshot"
+      }
+    },
+    "plans.approve": {
+      "input": {
+        "$ref": "#/$defs/ApprovePlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/ApprovalResult"
+      }
+    },
+    "workflows.load": {
+      "input": {
+        "$ref": "#/$defs/LoadWorkflowInput"
+      },
+      "output": {
+        "$ref": "#/$defs/WorkflowSummary"
+      }
+    },
+    "workflows.prepare": {
+      "input": {
+        "$ref": "#/$defs/PrepareWorkflowInput"
+      },
+      "output": {
+        "$ref": "#/$defs/WorkflowPlanPreview"
+      }
+    },
+    "workflows.submit": {
+      "input": {
+        "$ref": "#/$defs/SubmitPlanInput"
+      },
+      "output": {
+        "$ref": "#/$defs/SubmissionResult"
+      }
+    }
+  }
+}

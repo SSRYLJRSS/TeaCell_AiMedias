@@ -3,18 +3,44 @@
 //!       批量删除 / tag 父子/循环校验 / 分页边界
 //! 运行：cargo test --test qa_edge_tests
 
-use bagertea_ai_media_v2_lib::db::ai::CategorizedTags;
-use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
-use bagertea_ai_media_v2_lib::db::{self, ai, asset_tags, assets, migrations, tags};
-use bagertea_ai_media_v2_lib::error::AppResult;
-use bagertea_ai_media_v2_lib::state::Database;
+use teacell_ai_media_manager_lib::db::ai::CategorizedTags;
+use teacell_ai_media_manager_lib::db::assets::AssetFilter;
+use teacell_ai_media_manager_lib::db::{self, ai, asset_tags, assets, migrations, tags};
+use teacell_ai_media_manager_lib::error::AppResult;
+use teacell_ai_media_manager_lib::state::Database;
 
 fn setup() -> rusqlite::Connection {
     db::init_memory().expect("内存库初始化失败")
 }
 
 fn add_asset(conn: &rusqlite::Connection, path: &str, name: &str, ext: &str, mime: &str) -> i64 {
-    assets::insert(conn, path, name, ext, 1024, mime, 1700000000000).expect("插入素材失败")
+    let id =
+        assets::insert(conn, path, name, ext, 1024, mime, 1700000000000).expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .unwrap();
+    let library = db::libraries::current(conn).unwrap().unwrap();
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .unwrap();
+    id
 }
 
 fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
@@ -1367,11 +1393,11 @@ fn w1_refill_real_library_rw2_dimensions() {
     let cancel = AtomicBool::new(false);
     let ids = {
         let c = db.lock().unwrap();
-        bagertea_ai_media_v2_lib::db::assets::list_ids_needing_dimensions(&c).unwrap()
+        teacell_ai_media_manager_lib::db::assets::list_ids_needing_dimensions(&c).unwrap()
     };
     println!("候选 id 数: {}", ids.len());
     let start = std::time::Instant::now();
-    let summary = bagertea_ai_media_v2_lib::services::media_refill::rescan_assets_dimensions(
+    let summary = teacell_ai_media_manager_lib::services::media_refill::rescan_assets_dimensions(
         &db,
         &ids,
         &cancel,

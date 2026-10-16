@@ -1,0 +1,25 @@
+{
+  "name": "teacell-agent-host",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.19.0"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node --check src/bootstrap.mjs && node --check src/host.mjs && node --check src/lease.mjs && node --check src/protocol.mjs && node --check src/sdk-session.mjs && node --check src/gateway-fetch.mjs && node --check src/gateway-rpc.mjs && node --check src/write-queue.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4"
+  },
+  "overrides": {
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-codemode": "1.0.4",
+    "@earendil-works/pi-mcp": "1.0.4",
+    "@earendil-works/pi-telemetry": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4"
+  }
+}

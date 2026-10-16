@@ -5,6 +5,7 @@ use tauri::{Manager, State};
 
 use crate::db::assets::{self, Asset, AssetFilter, AssetPage, MetadataFacet};
 use crate::db::dedup::{self, DupGroup};
+use crate::db::libraries::VERIFIED_ASSET_SCOPE;
 use crate::db::search_query;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
@@ -106,7 +107,7 @@ pub fn get_numeric_domains(state: State<AppState>) -> AppResult<Vec<search_query
 #[tauri::command]
 pub fn get_asset(app: tauri::AppHandle, state: State<AppState>, id: i64) -> AppResult<Asset> {
     let conn = lock_db(&state)?;
-    let a = assets::get(&conn, id)?;
+    let a = assets::get_managed(&conn, id)?;
     allow_asset(&app, &a.file_path);
     Ok(a)
 }
@@ -146,6 +147,14 @@ fn delete_assets_blocking(
     strategy: String,
 ) -> AppResult<DeleteResult> {
     let thumbs = ThumbnailService::new(&data_dir)?;
+    let ids = {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let managed: std::collections::HashSet<i64> =
+            assets::list_managed_ids(&conn)?.into_iter().collect();
+        ids.into_iter()
+            .filter(|id| managed.contains(id))
+            .collect::<Vec<_>>()
+    };
 
     // 阶段一：短锁收集待删文件路径（仅 delete_file 策略需要原文件路径）
     let paths: Vec<(i64, PathBuf)> = if strategy == "delete_file" {
@@ -154,9 +163,14 @@ fn delete_assets_blocking(
             .filter_map(|&id| {
                 // 删除只需要路径；不要为全库重置加载完整 Asset 与标签，
                 // 否则素材量大时会额外占用大量内存和查询时间。
-                conn.query_row("SELECT file_path FROM assets WHERE id = ?1", [id], |row| {
-                    row.get::<_, String>(0)
-                })
+                conn.query_row(
+                    &format!(
+                        "SELECT a.file_path FROM assets a
+                          WHERE a.id = ?1 AND {VERIFIED_ASSET_SCOPE}"
+                    ),
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
                 .ok()
                 .map(|path| (id, PathBuf::from(path)))
             })
@@ -222,9 +236,7 @@ pub fn delete_all_asset_files_for_reset(
 ) -> AppResult<DeleteResult> {
     let ids = {
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        let mut stmt = conn.prepare("SELECT id FROM assets")?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
+        assets::list_managed_ids(&conn)?
     };
     delete_assets_blocking(db, data_dir, ids, "delete_file".to_owned())
 }
@@ -299,7 +311,7 @@ pub fn get_asset_urls(
     let conn = lock_db(&state)?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        match assets::get(&conn, id) {
+        match assets::get_managed(&conn, id) {
             Ok(a) => {
                 allow_asset(&app, &a.file_path);
                 out.push(a.file_path);
@@ -322,7 +334,7 @@ pub fn reveal_in_folder(
     let norm = crate::utils::path::normalize_path(&path);
     {
         let conn = lock_db(&state)?;
-        if assets::find_by_path(&conn, &norm)?.is_none() {
+        if assets::find_managed_by_path(&conn, &norm)?.is_none() {
             return Err(AppError::msg("路径不属于已入库素材"));
         }
     }
@@ -374,6 +386,14 @@ mod tests {
 
         let (existing_id, missing_id) = {
             let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE libraries
+                    SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                        library_epoch=lower(hex(randomblob(16)))
+                  WHERE singleton=1",
+                [],
+            )
+            .unwrap();
             let a = assets::insert(
                 &conn,
                 original.to_string_lossy().as_ref(),
@@ -394,6 +414,24 @@ mod tests {
                 1,
             )
             .unwrap();
+            let library = crate::db::libraries::current(&conn).unwrap().unwrap();
+            for id in [a, b] {
+                conn.execute(
+                    "UPDATE managed_asset_locations
+                        SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                            relative_path=printf('asset-%d.jpg',asset_id),
+                            file_identity='fixture-file',content_sha256=?3,
+                            ownership_receipt='fixture-receipt'
+                      WHERE asset_id=?4",
+                    rusqlite::params![
+                        library.library_id,
+                        library.library_epoch,
+                        "a".repeat(64),
+                        id
+                    ],
+                )
+                .unwrap();
+            }
             (a, b)
         };
 

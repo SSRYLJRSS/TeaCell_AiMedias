@@ -10,6 +10,7 @@
 use rusqlite::Connection;
 
 use super::ai::{parse_number_proposal, validate_number_in_range, NumberParse};
+use super::libraries::{self, VERIFIED_ASSET_SCOPE};
 use super::tag_facets;
 use super::tags;
 use crate::error::{AppError, AppResult};
@@ -86,6 +87,7 @@ pub fn set_facet_number(
     facet_key: &str,
     value: f64,
 ) -> AppResult<()> {
+    libraries::ensure_managed_assets(conn, asset_ids)?;
     let facet = tag_facets::get(conn, facet_key)?;
     if facet.facet_kind != "number" {
         return Err(AppError::msg(format!("分面「{facet_key}」不是数值型分面")));
@@ -109,6 +111,7 @@ pub fn set_facet_number(
 
 /// 手工清值。
 pub fn clear_facet_number(conn: &Connection, asset_ids: &[i64], facet_key: &str) -> AppResult<()> {
+    libraries::ensure_managed_assets(conn, asset_ids)?;
     let tx = conn.unchecked_transaction()?;
     for &aid in asset_ids {
         tx.execute(
@@ -128,7 +131,10 @@ pub fn clear_facet_number(conn: &Connection, asset_ids: &[i64], facet_key: &str)
 
 /// 返回完整同源组恰好 1 RAW + 1 非 RAW 时的唯一兄弟；歧义组不扩散数值。
 fn kinship_siblings(conn: &Connection, asset_id: i64) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_path FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     let all: Vec<(i64, String)> = rows.collect::<Result<_, _>>()?;
     Ok(crate::services::kinship::paired_sibling(&all, asset_id)
@@ -297,6 +303,7 @@ pub fn undo_batch_numbers(conn: &Connection, batch_id: i64) -> AppResult<usize> 
 
 /// 重跑 ReplaceAiOnly：删未审核 AI 数值（manual / ai_reviewed 保留）。
 pub fn retag_clear_unreviewed_numbers(conn: &Connection, asset_ids: &[i64]) -> AppResult<()> {
+    libraries::ensure_managed_assets(conn, asset_ids)?;
     for &aid in asset_ids {
         conn.execute(
             "DELETE FROM asset_facet_numbers

@@ -1,6 +1,6 @@
 # 文档中心
 
-> 更新日期：2026-09-23
+> 更新日期：2026-10-11
 >
 > 本文档只维护“当前有效信息”和阅读路径。一次性实施方案、阶段报告、修复稿、旧版测试报告不再长期保留，历史内容以 Git 历史为准。
 
@@ -16,13 +16,16 @@
 
 ## 默认阅读顺序
 
-AI 或新开发者进入项目时，默认只读以下最小集合：
+仓库的 `AGENTS.md` 规定协作约束和按任务扩展阅读的条件；项目事实从本文件开始，默认按以下顺序读取最小集合：
 
-1. `AGENTS.md`
+1. `docs/README.md`
 2. `docs/ARCHITECTURE.md`
 3. `docs/DEVELOPMENT.md`
-4. 涉及路径、进程、凭据、原生依赖或打包时读取 `docs/PLATFORM.md`
-5. 任务相关的产品、UI、契约或测试文档
+4. 开发或阶段复盘时读取 `docs/PROJECT_PLAN.md`，核实实际状态、前置证据和阻塞项
+5. 涉及产品行为时读取 `docs/PRD.md` 和 `docs/UI_DESIGN_SYSTEM.md`
+6. 涉及路径、进程、凭据、原生依赖或打包时读取 `docs/PLATFORM.md`
+7. 按需读取任务相关契约、测试、性能、运维或故障排查文档
+8. 执行 2.0/2.5 任务时读取 `plans/v2/11-execution-guide.md`、任务索引、当前任务卡和 `plans/v2/14-review-and-handoff.md`；静态任务卡不代表已实现或已获授权。
 
 不要在未确认任务相关性时加载整批历史文档，也不要读取本地 AI 工具的历史缓存来补全项目事实。
 
@@ -32,11 +35,15 @@ AI 或新开发者进入项目时，默认只读以下最小集合：
 |---|---|---|
 | [PRD.md](PRD.md) | 产品定位、用户、需求边界、验收口径 | 需求新增、变更、删除时 |
 | [PROJECT_PLAN.md](PROJECT_PLAN.md) | 当前交付状态、里程碑、下一阶段、发布阻塞 | 排期、发布、阶段复盘时 |
+| [`plans/v2/execution/`](../plans/v2/execution/README.md) | 2.0/2.5任务范围、依赖与验收要求；不记录实际进度 | 执行 2.0/2.5任务时 |
+| [12-implementation-contracts.md](../plans/v2/12-implementation-contracts.md) | 2.0/2.5 冻结实现契约；各任务按需读取对应章节 | 任务存在冻结的数据、并发或外发规则时 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 前后端结构、模块职责、数据流、关键机制、设计约束 | 改代码前必读，结构变化时同步 |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | 环境、命令、分层、代码规范、测试、迁移、AI 协作流程 | 所有开发任务 |
 | [PLATFORM.md](PLATFORM.md) | 支持系统、支持等级、能力矩阵、平台差异边界 | 路径、进程、凭据、原生依赖、打包和跨平台发布 |
 | [UI_DESIGN_SYSTEM.md](UI_DESIGN_SYSTEM.md) | 视觉令牌、布局、控件、状态、响应式和可访问性 | 新增或修改 UI 时 |
 | [CONTRACTS.md](CONTRACTS.md) | 搜索、分面、AI 查询协议的索引和不变量 | 修改搜索或标签协议前 |
+| [contracts/authorization-v1.md](contracts/authorization-v1.md) | 目录授权、主体世代和受控资源句柄 | Agent 入口、目录选择、导入/导出/移动 |
+| [contracts/agent-host-protocol-v1.md](contracts/agent-host-protocol-v1.md) | Rust ↔ 应用自带 Node/Pi Host 的内部协议、生命周期和限制 | Host、进程、会话、协议或打包改动 |
 | [contracts/search-plan-v3.md](contracts/search-plan-v3.md) | SearchPlanV3 执行契约 | 超级搜索执行链路 |
 | [contracts/facets-v2.md](contracts/facets-v2.md) | 分面数据模型、输入模式、级联规则 | 标签、分面、AI 打标 |
 | [contracts/super-search-ai-v2.md](contracts/super-search-ai-v2.md) | SearchIntentV2、降级和剔除协议 | AI 智能搜 |
@@ -59,11 +66,14 @@ AI 或新开发者进入项目时，默认只读以下最小集合：
 |---|---|
 | 产品需求、用户行为、验收标准 | `PRD.md` |
 | 里程碑、状态、发布阻塞 | `PROJECT_PLAN.md` |
+| 2.0/2.5 单卡目标、依赖与验收 | 对应 `plans/v2/execution/*.md`；实际状态只改 `PROJECT_PLAN.md` |
+| 2.0/2.5 冻结实现规则 | `plans/v2/12-implementation-contracts.md`；其他文档只链接 |
 | 模块、数据流、关键机制、设计约束 | `ARCHITECTURE.md` |
 | 命令行、规范、测试门禁、迁移流程 | `DEVELOPMENT.md` |
 | 支持范围、能力差异、平台高危区域 | `PLATFORM.md` |
 | 颜色、布局、控件、交互范式 | `UI_DESIGN_SYSTEM.md` |
 | 搜索计划、分面、AI 查询结构 | 对应 `contracts/*.md` |
+| Node/Pi Host 内部协议 | `contracts/agent-host-protocol-v1.md` |
 | 测试分层、准入准出 | `TEST_STRATEGY.md` |
 | 真机验收步骤 | `QA_PLAYBOOK.md` |
 | 性能红线 | `PERFORMANCE.md` |

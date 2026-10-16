@@ -139,7 +139,7 @@ describe("ServiceManagement platform policy", () => {
       credentialStatus: "missing",
       enabled: true,
     });
-    vi.mocked(getAiUsageBindings).mockResolvedValue({ super_search: null, tagging: null });
+    vi.mocked(getAiUsageBindings).mockResolvedValue({ super_search: null, tagging: null, agent: null });
     vi.mocked(setAiUsageBinding).mockResolvedValue(undefined);
 
     render(
@@ -195,7 +195,7 @@ describe("ServiceManagement platform policy", () => {
     };
     vi.mocked(listAiConnections).mockResolvedValue([localConnection, cloudConnection]);
     vi.mocked(saveAiConnection).mockResolvedValue({ ...localConnection, model: "qwen3.5:4b" });
-    vi.mocked(getAiUsageBindings).mockResolvedValue({ super_search: null, tagging: "cloud-1" });
+    vi.mocked(getAiUsageBindings).mockResolvedValue({ super_search: null, tagging: "cloud-1", agent: null });
     vi.mocked(setAiUsageBinding).mockResolvedValue(undefined);
 
     render(

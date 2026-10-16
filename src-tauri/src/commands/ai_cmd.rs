@@ -2,14 +2,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, State};
 
+use crate::contracts::agent::ResourceRef;
+use crate::contracts::caller::CallerContext;
 use crate::db::ai::{AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags};
 use crate::db::{ai, ai_connections, settings};
 use crate::error::{AppError, AppResult};
-use crate::services::ai_cloud::{self, AiProgress};
-use crate::services::ollama_runtime;
+use crate::services::ai_cloud::{self, AiProgress, RequestBudget};
+use crate::services::{authorization, ollama_runtime, operations, tagging};
 use crate::state::AppState;
 
 fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
@@ -37,6 +40,19 @@ fn mode_for_active_profile(cfg: &settings::AiSettings) -> &'static str {
         Some(true) => "local",
         _ => "cloud",
     }
+}
+
+fn gui_caller(state: &AppState) -> AppResult<CallerContext> {
+    let conn = state.db.lock()?;
+    authorization::build_caller_context(
+        &conn,
+        authorization::TrustedAdapterIdentity::Gui {
+            session_id: state.authorization_session_id.clone(),
+            instance_id: state.authorization_instance_id.clone(),
+        },
+        ResourceRef::generated("request"),
+        Vec::new(),
+    )
 }
 
 /// 用选中素材创建批次（pending 建议占位）
@@ -77,167 +93,212 @@ pub fn ai_create_batch(
     ai::create_batch_with_retag(&conn, &ids, &mode, retag)
 }
 
-/// 执行批次（云端）：spawn_blocking 工作线程跑，进度走 ai://progress 事件；
-/// 预检短锁即用即放，批次执行期间不持 DB 锁（网络等待不阻塞全应用 DB 读写）
+/// 准备 AI 打标计划。这里只生成供可信界面展示的审批预览，不发送网络请求。
 #[tauri::command]
-pub async fn ai_start_batch(
+pub fn ai_prepare_batch(
+    state: State<AppState>,
+    batch_id: i64,
+    limit: Option<u32>,
+) -> AppResult<tagging::TaggingPreparation> {
+    let caller = gui_caller(&state)?;
+    tagging::prepare_existing_batch(&state.db, &caller, batch_id, limit)
+}
+
+/// 从已完成导入操作的成功收据准备打标计划；重复映射必须逐项明确纳入。
+#[tauri::command]
+pub fn ai_prepare_import_batch(
+    state: State<AppState>,
+    source_operation_id: ResourceRef,
+    source_step_id: ResourceRef,
+    included_duplicate_item_ids: Vec<String>,
+) -> AppResult<tagging::TaggingPreparation> {
+    let caller = gui_caller(&state)?;
+    tagging::prepare_from_import(
+        &state.db,
+        &caller,
+        &source_operation_id,
+        &source_step_id,
+        &included_duplicate_item_ids,
+    )
+}
+
+/// 已批准计划只会原子创建待启动批次和操作，不会在 submit 阶段外发。
+#[tauri::command]
+pub fn ai_submit_tagging_plan(
+    state: State<AppState>,
+    plan_ref: ResourceRef,
+    idempotency_key: ResourceRef,
+) -> AppResult<tagging::TaggingOperation> {
+    let caller = gui_caller(&state)?;
+    tagging::submit_plan(&state.db, &caller, &plan_ref, &idempotency_key)
+}
+
+/// 仅可信 GUI 能显式启动已批准操作的联网阶段。
+#[tauri::command]
+pub async fn ai_start_tagging(
     app: AppHandle,
     state: State<'_, AppState>,
-    batch_id: i64,
-    limit: Option<i64>,
+    operation_id: ResourceRef,
+    step_id: ResourceRef,
 ) -> AppResult<AiBatch> {
-    let db = std::sync::Arc::clone(&state.db);
-    let registry = std::sync::Arc::clone(&state.ai_cancel);
-    let ai_config_guard = std::sync::Arc::clone(&state.ai_config_guard);
-    let runtime = std::sync::Arc::clone(&state.ollama_runtime);
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    tauri::async_runtime::spawn_blocking(move || {
-        // 与设置及分类保存共用配置锁，保证业务说明和分类说明来自同一快照。
-        let config_guard = ai_config_guard
-            .lock()
-            .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
-        // Resolve usage metadata under a short DB guard, release it, then read the
-        // system keyring before taking any subsequent DB guard.
-        let tagging_profile = crate::services::credentials::usage_profile_with_system_credential(
-            &db,
-            "tagging",
-        )?
+    let db = Arc::clone(&state.db);
+    let registry = Arc::clone(&state.ai_cancel);
+    let ai_config_guard = Arc::clone(&state.ai_config_guard);
+    let runtime = Arc::clone(&state.ollama_runtime);
+    let caller = gui_caller(&state)?;
+    let batch_id = tagging::batch_id_for_start(&db, &caller, &operation_id, &step_id)?;
+    let queue_claim = state
+        .operation_queue
+        .try_reserve_operation(&db, operation_id.as_str(), "tagging.submit")?
         .ok_or_else(|| {
-            AppError::msg("尚未绑定打标服务，请先在打标页选择在线或本地模型")
+            AppError::conflict("其他长任务正在执行或打标操作尚未排到队首，请稍后重试")
         })?;
-        // 预检与配置读取：短锁作用域，读完即放
-        let (all, facets, facets_video) = {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            let batch = ai::get_batch(&conn, batch_id)?;
-            // v2.12：仅执行中拒绝；done/cancelled 允许续跑剩余 pending 建议
-            if batch.status == "processing" {
-                return Err(AppError::conflict("批次正在执行中"));
-            }
-            // F15a（2026-08-22）：待打标 = pending 且尚无候选（set_suggestion_tags 不改 status，
-            // 只看 status 会把「已生成候选未确认」的条目误判为待处理 → 续跑重复请求）
-            let has_pending = ai::list_suggestions(&conn, batch_id)?
-                .iter()
-                .any(|s| s.status == "pending" && s.suggested_tags.is_empty());
-            if !has_pending {
-                return Err(AppError::not_found(
-                    "当前没有待打标的建议（已全部处理或确认）",
-                ));
-            }
-            let mut s = settings::get_settings(&conn)?;
-            // 用已在 DB/keyring 锁外解析出的连接快照；本作用域不做凭据 IO。
-            ai_connections::apply_profile(&mut s.ai, tagging_profile.clone());
-            let facets = crate::db::tag_facets::build_prompt_context(&conn, "image")?;
-            let facets_video = crate::db::tag_facets::build_prompt_context(&conn, "video")?;
-            crate::services::ai_cloud::validate_tagging_facet_descriptions(
-                facets.iter().chain(facets_video.iter()),
-            )?;
-            let profile_is_local = s
-                .ai
-                .active()
-                .is_some_and(crate::services::ai_cloud::is_managed_ollama_profile);
-            // 建批后允许切换服务；执行时按当前 tagging 绑定修正批次类型。
-            ai::set_batch_mode(&conn, batch_id, mode_for_active_profile(&s.ai))?;
-            // FB-03 §9.3 视频批次预检（前后端一致；后端为最终校验，service 层兜底保留）：
-            // 待打标条目是否含视频 → 开关/ffmpeg/本地视觉模型三项检查，启动前阻断而非逐条启动后失败。
-            {
-                let suggestions = ai::list_suggestions(&conn, batch_id)?;
-                let pending_items: Vec<_> = suggestions
-                    .iter()
-                    .filter(|s| s.status == "pending" && s.suggested_tags.is_empty())
-                    .collect();
-                let has_video = pending_items.iter().any(|s| {
-                    let by_mime = s
-                        .mime_type
-                        .as_deref()
-                        .map(|m| m.starts_with("video/"))
-                        .unwrap_or(false);
-                    let by_ext = {
-                        let lower = s.asset_path.to_ascii_lowercase();
-                        [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".ts"]
-                            .iter()
-                            .any(|ext| lower.ends_with(ext))
-                    };
-                    by_mime || by_ext
-                });
-                if has_video {
-                    if !s.ai.video_tagging {
-                        return Err(AppError::unsupported(
-                            "视频 AI 打标未开启。请打开「设置 → AI 设置 → 自动打标 → 视频 AI 打标」，保存后重新开始批次。",
-                        ));
-                    }
-                    if s.ai.video_tagging_mode == "frames"
-                        && !crate::services::video::ffmpeg_available()
-                    {
-                        return Err(AppError::unsupported(
-                            "视频打标模式为「抽帧打标」，但未检测到 ffmpeg。请安装 ffmpeg 并加入 PATH，或在设置中改为「封面打标」后重试。",
-                        ));
-                    }
-                }
-                // W5a（a11）：本地模型视觉能力检查对图片批次也生效（此前只在 has_video 块内——
-                // 图片库（如本库 0 视频）该检查从未运行过，纯图片批次会带着纯文本模型起跑后逐条失败）
-                if profile_is_local {
-                    if let Some(active) = s.ai.active() {
-                        if !crate::services::ai_cloud::model_supports_vision(&active.model) {
-                            return Err(AppError::unsupported(format!(
-                                "当前本地模型「{}」不支持视觉（图片/视频）输入，无法打标。请更换支持图片输入的视觉模型（如 qwen3.5、llava、moondream），保存后重新开始批次。",
-                                active.model
-                            )));
-                        }
-                    }
-                }
-            }
-            (s, facets, facets_video)
-        };
-        let proxy = all.model_download_proxy.clone();
-        let cfg = all.ai;
-        let managed_ollama = cfg
-            .active()
-            .is_some_and(ai_cloud::is_managed_ollama_profile);
-        if managed_ollama {
-            // Windows 应用托管的默认 Ollama 允许按需启动；其它本机兼容服务绝不接管。
-            ollama_runtime::ensure_ready(&runtime, &proxy)?;
-        }
-        registry
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = registry
             .lock()
-            .map_err(|_| AppError::msg("取消注册表锁中毒"))?
-            .insert(batch_id, Arc::clone(&cancel));
-        drop(config_guard);
-        let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, &facets_video, limit, &cancel, |p: AiProgress| {
-            let _ = app.emit("ai://progress", p);
-        });
-        // B12：收尾清理 flag——锁中毒不再静默吞
-        match registry.lock() {
-            Ok(mut m) => {
-                m.remove(&batch_id);
+            .map_err(|_| AppError::msg("取消注册表锁中毒"))?;
+        if active.contains_key(&batch_id) {
+            return Err(AppError::conflict("批次正在执行中"));
+        }
+        active.insert(batch_id, Arc::clone(&cancel));
+    }
+    let worker_registry = Arc::clone(&registry);
+    let queue_wakeup_app = app.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _queue_claim = queue_claim;
+        let execution = (|| -> AppResult<AiBatch> {
+            let config_guard = ai_config_guard
+                .lock()
+                .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
+            let started = tagging::start(&db, &caller, &operation_id, &step_id)?;
+            let preparation = (|| -> AppResult<()> {
+                let proxy = { tagging::model_download_proxy(&db)? };
+                if started
+                    .config
+                    .active()
+                    .is_some_and(ai_cloud::is_managed_ollama_profile)
+                {
+                    ollama_runtime::ensure_ready(&runtime, &proxy)?;
+                }
+                Ok(())
+            })();
+            drop(config_guard);
+            let run_result = preparation.and_then(|()| {
+                let budget_db = Arc::clone(&db);
+                let outcome_db = Arc::clone(&db);
+                let budget_operation_id = started.operation_id.clone();
+                let budget_step_id = started.step_id.clone();
+                let outcome_operation_id = started.operation_id.clone();
+                let outcome_step_id = started.step_id.clone();
+                let remaining = Duration::from_secs(
+                    started
+                        .deadline_at
+                        .saturating_sub(chrono::Utc::now().timestamp())
+                        .max(0) as u64,
+                );
+                let budget = RequestBudget::persistent_tagging_until(
+                    started.request_limit as u64,
+                    Instant::now() + remaining,
+                    move |asset_id| {
+                        tagging::persist_request_attempt_for_item(
+                            &budget_db,
+                            &budget_operation_id,
+                            &budget_step_id,
+                            asset_id,
+                        )
+                    },
+                    move |asset_id, succeeded, error_code| {
+                        tagging::record_request_outcome(
+                            &outcome_db,
+                            &outcome_operation_id,
+                            &outcome_step_id,
+                            asset_id,
+                            succeeded,
+                            error_code.as_deref(),
+                        )
+                    },
+                );
+                ai_cloud::run_cloud_batch_with_plan(
+                    &db,
+                    batch_id,
+                    &started.config,
+                    &started.facets,
+                    &started.facets_video,
+                    None,
+                    &cancel,
+                    Some(&budget),
+                    Some(&started.allowed_asset_ids),
+                    Some(&started.top_tags),
+                    |progress: AiProgress| {
+                        let _ = app.emit("ai://progress", progress);
+                    },
+                )?;
+                tagging::batch_result(&db, batch_id)
+            });
+            match run_result {
+                Ok(batch) => {
+                    if batch.status == "cancelled"
+                        || cancel.load(Ordering::Relaxed)
+                        || tagging::cancellation_requested(
+                            &db,
+                            &started.operation_id,
+                            &started.step_id,
+                        )?
+                    {
+                        tagging::finish_cancelled(&db, &started.operation_id, &started.step_id)?;
+                        tagging::batch_result(&db, batch_id)
+                    } else {
+                        tagging::finish(&db, &started.operation_id, &started.step_id, true)?;
+                        Ok(batch)
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("已批准打标操作 {} 执行异常: {error}", started.operation_id);
+                    let cancellation_requested = cancel.load(Ordering::Relaxed)
+                        || tagging::cancellation_requested(
+                            &db,
+                            &started.operation_id,
+                            &started.step_id,
+                        )?;
+                    if cancellation_requested {
+                        tagging::finish_cancelled(&db, &started.operation_id, &started.step_id)?;
+                        return tagging::batch_result(&db, batch_id);
+                    }
+                    tagging::finish(&db, &started.operation_id, &started.step_id, false)?;
+                    Err(error)
+                }
+            }
+        })();
+        match worker_registry.lock() {
+            Ok(mut active) => {
+                active.remove(&batch_id);
             }
             Err(_) => tracing::error!("取消注册表锁中毒，batch {} 的 flag 未清理", batch_id),
         }
-        if let Err(e) = r {
-            // 批次级异常（DB/配置等）收尾：置 cancelled 防卡死在 processing 无法重试
-            // （单条失败已在 run_cloud_batch 内部置 rejected，不进这里）
-            tracing::warn!("批次 {} 执行异常，标记 cancelled: {e}", batch_id);
-            if let Ok(conn) = db.lock() {
-                // 限流或连续失败时 run_cloud_batch 已落为 interrupted；保留可续跑语义，
-                // 只回收仍处于 processing 的异常，避免误报为用户主动取消。
-                let should_cancel = ai::get_batch(&conn, batch_id)
-                    .map(|batch| batch.status == "processing")
-                    .unwrap_or(true);
-                if should_cancel {
-                    let _ = ai::set_batch_status(&conn, batch_id, "cancelled");
-                }
-            }
-            return Err(e);
-        }
-        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        ai::get_batch(&conn, batch_id)
+        execution
     })
-    .await
-    .map_err(|e| AppError::msg(format!("打标线程异常: {e}")))?
+    .await;
+    crate::commands::import_cmd::wake_import_queue(queue_wakeup_app);
+    match joined {
+        Ok(result) => result,
+        Err(error) => {
+            if let Ok(mut active) = registry.lock() {
+                active.remove(&batch_id);
+            }
+            Err(AppError::msg(format!("打标线程异常: {error}")))
+        }
+    }
 }
 
 #[tauri::command]
 pub fn ai_cancel_batch(state: State<AppState>, batch_id: i64) -> AppResult<()> {
+    let caller = gui_caller(&state)?;
+    // Approved tagging batches must close the durable operation/link send
+    // gate before the in-memory cancellation flag is signalled. Unlinked
+    // legacy/manual batches retain their original flag-only behavior.
+    operations::cancel_tagging_batch(&state.db, &caller, batch_id)?;
     // B11：不再静默吞锁中毒
     let m = state
         .ai_cancel

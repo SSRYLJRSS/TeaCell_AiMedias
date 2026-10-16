@@ -3,13 +3,13 @@
 //! → degrade 解析 → build expr/plan → validate，采集每条状态与完整产出。
 //! 运行：$env:SS_OUT="<绝对路径.json>"; cargo run --example ss_batch
 //! 可选：SS_CASES="15,19,24" 只跑指定 1-based 序号；SS_SLEEP=1500 每条间隔毫秒。
-use bagertea_ai_media_v2_lib::db::ai_connections;
-use bagertea_ai_media_v2_lib::db::query_expr::{validate_expr, LeafCond, QueryExpr};
-use bagertea_ai_media_v2_lib::db::{settings, tag_facets};
-use bagertea_ai_media_v2_lib::services::super_search_ai as ss;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::time::Instant;
+use teacell_ai_media_manager_lib::db::ai_connections;
+use teacell_ai_media_manager_lib::db::query_expr::{validate_expr, LeafCond, QueryExpr};
+use teacell_ai_media_manager_lib::db::{settings, tag_facets};
+use teacell_ai_media_manager_lib::services::super_search_ai as ss;
 
 // 30 条：覆盖单标签 / 多标签且 / 或 / 排除 / 优先 / 素材类型 / 文件大小 / 日期 /
 // 视频时长 / 分辨率 / 横竖 / GPS / 颜色 / 文件名 / 未打标 / 超长复合 / 口语化。

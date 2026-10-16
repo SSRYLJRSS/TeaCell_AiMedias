@@ -19,6 +19,8 @@ import { useMetadataStore } from "@/stores/metadataStore";
 import { markStartup } from "@/utils/startupMarks";
 import { useTauriEvent } from "@/hooks/hooks";
 import { on } from "@/api/client";
+import { startImportDropDispatcher, stopImportDropDispatcher } from "@/utils/importDropDispatcher";
+import { logger } from "@/utils/logger";
 
 type PageKey = TabKey | "settings" | "superSearch";
 
@@ -83,6 +85,15 @@ export default function App() {
   // 全局任务条：订阅入库/导出/AI 进度事件（幂等，M3-04）
   useEffect(() => {
     void startGlobalTaskWatch();
+  }, []);
+
+  // Native WebView drag/drop is subscribed once here; the mounted import page
+  // registers and unregisters its target as navigation changes.
+  useEffect(() => {
+    void startImportDropDispatcher().catch((error: unknown) => {
+      logger.error("导入拖拽监听启动失败", { error: error instanceof Error ? error.message : String(error) });
+    });
+    return stopImportDropDispatcher;
   }, []);
 
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）

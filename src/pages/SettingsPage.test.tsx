@@ -125,11 +125,22 @@ vi.mock("@/api/client", () => ({
   invoke: vi.fn(),
   AppError: class extends Error {},
 }));
+vi.mock("@/api/legacyAssets", () => ({
+  listLegacyAssets: vi.fn().mockResolvedValue({
+    libraryHealth: "ready", canResolve: true, rootPath: "D:/Library", items: [], nextAfterAssetId: null,
+  }),
+  listUnlinkedLegacyAssets: vi.fn().mockResolvedValue([]),
+  prepareLegacyUnlink: vi.fn(),
+  prepareLegacyCopyBack: vi.fn(),
+  cancelLegacyResolution: vi.fn(),
+  confirmLegacyResolution: vi.fn(),
+  reopenUnlinkedLegacyAsset: vi.fn(),
+}));
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn().mockResolvedValue([
     { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, credentialStatus: "configured", enabled: true },
   ]),
-  getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: "c1" }),
+  getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: "c1", agent: null }),
   getSuperSearchServiceResolution: vi.fn().mockResolvedValue({
     ready: true,
     source: "automaticOnline",

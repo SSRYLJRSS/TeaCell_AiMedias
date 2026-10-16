@@ -1,7 +1,7 @@
 //! V24 数值分面（Phase 6 协议测试，§6.3–6.6）—— 生命周期 / 链路 / 转换。
 //! 运行：cargo test --test v24_numbers
 
-use bagertea_ai_media_v2_lib::db::{
+use teacell_ai_media_manager_lib::db::{
     ai, asset_tags, assets, facet_numbers, init_memory, tag_facets, tags,
 };
 
@@ -11,7 +11,7 @@ fn mem() -> rusqlite::Connection {
 
 /// 辅助：插入素材，返回 id（与 foundation_acceptance::f4_insert_asset 同语义）。
 fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
-    assets::insert(
+    let id = assets::insert(
         conn,
         path,
         path.rsplit('/').next().unwrap_or("a.jpg"),
@@ -20,7 +20,34 @@ fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
         "image/jpeg",
         1700000000000,
     )
-    .expect("插入素材失败")
+    .expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .unwrap();
+    let library = teacell_ai_media_manager_lib::db::libraries::current(conn)
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .unwrap();
+    id
 }
 
 /// 数值分面测试夹具：建「人数」数值分面（0–50，单位人），直接 UPDATE 类型与配置
@@ -135,7 +162,7 @@ fn numeric_sync_remains_enabled_for_an_exact_raw_non_raw_pair() {
 fn restrict_delete_blocks_when_numbers_exist() {
     let c = mem();
     // RESTRICT 触发器由 apply_v22b_constraints 创建（生产库 apply 后常在）
-    bagertea_ai_media_v2_lib::db::migrations::apply_v22b_constraints(&c).unwrap();
+    teacell_ai_media_manager_lib::db::migrations::apply_v22b_constraints(&c).unwrap();
     number_facet_setup(&c);
     let _aid = f4_insert_asset(&c, "d:/num4.jpg");
     facet_numbers::set_facet_number(&c, &[_aid], "people_count", 2.0).unwrap();

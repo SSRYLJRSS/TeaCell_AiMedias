@@ -15,7 +15,7 @@
 
 use rusqlite::Connection;
 
-use bagertea_ai_media_v2_lib::db;
+use teacell_ai_media_manager_lib::db;
 
 /// 清空素材相关记录（出库；原文件不动）。事务内完成，触发器自动清 fts_content。
 /// 返回 (清理前素材数, 清理后素材数, fts 剩余)。

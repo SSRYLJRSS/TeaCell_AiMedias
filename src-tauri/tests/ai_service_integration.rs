@@ -1,5 +1,5 @@
 //! AI 云端打标服务层集成测试（TEST_STRATEGY M5 / G3）
-//! 覆盖 run_cloud_batch 全链路：成功写建议 / Anthropic 模式 / 空解析置 rejected（v2.12）/
+//! 覆盖 run_cloud_batch 全链路：成功写建议 / Anthropic 模式 / 空解析保留 pending 并记录错误（v2.12）/
 //! 非 200 降级 / 取消 / limit 续跑 / 无 pending 空转 / list_models / 连接拒绝本地提示。
 //! HTTP mock 用 tests/common 的同步 mock（见其文件头选型说明）。
 //! 网络类用例统一持 common::NET_LOCK 串行执行，消除 Windows 并行偶发连接失败。
@@ -11,14 +11,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bagertea_ai_media_v2_lib::db::ai::{self, AiSuggestion};
-use bagertea_ai_media_v2_lib::db::settings::{AiSettings, ApiProfile};
-use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-use bagertea_ai_media_v2_lib::db::{self, assets};
-use bagertea_ai_media_v2_lib::error::{AppError, AppResult};
-use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
-use bagertea_ai_media_v2_lib::services::{ai_cloud, importer};
-use bagertea_ai_media_v2_lib::state::Database;
+use teacell_ai_media_manager_lib::db::ai::{self, AiSuggestion};
+use teacell_ai_media_manager_lib::db::settings::{AiSettings, ApiProfile};
+use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+use teacell_ai_media_manager_lib::db::{self, assets};
+use teacell_ai_media_manager_lib::error::{AppError, AppResult};
+use teacell_ai_media_manager_lib::services::thumbnail::ThumbnailService;
+use teacell_ai_media_manager_lib::services::{ai_cloud, importer};
+use teacell_ai_media_manager_lib::state::Database;
 
 use common::{HttpResponse, MockServer, RecordedRequest};
 
@@ -53,7 +53,7 @@ fn is_conn_err_text(s: &str) -> bool {
 /// 用例级重试外壳：
 /// - 仅当「连接层特征错误」出现时整体重建环境（DB/tempdir/mock）重跑，最多 2 次重试；
 /// - 覆盖两种出现形态：① 用例以连接层 Err 返回；② 断言 panic 的消息中带连接层错误
-///   （被测代码把连接失败降级为「建议 rejected」，断言会因标签缺失而 panic）；
+///   （被测代码会为连接失败保留 pending 建议并记录错误，断言会因标签缺失而 panic）；
 /// - 业务错误（401/无待打标/解析失败）与不带连接特征的断言失败**不重试**——
 ///   不掩盖被测状态机真错。
 ///
@@ -450,8 +450,8 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
     Ok(())
 });
 
-// v2.12 核心：空解析 = 单条失败置 rejected（不写空标签冒充成功），批次不中断
-conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
+// v2.12 核心：空解析 = 单条失败保留 pending 并记录错误（不写空标签冒充成功），批次不中断
+conn_retry_test!(empty_tags_keep_pending_and_batch_continues, {
     let _g = common::net_lock_guard();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls2 = Arc::clone(&calls);
@@ -490,8 +490,8 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     assert_eq!(b.status, "done", "空解析不得中断整批");
     assert_eq!(b.processed, 2);
     let sug = ai::list_suggestions(&conn, batch.id)?;
-    // 空解析那条：rejected + 失败详情落库；tags 保持空（不冒充成功）
-    assert_eq!(sug[0].status, "rejected");
+    // 空解析那条：pending + 失败详情落库；tags 保持空（不冒充成功）
+    assert_eq!(sug[0].status, "pending");
     assert_eq!(sug[0].suggested_tags.len(), 0);
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
     assert!(
@@ -513,8 +513,8 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     Ok(())
 });
 
-// 非 200（5xx）：该条 rejected，批次继续走完 done
-conn_retry_test!(http_500_marks_rejected_and_batch_done, {
+// 非 200（5xx）：该条保留 pending 并记录错误，批次继续走完 done
+conn_retry_test!(http_500_keeps_pending_and_batch_done, {
     let _g = common::net_lock_guard();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls2 = Arc::clone(&calls);
@@ -554,7 +554,7 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     assert_eq!(b.processed, 2);
     let sug = ai::list_suggestions(&conn, batch.id)?;
     assert_eq!(
-        sug[0].status, "rejected",
+        sug[0].status, "pending",
         "status={} last_error={:?}",
         sug[0].status, sug[0].last_error
     );
@@ -943,7 +943,7 @@ conn_retry_test!(connection_refused_local_profile_hint, {
 
     let conn = dbm.lock().unwrap();
     let sug = ai::list_suggestions(&conn, batch.id)?;
-    assert_eq!(sug[0].status, "rejected");
+    assert_eq!(sug[0].status, "pending");
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
     assert!(
         err.contains("视觉请求连接失败，请检查服务地址或网络"),

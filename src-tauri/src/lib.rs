@@ -4,6 +4,7 @@
 //! 缩略图 LRU、旧标签整理、历史任务状态修复全部移入具名后台线程（不阻塞窗口显示）。
 
 pub mod commands;
+pub mod contracts;
 pub mod db;
 pub mod error;
 pub mod observability;
@@ -16,6 +17,7 @@ use crate::error::AppError;
 use crate::observability::LoggingGuard;
 use crate::services::thumbnail::ThumbnailService;
 use state::AppState;
+use tauri::Emitter;
 use tauri::Manager;
 
 /// W0-10：迁移/初始化失败给用户可见出路（发布版无控制台，panic 等于静默崩溃）。
@@ -74,6 +76,9 @@ pub fn run() {
         Ok(c) => c,
         Err(e) => fatal_db_error(&db_path, &data_dir.join("logs"), &e),
     };
+    if let Err(error) = services::managed_library::initialize_runtime(&conn) {
+        tracing::error!("总仓身份初始化失败，受管素材将保持不可见: {error}");
+    }
     if let Some(id) = installation_id {
         if let Err(error) = settings::normalize_tutorial_installation(&conn, &id) {
             tracing::warn!("安装后的教程提示状态同步失败，下次启动将重试: {error}");
@@ -103,6 +108,20 @@ pub fn run() {
         // B08：只放行 thumbnails/ + previews/ 子目录，不放行 data_dir 根（含 library.db）
         // 素材原文件由 list/get 命令逐路径放行
         .setup(move |app| {
+            // The Rust desktop process owns one Pi Host. The event adapter only
+            // forwards validated protocol frames; persistence remains with A3-04.
+            let agent_state = app.state::<AppState>();
+            let agent_app = app.handle().clone();
+            agent_state.agent_runtime.configure_for_app(
+                app.handle(),
+                &scope_dir,
+                std::sync::Arc::clone(&agent_state.db),
+                std::sync::Arc::new(move |frame| {
+                    if agent_app.emit("agent-host-event", frame).is_err() {
+                        tracing::debug!(operation = "agent_host_event", error_code = "emit_failed");
+                    }
+                }),
+            );
             let thumbs_dir = scope_dir.join("thumbnails");
             let previews_dir = scope_dir.join("previews");
             let proxies_dir = scope_dir.join("proxies");
@@ -158,6 +177,20 @@ pub fn run() {
                     if let Err(e) = db::tags::retire_unused_presets(&c) {
                         tracing::warn!("旧预置标签清理失败: {e}");
                     }
+                }
+            });
+
+            // A1-02：旧记录分类是后台、分页、限批工作；不阻塞启动，也不让
+            // 未核验记录进入普通查询或自动清理。
+            let reconcile_db = std::sync::Arc::clone(&state.db);
+            spawn_maintenance("library-reconcile", move || {
+                match services::managed_library::reconcile_pending(&reconcile_db) {
+                    Ok(report) => tracing::info!(
+                        inspected = report.inspected,
+                        classified = report.classified,
+                        "总仓旧记录分类完成"
+                    ),
+                    Err(error) => tracing::warn!("总仓旧记录分类失败: {error}"),
                 }
             });
 
@@ -237,6 +270,14 @@ pub fn run() {
                 }
             });
 
+            // A1-05：启动只对账并生成恢复摘要，不自动推进任何副作用。
+            let operation_db = std::sync::Arc::clone(&state.db);
+            spawn_maintenance("operation-recovery", move || {
+                if let Err(error) = services::operations::reconcile_startup(&operation_db) {
+                    tracing::warn!("操作恢复对账失败: {error}");
+                }
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -248,6 +289,44 @@ pub fn run() {
             // 素材
             commands::list_assets,
             commands::list_asset_ids,
+            // A1-03：目录授权和受控资源句柄
+            commands::pick_directory_grant,
+            commands::list_directory_grants,
+            commands::reissue_directory_grant,
+            commands::revoke_directory_grant,
+            commands::revoke_all_directory_grants,
+            commands::page_authorized_directory,
+            // A1-04：计划审核与操作查询
+            commands::list_pending_plans,
+            commands::approve_plan,
+            commands::get_operation,
+            commands::cancel_operation,
+            commands::resume_operation,
+            commands::list_operation_recovery,
+            // A1-06：会话索引与持久工作台草稿
+            commands::create_conversation,
+            commands::list_conversations,
+            commands::get_conversation,
+            commands::rename_conversation,
+            commands::set_conversation_archived,
+            commands::delete_conversation,
+            commands::save_conversation_draft,
+            commands::attach_conversation_asset,
+            commands::link_conversation,
+            // A3-01：Rust-owned, offline-only Pi Host lifecycle/protocol.
+            commands::agent_host_start,
+            commands::agent_host_open_conversation,
+            commands::agent_host_send,
+            commands::agent_host_cancel_run,
+            commands::agent_host_close_conversation,
+            // A2-01：导入准备计划（扫描/检查与正式入库分离）
+            commands::prepare_import,
+            commands::cancel_prepare_import,
+            commands::get_import_plan,
+            commands::get_import_plan_preview_paths,
+            commands::get_import_result,
+            commands::verify_import_plan,
+            commands::confirm_import,
             // 一句话描述列表（标签设置页展示）
             commands::list_content_descriptions,
             commands::list_metadata_facets,
@@ -293,11 +372,17 @@ pub fn run() {
             commands::list_assets_by_plan,
             commands::list_asset_ids_by_plan,
             // 入库
-            commands::import_files,
             commands::inspect_import,
-            commands::cancel_import,
             commands::preview_rename,
             commands::open_file_external,
+            // A2-03：GUI-only, receipt-backed handling of historical external assets.
+            commands::list_legacy_assets,
+            commands::list_unlinked_legacy_assets,
+            commands::prepare_legacy_unlink,
+            commands::prepare_legacy_copy_back,
+            commands::cancel_legacy_asset_resolution,
+            commands::confirm_legacy_asset_resolution,
+            commands::reopen_unlinked_legacy_asset,
             // 标签
             commands::list_tags,
             commands::list_tag_facets,
@@ -351,7 +436,10 @@ pub fn run() {
             commands::cancel_export,
             // AI 打标
             commands::ai_create_batch,
-            commands::ai_start_batch,
+            commands::ai_prepare_batch,
+            commands::ai_prepare_import_batch,
+            commands::ai_submit_tagging_plan,
+            commands::ai_start_tagging,
             commands::ai_cancel_batch,
             commands::ai_list_batches,
             commands::ai_list_suggestions,
@@ -429,6 +517,7 @@ pub fn run() {
             // L2（§8.2）：应用退出只停止 AppOwned；External（用户自启）永不杀
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    state.agent_runtime.shutdown();
                     let rt = std::sync::Arc::clone(&state.ollama_runtime);
                     {
                         let mut runtime = rt.lock().ok();

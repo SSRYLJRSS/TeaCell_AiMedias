@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import PendingList from "@/components/import/PendingList";
 import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
-import type { ImportPlanItem } from "@/api/import";
+import type { ImportPlanItem } from "@/types/import";
 
 vi.mock("@/api/preview", () => ({
   getPreviewUrl: (p: string) => Promise.resolve(`asset://preview/${p}`),

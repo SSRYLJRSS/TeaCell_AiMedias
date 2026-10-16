@@ -10,16 +10,21 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::thumbnail::ThumbnailService;
-use super::{dedup, exif_meta, imaging, thumbnail, video};
+use super::{exif_meta, imaging, thumbnail, video};
 use crate::db::assets::{self, ImportResult};
+use crate::db::libraries::{self, LibrarySnapshot};
 use crate::error::{AppError, AppResult};
+use crate::services::managed_library::{self, ImportFileEvidence};
 use crate::state::Database;
+use crate::utils::file_identity::file_object_identity;
+use crate::utils::path::is_link_or_reparse;
 use crate::utils::{mime, path};
 
 /// 入库阶段（阶段 1 契约，见《入库标签与素材库改造开发指导书》§4.4）：
@@ -61,6 +66,10 @@ impl ImportPhase {
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
     pub task_id: String,
+    /// Persistent operation scope for import-queue events; legacy manual
+    /// imports keep this unset and continue to use their task ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     /// queued|scanning|hashing|processing|previewing|done
     pub phase: String,
     pub phase_current: i64,
@@ -79,6 +88,7 @@ impl ImportProgress {
     fn new(task_id: &str, phase: ImportPhase) -> Self {
         ImportProgress {
             task_id: task_id.to_string(),
+            operation_id: None,
             phase: phase.as_str().to_string(),
             phase_current: 0,
             phase_total: None,
@@ -164,6 +174,15 @@ fn is_supported(p: &Path) -> bool {
         .is_some()
 }
 
+/// Classify a file name as "image" / "video" using the shared MIME table.
+pub(crate) fn kind_for_display_name(name: &str) -> &'static str {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    mime::asset_type_from_ext(ext).unwrap_or("image")
+}
+
 /// 入库选项（R-32 总库/分库托管）
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
@@ -223,10 +242,10 @@ fn render_name(
 }
 
 /// 校验分库名：禁止路径穿越/分隔符（PRD R-32）
-fn validate_collection(name: &str) -> AppResult<()> {
+pub(crate) fn validate_collection(name: &str) -> AppResult<()> {
     let n = name.trim();
     if n.is_empty() || n.contains("..") || n.contains('/') || n.contains('\\') || n.contains(':') {
-        return Err(AppError::msg("非法分库名称"));
+        return Err(AppError::invalid_arg("非法分库名称"));
     }
     Ok(())
 }
@@ -243,9 +262,20 @@ fn copy_create_new(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 托管模式：复制源文件到 总库/分库/（可选批量改名），返回入库用路径
-/// B06a：同名冲突循环耗尽（999）时报错而非静默覆盖已有文件
+/// Managed import publication follows: durable intent -> bounded private staging
+/// copy -> digest verification -> exclusive hard-link publication -> DB insert.
 fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBuf> {
+    stage_file_with_intent(file, opts, seq, None, &|| Ok(()), &|_| {})
+}
+
+fn stage_file_with_intent(
+    file: &Path,
+    opts: &ImportOptions,
+    seq: usize,
+    intent: Option<(&Database, &str, &str)>,
+    checkpoint: &(dyn Fn() -> AppResult<()> + Sync),
+    copy_progress: &(dyn Fn(u64) + Sync),
+) -> AppResult<PathBuf> {
     let root = opts.library_root.as_deref().unwrap_or_default().trim();
     if root.is_empty() {
         return Ok(file.to_path_buf());
@@ -254,66 +284,458 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
     if !collection.is_empty() {
         validate_collection(collection)?;
     }
-    let dest_dir = if collection.is_empty() {
+    let destination_directory = if collection.is_empty() {
         PathBuf::from(root)
     } else {
         PathBuf::from(root).join(collection)
     };
-    // 目标路径将写入 SQLite/回传前端，不接受不可无损表示的路径。
-    path::encode_native_path(&dest_dir)?;
-    std::fs::create_dir_all(&dest_dir)?;
+    path::encode_native_path(&destination_directory)?;
+    std::fs::create_dir_all(&destination_directory)?;
+    let base_name = import_target_name(file, opts, collection, seq)?;
+    let candidates = import_target_candidates(&destination_directory, &base_name);
 
-    let ext = file
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-    let base_name = if let Some(tpl) = &opts.rename_pattern {
-        let orig_stem = file
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全改名"))?;
-        let mtime = file
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        format!(
-            "{}.{ext}",
-            render_name(tpl, collection, orig_stem, mtime, seq)
-        )
-    } else {
-        file.file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全入库"))?
-            .to_owned()
-    };
-    // 同名冲突加 (n) 后缀：create_new 原子创建，②a 并行 stage 的多个同名文件
-    // 各自依次尝试候选名，先创建成功者占用——不再依赖 exists() 检查后复制（有竞态，
-    // 两线程会同时通过检查互相覆盖 → 数据丢失）
-    let stem = Path::new(&base_name)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    for i in 0..1000 {
-        let dest = if i == 0 {
-            dest_dir.join(&base_name)
-        } else {
-            dest_dir.join(format!("{stem}({i}).{ext}"))
+    if let Some((db, task, hash)) = intent {
+        let library = {
+            let conn = db.lock()?;
+            crate::db::libraries::current(&conn)?.ok_or_else(|| AppError::conflict("总仓不可用"))?
         };
-        match copy_create_new(file, &dest) {
-            Ok(()) => return Ok(dest),
-            // 该名字已被（并行任务或磁盘已有文件）占用，尝试下一个候选
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
+        let previous = {
+            let conn = db.lock()?;
+            crate::db::import_execution::intent(&conn, task)?
+        };
+        if let Some(mut previous) = previous {
+            if previous.content_sha256 != hash {
+                return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+            }
+            if previous.staging_path.is_none() {
+                let target = PathBuf::from(&previous.target_path);
+                managed_library::validate_import_target(&library, &target)?;
+                if path_exists_no_follow(&target)? {
+                    let metadata = std::fs::symlink_metadata(&target)?;
+                    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+                    }
+                    let opened = std::fs::File::open(&target)?;
+                    if previous.created_file_identity.as_deref()
+                        != Some(crate::utils::file_identity::file_identity(&opened)?.as_str())
+                        || crate::utils::hash::sha256_full(&target)? != hash
+                    {
+                        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+                    }
+                    return Ok(target);
+                }
+                if previous.created_file_identity.is_some() {
+                    return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+                }
+                let stage_directory = managed_library::prepare_import_staging_directory(&library)?;
+                let stage_path = new_import_stage_path(&stage_directory);
+                let conn = db.lock()?;
+                crate::db::import_execution::attach_missing_unpublished_stage(
+                    &conn,
+                    task,
+                    &previous.target_path,
+                    &path::encode_native_path(&stage_path)?,
+                )?;
+                previous = crate::db::import_execution::intent(&conn, task)?
+                    .ok_or_else(|| AppError::conflict("OUTCOME_UNKNOWN"))?;
+            }
+            let context = StagedImportContext {
+                db,
+                task,
+                checkpoint,
+                copy_progress,
+            };
+            return resume_staged_import(
+                file,
+                &library,
+                &destination_directory,
+                &base_name,
+                hash,
+                &context,
+                previous,
+            );
+        }
+
+        let stage_directory = managed_library::prepare_import_staging_directory(&library)?;
+        for target in &candidates {
+            if path_exists_no_follow(target)? {
+                continue;
+            }
+            managed_library::validate_import_target(&library, target)?;
+            let stage_path = new_import_stage_path(&stage_directory);
+            {
+                let conn = db.lock()?;
+                crate::db::import_execution::record_intent(
+                    &conn,
+                    task,
+                    &path::encode_native_path(target)?,
+                    &path::encode_native_path(&stage_path)?,
+                    hash,
+                )?;
+            }
+            let previous = {
+                let conn = db.lock()?;
+                crate::db::import_execution::intent(&conn, task)?
+                    .ok_or_else(|| AppError::internal("导入发布意图写入后丢失"))?
+            };
+            let context = StagedImportContext {
+                db,
+                task,
+                checkpoint,
+                copy_progress,
+            };
+            return resume_staged_import(
+                file,
+                &library,
+                &destination_directory,
+                &base_name,
+                hash,
+                &context,
+                previous,
+            );
+        }
+        return Err(AppError::msg(format!("同名文件过多: {base_name}")));
+    }
+
+    for target in candidates {
+        if path_exists_no_follow(&target)? {
+            continue;
+        }
+        match copy_create_new(file, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
         }
     }
-    // B06a：同名冲突耗尽时报错，不再回退覆盖已有文件
     Err(AppError::msg(format!("同名文件过多: {base_name}")))
 }
 
+fn import_target_name(
+    file: &Path,
+    opts: &ImportOptions,
+    collection: &str,
+    seq: usize,
+) -> AppResult<String> {
+    let extension = file
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if let Some(template) = &opts.rename_pattern {
+        let stem = file
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全改名"))?;
+        let modified_at = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(format!(
+            "{}.{extension}",
+            render_name(template, collection, stem, modified_at, seq)
+        ))
+    } else {
+        file.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全入库"))
+    }
+}
+
+fn import_target_candidates(destination_directory: &Path, base_name: &str) -> Vec<PathBuf> {
+    let extension = Path::new(base_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let stem = Path::new(base_name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    (0..1000)
+        .map(|index| {
+            if index == 0 {
+                destination_directory.join(base_name)
+            } else {
+                destination_directory.join(format!("{stem}({index}).{extension}"))
+            }
+        })
+        .collect()
+}
+
+fn new_import_stage_path(stage_directory: &Path) -> PathBuf {
+    stage_directory.join(format!("{}.part", Uuid::new_v4().simple()))
+}
+
+struct StagedImportContext<'a> {
+    db: &'a Database,
+    task: &'a str,
+    checkpoint: &'a (dyn Fn() -> AppResult<()> + Sync),
+    copy_progress: &'a (dyn Fn(u64) + Sync),
+}
+
+fn path_exists_no_follow(path: &Path) -> AppResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_stage_link_if_owned(stage_path: &Path, expected_identity: &str) -> AppResult<()> {
+    if !path_exists_no_follow(stage_path)? {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(stage_path)?;
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Ok(());
+    }
+    let stage = std::fs::File::open(stage_path)?;
+    if file_object_identity(&stage)? == expected_identity {
+        std::fs::remove_file(stage_path)?;
+    }
+    Ok(())
+}
+
+fn resume_staged_import(
+    source: &Path,
+    library: &LibrarySnapshot,
+    destination_directory: &Path,
+    base_name: &str,
+    expected_hash: &str,
+    context: &StagedImportContext<'_>,
+    mut intent: crate::db::import_execution::PublicationIntent,
+) -> AppResult<PathBuf> {
+    let stage_directory = managed_library::prepare_import_staging_directory(library)?;
+    let mut stage_path = PathBuf::from(
+        intent
+            .staging_path
+            .as_deref()
+            .ok_or_else(|| AppError::conflict("OUTCOME_UNKNOWN"))?,
+    );
+    if stage_path.parent() != Some(stage_directory.as_path()) {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+    let target_path = PathBuf::from(&intent.target_path);
+    if let Some(published_identity) = intent.published_file_identity.as_deref() {
+        // The persisted target is already the output of the frozen rename
+        // decision. During recovery `source` may itself be this published file,
+        // so applying the rename template again would produce a different
+        // candidate (for example `prefix_prefix_a.jpg`). Trust only the exact
+        // recorded target, after checking its location, object identity, and
+        // full content digest.
+        if target_path.parent() != Some(destination_directory) {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        if !path_exists_no_follow(&target_path)? {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        managed_library::validate_import_target(library, &target_path)?;
+        let published = std::fs::File::open(&target_path)?;
+        if file_object_identity(&published)? != published_identity
+            || crate::utils::hash::sha256_full(&target_path)? != expected_hash
+        {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        if let Some(staging_identity) = intent.staging_file_identity.as_deref() {
+            let _ = remove_stage_link_if_owned(&stage_path, staging_identity);
+        }
+        return Ok(target_path);
+    }
+    let candidates = import_target_candidates(destination_directory, base_name);
+    if !target_path.starts_with(destination_directory) || !candidates.contains(&target_path) {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+    if intent.created_file_identity.is_some() {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+
+    if path_exists_no_follow(&target_path)? {
+        let metadata = std::fs::symlink_metadata(&target_path)?;
+        if !is_link_or_reparse(&metadata) && metadata.is_file() {
+            if let Some(staging_identity) = intent.staging_file_identity.as_deref() {
+                let target = std::fs::File::open(&target_path)?;
+                if file_object_identity(&target)? == staging_identity {
+                    if crate::utils::hash::sha256_full(&target_path)? != expected_hash {
+                        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+                    }
+                    {
+                        let conn = context.db.lock()?;
+                        crate::db::import_execution::record_published_file(
+                            &conn,
+                            context.task,
+                            staging_identity,
+                            staging_identity,
+                        )?;
+                    }
+                    let _ = remove_stage_link_if_owned(&stage_path, staging_identity);
+                    return Ok(target_path);
+                }
+            } else {
+                return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+            }
+        }
+    }
+
+    if path_exists_no_follow(&stage_path)? {
+        let metadata = std::fs::symlink_metadata(&stage_path)?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        if intent.staging_file_identity.is_none() {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+    } else if intent.staging_file_identity.is_some() {
+        let replacement = new_import_stage_path(&stage_directory);
+        let old_path = intent
+            .staging_path
+            .clone()
+            .ok_or_else(|| AppError::conflict("OUTCOME_UNKNOWN"))?;
+        {
+            let conn = context.db.lock()?;
+            crate::db::import_execution::reset_missing_unpublished_stage(
+                &conn,
+                context.task,
+                &old_path,
+                &path::encode_native_path(&replacement)?,
+            )?;
+            intent = crate::db::import_execution::intent(&conn, context.task)?
+                .ok_or_else(|| AppError::conflict("OUTCOME_UNKNOWN"))?;
+        }
+        stage_path = replacement;
+    }
+
+    let staging_identity = write_verified_stage(
+        source,
+        &stage_path,
+        intent.staging_file_identity.as_deref(),
+        expected_hash,
+        context,
+    )?;
+
+    for candidate in candidates {
+        if path_exists_no_follow(&candidate)? {
+            continue;
+        }
+        managed_library::validate_import_target(library, &candidate)?;
+        let encoded_candidate = path::encode_native_path(&candidate)?;
+        if encoded_candidate != intent.target_path {
+            let conn = context.db.lock()?;
+            crate::db::import_execution::update_unpublished_target(
+                &conn,
+                context.task,
+                &intent.target_path,
+                &encoded_candidate,
+            )?;
+            intent.target_path = encoded_candidate;
+        }
+        (context.checkpoint)()?;
+        match std::fs::hard_link(&stage_path, &candidate) {
+            Ok(()) => {
+                managed_library::validate_import_target(library, &candidate)?;
+                let published = std::fs::File::open(&candidate)?;
+                let published_identity = file_object_identity(&published)?;
+                if published_identity != staging_identity
+                    || crate::utils::hash::sha256_full(&candidate)? != expected_hash
+                {
+                    return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+                }
+                {
+                    let conn = context.db.lock()?;
+                    crate::db::import_execution::record_published_file(
+                        &conn,
+                        context.task,
+                        &staging_identity,
+                        &published_identity,
+                    )?;
+                }
+                let _ = remove_stage_link_if_owned(&stage_path, &staging_identity);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(AppError::unsupported(
+                    "当前文件系统不支持安全的导入目标发布",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(AppError::msg(format!("同名文件过多: {base_name}")))
+}
+
+fn write_verified_stage(
+    source: &Path,
+    stage: &Path,
+    expected_identity: Option<&str>,
+    expected_hash: &str,
+    context: &StagedImportContext<'_>,
+) -> AppResult<String> {
+    (context.checkpoint)()?;
+    let stage_exists = path_exists_no_follow(stage)?;
+    let mut destination = if stage_exists {
+        let output = OpenOptions::new().write(true).open(stage)?;
+        let identity = file_object_identity(&output)?;
+        if expected_identity != Some(identity.as_str()) {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        output.set_len(0)?;
+        output
+    } else {
+        if expected_identity.is_some() {
+            return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+        }
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stage)?;
+        let identity = file_object_identity(&output)?;
+        {
+            let conn = context.db.lock()?;
+            crate::db::import_execution::record_staging_file(&conn, context.task, &identity)?;
+        }
+        output
+    };
+    let stage_identity = file_object_identity(&destination)?;
+    if expected_identity.is_some_and(|expected| expected != stage_identity) {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+    let mut input = std::fs::File::open(source)?;
+    let mut buffer = [0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        (context.checkpoint)()?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read])?;
+        copied = copied.saturating_add(read as u64);
+        (context.copy_progress)(copied);
+        (context.checkpoint)()?;
+    }
+    destination.flush()?;
+    destination.sync_all()?;
+    (context.checkpoint)()?;
+    if file_object_identity(&destination)? != stage_identity {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+    let metadata = destination.metadata()?;
+    if !metadata.is_file() || metadata.len() != copied {
+        return Err(AppError::conflict("OUTCOME_UNKNOWN"));
+    }
+    drop(destination);
+    let reopened = std::fs::File::open(stage)?;
+    if file_object_identity(&reopened)? != stage_identity
+        || crate::utils::hash::sha256_full(stage)? != expected_hash
+    {
+        return Err(AppError::from(
+            crate::contracts::agent::AgentErrorCode::PlanChanged,
+        ));
+    }
+    Ok(stage_identity)
+}
 // ── B01：元数据提取与回写（拆自原 import_one） ──
 
 /// 锁外提取的元数据（image_dimensions + EXIF + ffprobe）
@@ -471,6 +893,7 @@ struct Processed {
     file_size: i64,
     modified_at: i64,
     meta: Option<AssetMeta>,
+    protection: Option<ImportFileEvidence>,
 }
 
 /// 单文件处理结果：New 带完整元数据（大）、Duplicate/Failed 轻量。
@@ -485,25 +908,71 @@ enum ProcResult {
 }
 
 enum HashOutcome {
-    Ready(String),
+    Ready {
+        compact: String,
+        content_sha256: String,
+    },
     Failed(String),
     Cancelled,
 }
 
 /// B01：单文件写库（insert + set_hash + write_meta），事务内调用
-fn write_one(conn: &Connection, p: &Processed) -> AppResult<i64> {
-    let id = assets::insert(
-        conn,
-        &p.norm,
-        &p.file_name,
-        &p.ext,
-        p.file_size,
-        &p.mime_type,
-        p.modified_at,
-    )?;
-    assets::set_hash(conn, id, &p.hash)?;
-    write_meta(conn, id, &p.meta, &p.mime_type)?;
-    Ok(id)
+fn write_one(
+    conn: &Connection,
+    p: &Processed,
+    library: Option<&LibrarySnapshot>,
+) -> AppResult<i64> {
+    conn.execute_batch("SAVEPOINT import_item")?;
+    let result = (|| {
+        let id = assets::insert(
+            conn,
+            &p.norm,
+            &p.file_name,
+            &p.ext,
+            p.file_size,
+            &p.mime_type,
+            p.modified_at,
+        )?;
+        assets::set_hash(conn, id, &p.hash)?;
+        write_meta(conn, id, &p.meta, &p.mime_type)?;
+        if let (Some(library), Some(protection)) = (library, p.protection.as_ref()) {
+            let revision: String = conn.query_row(
+                "SELECT location_revision FROM managed_asset_locations WHERE asset_id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            let candidate = libraries::VerificationCandidate {
+                asset_id: id,
+                observed_path: p.norm.clone(),
+                observed_modified_at: p.modified_at,
+                location_revision: Some(revision),
+            };
+            if !libraries::record_verified(
+                conn,
+                library,
+                &candidate,
+                &protection.relative_path,
+                &protection.file_identity,
+                &protection.content_sha256,
+                &protection.ownership_receipt,
+            )? {
+                return Err(AppError::conflict(
+                    "导入期间总仓身份或文件定位发生变化，已拒绝登记",
+                ));
+            }
+        }
+        Ok(id)
+    })();
+    match result {
+        Ok(id) => {
+            conn.execute_batch("RELEASE import_item")?;
+            Ok(id)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK TO import_item; RELEASE import_item");
+            Err(error)
+        }
+    }
 }
 
 /// 托管模式下，写库失败要清理已复制副本，避免磁盘文件和数据库记录长期不一致。
@@ -612,6 +1081,40 @@ pub fn validate_library_root(root: &str) -> AppResult<PathBuf> {
     Ok(path)
 }
 
+fn ensure_import_library(conn: &Connection, root: &Path) -> AppResult<LibrarySnapshot> {
+    let canonical_root = root.canonicalize().map_err(|_| {
+        AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "总库目录不可访问",
+        )
+    })?;
+    let current =
+        libraries::current(conn)?.ok_or_else(|| AppError::internal("总仓保护状态缺失"))?;
+    if current.root_path.trim().is_empty() {
+        managed_library::adopt_initial_root(conn, &canonical_root)?;
+    } else {
+        let current_root = Path::new(&current.root_path).canonicalize().map_err(|_| {
+            AppError::coded(
+                crate::error::AppErrorCode::InvalidLibraryRoot,
+                "已配置总库目录不可访问",
+            )
+        })?;
+        if current_root != canonical_root {
+            return Err(AppError::conflict(
+                "导入目标不是当前总仓，请重新选择导入位置",
+            ));
+        }
+    }
+    let snapshot = managed_library::initialize_runtime(conn)?;
+    if snapshot.health != crate::db::libraries::LibraryHealth::Ready {
+        return Err(AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "总仓身份未通过核验，已停止入库",
+        ));
+    }
+    Ok(snapshot)
+}
+
 /// 使用已有的检查任务 ID 继续入库，让检查、前置校验和入库阶段共用左侧进度栏。
 pub fn import_paths_with_task_id<F: Fn(ImportProgress) + Sync>(
     db: &Database,
@@ -628,8 +1131,11 @@ pub fn import_paths_with_task_id<F: Fn(ImportProgress) + Sync>(
         ImportInput::Paths(paths),
         opts,
         cancel,
-        task_id,
-        progress,
+        ImportExecutionHooks {
+            task_id,
+            progress,
+            checkpoint: || Ok(()),
+        },
     )
 }
 
@@ -649,32 +1155,112 @@ pub fn import_preflight_plan_with_task_id<F: Fn(ImportProgress) + Sync>(
         ImportInput::PreflightPlan(plan),
         opts,
         cancel,
-        task_id,
-        progress,
+        ImportExecutionHooks {
+            task_id,
+            progress,
+            checkpoint: || Ok(()),
+        },
+    )
+}
+
+/// Bind reliable worker evidence to the shared importer hash and staged-byte validation.
+pub fn import_verified_plan_with_task_id<F: Fn(ImportProgress) + Sync>(
+    db: &Database,
+    thumbs: &ThumbnailService,
+    plan: ImportPlan,
+    opts: &ImportOptions,
+    cancel: &AtomicBool,
+    task_id: String,
+    verified: (&str, usize, F),
+) -> AppResult<ImportResult> {
+    import_verified_plan_with_task_id_and_check(
+        db,
+        thumbs,
+        plan,
+        opts,
+        cancel,
+        VerifiedImportExecution {
+            task_id,
+            content_sha256: verified.0.to_owned(),
+            sequence: verified.1,
+            progress: verified.2,
+            checkpoint: || Ok(()),
+        },
+    )
+}
+
+pub struct VerifiedImportExecution<F, C> {
+    pub task_id: String,
+    pub content_sha256: String,
+    pub sequence: usize,
+    pub progress: F,
+    pub checkpoint: C,
+}
+
+struct ImportExecutionHooks<F, C> {
+    task_id: String,
+    progress: F,
+    checkpoint: C,
+}
+
+/// Reliable imports pass a checkpoint that revalidates source authorization
+/// and cancellation between bounded staging-copy chunks.
+pub fn import_verified_plan_with_task_id_and_check<
+    F: Fn(ImportProgress) + Sync,
+    C: Fn() -> AppResult<()> + Sync,
+>(
+    db: &Database,
+    thumbs: &ThumbnailService,
+    plan: ImportPlan,
+    opts: &ImportOptions,
+    cancel: &AtomicBool,
+    execution: VerifiedImportExecution<F, C>,
+) -> AppResult<ImportResult> {
+    let task_id = execution.task_id;
+    import_paths_inner(
+        db,
+        thumbs,
+        ImportInput::VerifiedPlan(plan, execution.content_sha256, execution.sequence),
+        opts,
+        cancel,
+        ImportExecutionHooks {
+            task_id,
+            progress: execution.progress,
+            checkpoint: execution.checkpoint,
+        },
     )
 }
 
 enum ImportInput<'a> {
     Paths(&'a [String]),
     PreflightPlan(ImportPlan),
+    VerifiedPlan(ImportPlan, String, usize),
 }
 
-fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
+fn import_paths_inner<F: Fn(ImportProgress) + Sync, C: Fn() -> AppResult<()> + Sync>(
     db: &Database,
     thumbs: &ThumbnailService,
     input: ImportInput<'_>,
     opts: &ImportOptions,
     cancel: &AtomicBool,
-    task_id: String,
-    progress: F,
+    hooks: ImportExecutionHooks<F, C>,
 ) -> AppResult<ImportResult> {
+    let ImportExecutionHooks {
+        task_id,
+        progress,
+        checkpoint,
+    } = hooks;
     let library_root = opts.library_root.as_deref().ok_or_else(|| {
         AppError::coded(
             crate::error::AppErrorCode::LibraryRootRequired,
             "请先在设置中配置并保存总库位置",
         )
     })?;
-    validate_library_root(library_root)?;
+    let validated_root = validate_library_root(library_root)?;
+    let library_snapshot = {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        ensure_import_library(&conn, &validated_root)?
+    };
     // 快速失败：分库名非法直接拒绝整个批次（PRD R-32 禁路径穿越）
     if let Some(c) = &opts.collection {
         if !c.trim().is_empty() {
@@ -688,7 +1274,7 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
         task_id = %task_id,
         path_count = match &input {
             ImportInput::Paths(paths) => paths.len(),
-            ImportInput::PreflightPlan(plan) => plan.items.len(),
+            ImportInput::PreflightPlan(plan) | ImportInput::VerifiedPlan(plan, _, _) => plan.items.len(),
         },
         managed = opts.library_root.is_some(),
         "导入任务开始"
@@ -699,9 +1285,20 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
     progress(queued);
     // scanning：目录递归收集候选文件（phaseTotal 未知 → 前端显示不确定进度）
     let scan_started_at = std::time::Instant::now();
-    let reused_preflight = matches!(&input, ImportInput::PreflightPlan(_));
+    let expected_sequence = match &input {
+        ImportInput::VerifiedPlan(_, _, sequence) => Some(*sequence),
+        _ => None,
+    };
+    let expected_hash = match &input {
+        ImportInput::VerifiedPlan(_, hash, _) => Some(hash.clone()),
+        _ => None,
+    };
+    let reused_preflight = matches!(
+        &input,
+        ImportInput::PreflightPlan(_) | ImportInput::VerifiedPlan(_, _, _)
+    );
     let (files, scan_warnings) = match input {
-        ImportInput::PreflightPlan(plan) => {
+        ImportInput::PreflightPlan(plan) | ImportInput::VerifiedPlan(plan, _, _) => {
             let files: Vec<PathBuf> = plan
                 .items
                 .into_iter()
@@ -772,8 +1369,11 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
             if cancel.load(Ordering::Relaxed) {
                 return HashOutcome::Cancelled;
             }
-            let hash = match crate::utils::hash::sha256_16(f) {
-                Ok(hash) => HashOutcome::Ready(hash),
+            let hash = match crate::utils::hash::sha256_full(f) {
+                Ok(content_sha256) => HashOutcome::Ready {
+                    compact: content_sha256[..32].to_string(),
+                    content_sha256,
+                },
                 Err(e) => HashOutcome::Failed(format!("{}: {e}", f.display())),
             };
             let n = hash_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -822,8 +1422,14 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                     .into_owned(),
             );
             progress(pe);
-            let hash = match &hashes[idx] {
-                HashOutcome::Ready(hash) => hash.clone(),
+            if cancel.load(Ordering::Relaxed) {
+                return ProcResult::Cancelled;
+            }
+            let (hash, content_sha256) = match &hashes[idx] {
+                HashOutcome::Ready {
+                    compact,
+                    content_sha256,
+                } => (compact.clone(), content_sha256.clone()),
                 HashOutcome::Failed(error) => {
                     tracing::warn!(
                         operation = "import",
@@ -837,6 +1443,12 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                 }
                 HashOutcome::Cancelled => return ProcResult::Cancelled,
             };
+            if expected_hash
+                .as_ref()
+                .is_some_and(|expected| expected != &content_sha256)
+            {
+                return ProcResult::Failed("PLAN_CHANGED".into());
+            }
             // precheck 用短锁（单次查询，微秒级）；TOCTOU 由 UNIQUE 约束兜底
             // 注意：precheck 返回 true=新文件，false=重复
             let is_new = {
@@ -886,7 +1498,30 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                 return ProcResult::Failed(format!("{}: {e}", file.display()));
             }
             // 锁外：托管复制
-            let staged = match stage_file(file, opts, idx + 1) {
+            let staged_result = if expected_hash.is_some() {
+                let copy_total = file.metadata().map(|metadata| metadata.len() as i64).ok();
+                let report_copy = |copied: u64| {
+                    let mut event = ImportProgress::new(&task_id, ImportPhase::Processing);
+                    event.phase_current = copied.min(i64::MAX as u64) as i64;
+                    event.phase_total = copy_total;
+                    event.file = file
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned());
+                    event.message = Some("正在安全暂存并校验文件".into());
+                    progress(event);
+                };
+                stage_file_with_intent(
+                    file,
+                    opts,
+                    expected_sequence.unwrap_or(idx + 1),
+                    Some((db, &task_id, &content_sha256)),
+                    &checkpoint,
+                    &report_copy,
+                )
+            } else {
+                stage_file(file, opts, idx + 1)
+            };
+            let staged = match staged_result {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
@@ -897,9 +1532,20 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                         error = %e,
                         "导入文件暂存失败"
                     );
-                    return ProcResult::Failed(format!("{}: {e}", file.display()));
+                    if e.code() == "CANCELLED" {
+                        return ProcResult::Cancelled;
+                    }
+                    return ProcResult::Failed(format!("{}: {e}", e.code()));
                 }
             };
+            // The copy must contain the exact bytes hashed for this accepted item.
+            // A mismatch is kept for journal reconciliation, never registered.
+            if expected_hash.is_some()
+                && crate::utils::hash::sha256_full(&staged).ok().as_deref()
+                    != Some(content_sha256.as_str())
+            {
+                return ProcResult::Failed("OUTCOME_UNKNOWN".into());
+            }
             // 锁外：计算 DB 插入所需的路径/文件信息
             let ext = staged
                 .extension()
@@ -933,6 +1579,35 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let protection = match managed_library::prepare_import_evidence(
+                &library_snapshot,
+                &staged,
+                &content_sha256,
+            ) {
+                Ok(evidence) => evidence,
+                Err(e) => {
+                    tracing::warn!(
+                        operation = "import",
+                        task_id = %task_id,
+                        stage = "protection",
+                        file = %staged.display(),
+                        error = %e,
+                        "导入托管证据登记失败"
+                    );
+                    return ProcResult::Failed(format!("{}: {e}", staged.display()));
+                }
+            };
+            if expected_hash.is_some() {
+                let mut published = ImportProgress::new(&task_id, ImportPhase::Processing);
+                published.message = Some("publication_verified".into());
+                progress(published);
+                if let Err(error) = checkpoint() {
+                    if error.code() == "CANCELLED" {
+                        return ProcResult::Cancelled;
+                    }
+                    return ProcResult::Failed(error.code().to_string());
+                }
+            }
             ProcResult::New(Processed {
                 staged,
                 hash,
@@ -943,6 +1618,7 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                 file_size,
                 modified_at,
                 meta,
+                protection: Some(protection),
             })
         })
         .collect();
@@ -991,7 +1667,7 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
             if let ProcResult::New(p) = r {
                 // 二次查重：②a 的并行 precheck 互不可见，同批同 hash 的两条会双双通过；
                 // 此处串行事务内逐条「查+写」，同批后到的与跨批并发（单写连接全串行）都能拦住
-                match dedup::hash_exists(&tx, &p.hash) {
+                match assets::hash_exists_managed(&tx, &p.hash) {
                     Ok(true) => {
                         result.duplicates += 1;
                         if managed {
@@ -1016,7 +1692,7 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
                     }
                 }
                 // B01：UNIQUE 约束兜底 TOCTOU——单条失败不中断整批
-                match write_one(&tx, p) {
+                match write_one(&tx, p, Some(&library_snapshot)) {
                     Ok(id) => {
                         pending_thumbs.push((id, p.staged.clone(), p.mime_type.clone()));
                         result.imported += 1;
@@ -1181,10 +1857,10 @@ fn import_paths_inner<F: Fn(ImportProgress) + Sync>(
 fn precheck(conn: &Connection, file: &Path, file_hash: &str) -> AppResult<bool> {
     let native_path = path::encode_native_path(file)?;
     let norm = path::normalize_path(&native_path);
-    if assets::find_by_path(conn, &norm)?.is_some() {
+    if assets::find_managed_by_path(conn, &norm)?.is_some() {
         return Ok(false);
     }
-    if dedup::hash_exists(conn, file_hash)? {
+    if assets::hash_exists_managed(conn, file_hash)? {
         return Ok(false);
     }
     Ok(true)
@@ -1350,7 +2026,10 @@ pub fn inspect_paths_with_control<F: Fn(ImportProgress) + Sync>(
 
 /// 入库前只验证“能否生成快速缩略图”，不进入完整 RAW 显影。
 /// 这样导入页可以在正式入库前明确拦截损坏/当前不支持的图片。
-fn classify_import_preview(file: &Path, ext: &str) -> (ImportPreviewStatus, Option<String>) {
+pub(crate) fn classify_import_preview(
+    file: &Path,
+    ext: &str,
+) -> (ImportPreviewStatus, Option<String>) {
     let previewable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         imaging::decode_thumb(file, thumbnail::PLACEHOLDER_SIZE).is_some()
     }))
@@ -1410,17 +2089,50 @@ pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: us
     render_name(template, collection, orig_stem, now_ms, seq)
 }
 
+/// 与正式入库同源的改名预览：用候选文件真实 mtime 生成日期占位，
+/// 因此预检清单显示的名字与 `stage_file` 实际计算结果一致。
+pub(crate) fn plan_rename_preview(
+    template: &str,
+    collection: &str,
+    orig_stem: &str,
+    mtime_ms: i64,
+    seq: usize,
+) -> String {
+    render_name(template, collection, orig_stem, mtime_ms, seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_files, inspect_paths, precheck, render_name, validate_library_root,
-        ImportPreviewStatus,
+        collect_files, inspect_paths, precheck, remove_stage_link_if_owned, render_name,
+        validate_library_root, ImportPreviewStatus,
     };
     use crate::utils::path;
     use std::sync::atomic::AtomicBool;
 
     // 2026-07-27 12:00:00 UTC
     const MTIME: i64 = 1_785_225_600_000;
+
+    #[test]
+    fn published_stage_cleanup_removes_only_the_recorded_hard_link() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("owned.part");
+        let target = root.path().join("published.jpg");
+        std::fs::write(&stage, b"published bytes").unwrap();
+        std::fs::hard_link(&stage, &target).unwrap();
+        let identity = crate::utils::file_identity::file_object_identity(
+            &std::fs::File::open(&target).unwrap(),
+        )
+        .unwrap();
+        remove_stage_link_if_owned(&stage, &identity).unwrap();
+        assert!(!stage.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"published bytes");
+
+        let replacement = root.path().join("replacement.part");
+        std::fs::write(&replacement, b"unrelated bytes").unwrap();
+        remove_stage_link_if_owned(&replacement, &identity).unwrap();
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"unrelated bytes");
+    }
 
     #[test]
     fn library_root_must_exist_be_a_directory_and_be_writable() {

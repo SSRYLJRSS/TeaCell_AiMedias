@@ -2,12 +2,17 @@
 
 use rusqlite::Connection;
 
-use super::{tag_ops, tags::Tag, tags::FACET_EFFECTIVE};
+use super::{
+    libraries, libraries::VERIFIED_ASSET_SCOPE, tag_ops, tags::Tag, tags::FACET_EFFECTIVE,
+};
 use crate::error::AppResult;
 
 /// 仅当素材所在完整组恰好 1 RAW + 1 非 RAW 时，返回唯一同源兄弟。
 fn kinship_sibling_ids(conn: &Connection, asset_id: i64) -> Vec<i64> {
-    let mut stmt = match conn.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL") {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT a.id, a.file_path FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -103,6 +108,7 @@ pub fn assign(
     source: &str,
 ) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
+    libraries::ensure_managed_assets(&tx, asset_ids)?;
     assign_inner(&tx, asset_ids, tag_ids, source, None)?;
     tx.commit()?;
     Ok(())
@@ -111,6 +117,7 @@ pub fn assign(
 /// R-25：真实移除的关联写 remove 流水（actor 读原关联 source，保证 AI 标签可溯源）
 pub fn remove(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64]) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
+    libraries::ensure_managed_assets(&tx, asset_ids)?;
     // W5h-b：摘标签同步到同源文件（与 assign_inner 对称；关闭开关则回到独立行为）
     let effective_ids: Vec<i64> = if kinship_sync_enabled(&tx) {
         let mut seen = std::collections::HashSet::new();
@@ -160,6 +167,7 @@ pub fn retag_clear_unreviewed(conn: &Connection, asset_ids: &[i64]) -> AppResult
     if asset_ids.is_empty() {
         return Ok(0);
     }
+    libraries::ensure_managed_assets(conn, asset_ids)?;
     let placeholders = asset_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let mut stmt = conn.prepare(&format!(
         "SELECT asset_id, tag_id, source FROM asset_tags

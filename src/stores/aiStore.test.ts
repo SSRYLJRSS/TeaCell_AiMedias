@@ -13,8 +13,9 @@ import {
   aiListSuggestions,
   aiRejectSuggestion,
   aiRestoreSuggestion,
-  aiStartBatch,
+  aiStartTagging,
 } from "@/api/ai";
+import type { TaggingOperation } from "@/types/ai";
 import { useAiStore } from "@/stores/aiStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { AiBatch, AiSuggestion } from "@/types/ai";
@@ -28,7 +29,7 @@ vi.mock("@/api/ai", () => ({
   aiListSuggestions: vi.fn(),
   aiRejectSuggestion: vi.fn(),
   aiRestoreSuggestion: vi.fn(),
-  aiStartBatch: vi.fn(),
+  aiStartTagging: vi.fn(),
 }));
 
 const mkBatch = (id: number, over: Partial<AiBatch> = {}): AiBatch => ({
@@ -57,6 +58,13 @@ const mkSuggestion = (id: number, over: Partial<AiSuggestion> = {}): AiSuggestio
 });
 
 const IDs = [1, 2, 3];
+const mkTaggingOperation = (batchId: number): TaggingOperation => ({
+  operationId: `operation-${batchId}`,
+  stepId: `step-${batchId}`,
+  batchId,
+  requestLimit: 2,
+  requestsAttempted: 0,
+});
 
 /** 设置夹具：batchLimit 可覆盖 */
 const mkSettings = (over: Partial<Settings["ai"]> = {}): Settings => ({
@@ -118,7 +126,7 @@ describe("aiStore 打标状态机", () => {
     expect(s.batches[0].status).toBe("pending");
     expect(s.suggestions).toHaveLength(2);
     expect(aiCreateBatch).toHaveBeenCalledWith(IDs);
-    expect(aiStartBatch).not.toHaveBeenCalled();
+    expect(aiStartTagging).not.toHaveBeenCalled();
   });
 
   it("createBatch 空选中：直接返回，不调后端", async () => {
@@ -126,17 +134,17 @@ describe("aiStore 打标状态机", () => {
     expect(aiCreateBatch).not.toHaveBeenCalled();
   });
 
-  it("startBatch 云端：置 running、写回批次状态、重载建议", async () => {
+  it("startTagging：启动已批准 operation、写回批次状态并重载建议", async () => {
     useAiStore.setState({ currentBatchId: 1, batches: [mkBatch(1)] });
-    vi.mocked(aiStartBatch).mockResolvedValue(mkBatch(1, { status: "done", processed: 1 }));
+    vi.mocked(aiStartTagging).mockResolvedValue(mkBatch(1, { status: "done", processed: 1 }));
     vi.mocked(aiListSuggestions).mockResolvedValue([mkSuggestion(101)]);
 
-    await useAiStore.getState().startBatch();
+    await useAiStore.getState().startTagging(mkTaggingOperation(1));
     const s = useAiStore.getState();
     expect(s.running).toBe(false); // finally 复位
     expect(s.batches[0].status).toBe("done");
     expect(s.suggestions).toHaveLength(1);
-    expect(aiStartBatch).toHaveBeenCalledWith(1, undefined);
+    expect(aiStartTagging).toHaveBeenCalledWith("operation-1", "step-1");
   });
 
   it("confirm 成功：调后端后重载当前批次建议", async () => {

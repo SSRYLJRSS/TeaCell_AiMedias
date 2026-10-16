@@ -23,6 +23,7 @@
 use rusqlite::types::Value;
 use rusqlite::Connection;
 
+use super::libraries::VERIFIED_ASSET_SCOPE;
 use super::query_expr::SearchScope;
 use crate::error::AppResult;
 use crate::utils::bigram::{cjk_bigram, is_cjk};
@@ -207,7 +208,10 @@ pub fn search_asset_ids(conn: &Connection, raw: &str, scope: SearchScope) -> App
     let Some(pred) = build_search_predicate(conn, raw, scope)? else {
         return Ok(Vec::new());
     };
-    let sql = format!("SELECT a.id FROM assets a WHERE {}", pred.sql);
+    let sql = format!(
+        "SELECT a.id FROM assets a WHERE ({}) AND {VERIFIED_ASSET_SCOPE}",
+        pred.sql
+    );
     let mut stmt = conn.prepare(&sql)?;
     let ids = stmt
         .query_map(rusqlite::params_from_iter(pred.params.iter()), |r| r.get(0))?
@@ -227,17 +231,43 @@ mod tests {
 
     fn seed(conn: &rusqlite::Connection, file_name: &str, desc: &str) -> i64 {
         conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND health='unconfigured'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO assets (file_path, file_name, content_description, file_ext, file_size, mime_type, created_at, modified_at)
              VALUES (?1, ?2, ?3, '.jpg', 10, 'image/jpeg', 1, 1)",
             rusqlite::params![format!("/seed/{file_name}"), file_name, desc],
         )
         .unwrap();
-        conn.query_row(
-            "SELECT id FROM assets WHERE file_name = ?1",
-            [file_name],
-            |r| r.get(0),
+        let id = conn
+            .query_row(
+                "SELECT id FROM assets WHERE file_name = ?1",
+                [file_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let library = crate::db::libraries::current(conn).unwrap().unwrap();
+        conn.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                id
+            ],
         )
-        .unwrap()
+        .unwrap();
+        id
     }
 
     #[test]

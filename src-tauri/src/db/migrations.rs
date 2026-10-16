@@ -1840,6 +1840,31 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     migrate_v25(conn)?;
     // V26：视频代理缓存指纹。无版本幂等追加；旧 ready 代理的 NULL 指纹会触发安全重建。
     migrate_v26_video_proxy_fingerprints(conn)?;
+    // A3-02：为 Agent 增加独立 AI 用途绑定。历史用途绑定原样保留，Agent 不继承旧 active profile。
+    migrate_agent_usage_binding(conn)?;
+    // A3-02：每次保存连接都更换不可预测的配置修订，覆盖端点/模型/凭据轮换。
+    migrate_agent_connection_revision(conn)?;
+    // V27: append-only protection records; paths remain unverified until service checks.
+    super::libraries::migrate_structure(conn)?;
+    // A1-03: append-only authorization state. Handles are opaque and never
+    // become authority without the subject/generation checks in services.
+    super::authorization::migrate_structure(conn)?;
+    // A1-04: append-only plans, approvals, and operations. Prepared plans are
+    // distinct from execution; approval consumption is enforced in services.
+    super::plans::migrate_structure(conn)?;
+    // A1-05: operation steps/items/receipts and recovery summaries.
+    super::operations::migrate_structure(conn)?;
+    // A1-06: append-only conversation index, drafts, attachments, and links.
+    // The Pi transcript remains the single source of conversational context.
+    super::conversations::migrate_structure(conn)?;
+    // A2-01: import preparation plans bind candidates, fingerprints and rename
+    // previews. Preparing never copies files or writes asset rows.
+    super::import_plans::migrate_structure(conn)?;
+    super::import_execution::migrate_structure(conn)?;
+    // A2-03: recoverable manual dispositions for unverified historical assets.
+    super::legacy_assets::migrate_structure(conn)?;
+    // A2-04: approved tagging batch identity, provenance and persistent budget.
+    super::tagging::migrate_structure(conn)?;
     // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
@@ -1963,6 +1988,56 @@ fn migrate_v26_video_proxy_fingerprints(conn: &Connection) -> AppResult<()> {
             conn.execute(sql, [])?;
         }
     }
+    Ok(())
+}
+
+/// A3-02：扩大 AI 用途绑定允许值，保留现有行并保持旧档案不自动绑定 Agent。
+/// V15 已发布定义不可修改；仅在旧 CHECK 缺少 agent 时事务性重建，重复启动无副作用。
+fn migrate_agent_usage_binding(conn: &Connection) -> AppResult<()> {
+    let definition: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ai_usage_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(definition) = definition else {
+        return Ok(());
+    };
+    if definition.to_ascii_lowercase().contains("'agent'") {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE ai_usage_bindings_agent_next (
+           usage TEXT PRIMARY KEY CHECK (usage IN ('super_search','tagging','agent')),
+           connection_id TEXT NOT NULL REFERENCES ai_connections(id),
+           updated_at INTEGER NOT NULL
+         );
+         INSERT INTO ai_usage_bindings_agent_next (usage, connection_id, updated_at)
+           SELECT usage, connection_id, updated_at FROM ai_usage_bindings;
+         DROP TABLE ai_usage_bindings;
+         ALTER TABLE ai_usage_bindings_agent_next RENAME TO ai_usage_bindings;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 连接修订同时标识配置与凭据引用的一代；时间戳可能在同毫秒内重复，不能作请求新鲜度凭据。
+fn migrate_agent_connection_revision(conn: &Connection) -> AppResult<()> {
+    if !has_column(conn, "ai_connections", "config_revision")? {
+        conn.execute(
+            "ALTER TABLE ai_connections ADD COLUMN config_revision TEXT",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE ai_connections
+            SET config_revision = lower(hex(randomblob(16)))
+          WHERE config_revision IS NULL OR config_revision = ''",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2230,6 +2305,69 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
         assert_eq!(fingerprints, (None, None, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_usage_migration_preserves_legacy_bindings_and_is_idempotent() -> AppResult<()> {
+        let c = mem();
+        c.pragma_update(None, "foreign_keys", true)?;
+        c.execute_batch(
+            "CREATE TABLE ai_connections (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL,
+               deployment TEXT NOT NULL, protocol TEXT NOT NULL,
+               base_url TEXT NOT NULL, model TEXT NOT NULL,
+               api_key_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE ai_usage_bindings (
+               usage TEXT PRIMARY KEY CHECK (usage IN ('super_search','tagging')),
+               connection_id TEXT NOT NULL REFERENCES ai_connections(id),
+               updated_at INTEGER NOT NULL
+             );
+             INSERT INTO ai_connections
+               (id, name, deployment, protocol, base_url, model, created_at, updated_at)
+               VALUES ('search', 'Search', 'cloud', 'openai_chat', 'https://search.invalid/v1', 'm1', 1, 1),
+                      ('tags', 'Tags', 'cloud', 'openai_chat', 'https://tags.invalid/v1', 'm2', 2, 2);
+             INSERT INTO ai_usage_bindings (usage, connection_id, updated_at)
+               VALUES ('super_search', 'search', 11), ('tagging', 'tags', 12);",
+        )?;
+
+        migrate_agent_usage_binding(&c)?;
+        migrate_agent_usage_binding(&c)?;
+
+        let preserved: Vec<(String, String, i64)> = {
+            let mut statement = c.prepare(
+                "SELECT usage, connection_id, updated_at FROM ai_usage_bindings ORDER BY usage",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            rows
+        };
+        assert_eq!(
+            preserved,
+            vec![
+                ("super_search".to_string(), "search".to_string(), 11),
+                ("tagging".to_string(), "tags".to_string(), 12),
+            ]
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM ai_usage_bindings WHERE usage='agent'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "Agent must not inherit a legacy binding"
+        );
+
+        crate::db::ai_connections::bind_usage(&c, "agent", "search")?;
+        let foreign_key_errors: i64 =
+            c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(foreign_key_errors, 0);
         Ok(())
     }
 

@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use image::{GenericImageView, ImageBuffer, Rgb};
 
-use bagertea_ai_media_v2_lib::services::imaging;
-use bagertea_ai_media_v2_lib::utils::mime;
+use teacell_ai_media_manager_lib::services::imaging;
+use teacell_ai_media_manager_lib::utils::mime;
 
 /// 每个用例独立目录（测试默认并行跑，共享目录会被互相 remove_dir_all 踩坏）
 fn fixture_dir(name: &str) -> PathBuf {
@@ -134,7 +134,7 @@ fn hd_layer_garbage_degrades_gracefully() {
 
 #[test]
 fn heic_and_raw_decoder_guards() {
-    use bagertea_ai_media_v2_lib::services::{heic_decode, raw_decode};
+    use teacell_ai_media_manager_lib::services::{heic_decode, raw_decode};
     let dir = fixture_dir("guards");
     let garbage = dir.join("g.heic");
     std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
@@ -163,7 +163,7 @@ fn truncated_jpeg_graceful() {
 /// 样本不存在时跳过（CI/其它机器无样本），避免误报。
 #[test]
 fn raw_probe_dimensions_reads_rw2() {
-    use bagertea_ai_media_v2_lib::services::raw_decode;
+    use teacell_ai_media_manager_lib::services::raw_decode;
     let sample = std::path::Path::new("f:/all/_1091396.RW2");
     if !sample.exists() {
         eprintln!("跳过：真机 RW2 样本不存在（{sample:?}）");
@@ -183,7 +183,7 @@ fn raw_probe_dimensions_reads_rw2() {
 /// W1-4：probe_dimensions 对垃圾文件/不存在文件返回 None（不 panic）。
 #[test]
 fn raw_probe_dimensions_guards() {
-    use bagertea_ai_media_v2_lib::services::raw_decode;
+    use teacell_ai_media_manager_lib::services::raw_decode;
     let dir = fixture_dir("probe-dims");
     let garbage = dir.join("g.rw2");
     std::fs::write(&garbage, vec![0u8; 4096]).unwrap();

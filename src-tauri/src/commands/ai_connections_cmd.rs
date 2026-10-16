@@ -1,6 +1,6 @@
 //! AI 连接档案命令（指导书 §6.3/§4.4）：连接档案 CRUD（API Key 走系统凭据）+ 用途绑定。
 //!  - API Key 不经过普通 settings JSON：保存时写 keyring，成功后才置 api_key_ref；
-//!  - 用途绑定（super_search/tagging）独立可变：修改一个不影响另一个。
+//!  - 用途绑定（super_search/tagging/agent）独立可变：修改一个不影响另一个。
 
 use tauri::State;
 
@@ -122,6 +122,7 @@ pub async fn save_ai_connection(
     }
     let id_owned = id.trim().to_string();
     let db = std::sync::Arc::clone(&state.db);
+    let ai_config_guard = std::sync::Arc::clone(&state.ai_config_guard);
     let name = name.trim().to_string();
     let base_url = base_url.trim().to_string();
     let model = model.trim().to_string();
@@ -129,9 +130,14 @@ pub async fn save_ai_connection(
         .filter(|key| !key.trim().is_empty())
         .map(|key| key.trim().to_string());
     tauri::async_runtime::spawn_blocking(move || {
-        // Lock order: credential operation -> short DB reads/writes -> keyring IO
-        // only while no DB guard is held. The keyring write is compensated if DB
-        // upsert fails, so an old working key is never silently replaced.
+        // Serialize profile/revision changes with the approved tagging start
+        // window. Lock order: AI config -> credential operation -> short DB
+        // reads/writes -> keyring IO only while no DB guard is held. The keyring
+        // write is compensated if DB upsert fails, so an old working key is
+        // never silently replaced.
+        let _config = ai_config_guard
+            .lock()
+            .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
         let _operations = credentials::lock_operations()?;
         let existing = {
             let conn = db.lock()?;
@@ -203,7 +209,11 @@ pub async fn save_ai_connection(
 #[tauri::command]
 pub async fn delete_ai_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let db = std::sync::Arc::clone(&state.db);
+    let ai_config_guard = std::sync::Arc::clone(&state.ai_config_guard);
     tauri::async_runtime::spawn_blocking(move || {
+        let _config = ai_config_guard
+            .lock()
+            .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
         let _operations = credentials::lock_operations()?;
         let row = {
             let conn = db.lock()?;
@@ -236,9 +246,15 @@ pub fn set_ai_usage_binding(
     usage: String,
     connection_id: Option<String>,
 ) -> AppResult<()> {
-    if !matches!(usage.as_str(), "super_search" | "tagging") {
-        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    if !ai_connections::is_supported_usage(&usage) {
+        return Err(AppError::invalid_arg(
+            "非法用途（super_search|tagging|agent）",
+        ));
     }
+    let _config = state
+        .ai_config_guard
+        .lock()
+        .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
     let conn = lock_db(&state)?;
     let Some(cid) = connection_id.filter(|s| !s.is_empty()) else {
         ai_connections::unbind_usage(&conn, &usage)?;
@@ -298,14 +314,14 @@ pub async fn get_super_search_service_resolution(
     .map_err(|e| AppError::msg(format!("超级搜索服务状态读取任务失败: {e}")))?
 }
 
-/// 读取两个用途的当前绑定（connection_id，无绑定为 null）。
+/// 读取各用途的当前绑定（connection_id，无绑定为 null）。
 #[tauri::command]
 pub fn get_ai_usage_bindings(
     state: State<AppState>,
 ) -> AppResult<std::collections::HashMap<String, Option<String>>> {
     let conn = lock_db(&state)?;
     let mut out = std::collections::HashMap::new();
-    for usage in ["super_search", "tagging"] {
+    for usage in ai_connections::SUPPORTED_USAGES {
         let id = ai_connections::binding_id(&conn, usage)?;
         out.insert(usage.to_string(), id);
     }

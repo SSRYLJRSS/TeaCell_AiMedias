@@ -13,10 +13,12 @@
 1. `docs/README.md`：确认文档权威边界和当前阅读路径。
 2. `docs/ARCHITECTURE.md`：确认模块边界、数据流和设计约束。
 3. `docs/DEVELOPMENT.md`：确认编码、测试、迁移和交付规范。
-4. 涉及产品行为时读 `docs/PRD.md` 和 `docs/UI_DESIGN_SYSTEM.md`。
-5. 涉及路径、进程、凭据、原生依赖、平台能力或打包时读 `docs/PLATFORM.md`。
-6. 涉及搜索、分面协议时读 `docs/CONTRACTS.md` 及对应 `docs/contracts/*.md`。
-7. 涉及验收或故障时按需读 `docs/TEST_STRATEGY.md`、`docs/QA_PLAYBOOK.md`、`docs/PERFORMANCE.md`、`docs/TROUBLESHOOTING.md`、`docs/OPERATIONS.md`。
+4. 开发或阶段复盘时读 `docs/PROJECT_PLAN.md`：确认真实状态、前置证据、阻塞和下一步；这里是唯一进度事实源。
+5. 涉及产品行为时读 `docs/PRD.md` 和 `docs/UI_DESIGN_SYSTEM.md`。
+6. 涉及路径、进程、凭据、原生依赖、平台能力或打包时读 `docs/PLATFORM.md`。
+7. 涉及搜索、分面协议时读 `docs/CONTRACTS.md` 及对应 `docs/contracts/*.md`。
+8. 涉及验收或故障时按需读 `docs/TEST_STRATEGY.md`、`docs/QA_PLAYBOOK.md`、`docs/PERFORMANCE.md`、`docs/TROUBLESHOOTING.md`、`docs/OPERATIONS.md`；涉及 Agent Host、子进程协议或会话文件时读 `docs/contracts/agent-host-protocol-v1.md`。
+9. 执行 2.0/2.5 计划任务时读 `plans/v2/11-execution-guide.md`、任务索引、当前任务卡和 `plans/v2/14-review-and-handoff.md`；涉及冻结实现规则时只加载 `plans/v2/12-implementation-contracts.md` 中对应章节。
 
 只读取当前任务需要的最小上下文。日期化报告、阶段报告、施工稿和一次性修复计划不再属于仓库文档体系，历史内容以 Git 历史为准。
 
@@ -38,6 +40,8 @@
 | 性能基线与反模式 | `docs/PERFORMANCE.md` |
 | 运维、发布、备份恢复、本地模型 | `docs/OPERATIONS.md` |
 | 已知问题与排查路径 | `docs/TROUBLESHOOTING.md` |
+| 2.0/2.5 单卡范围、依赖与验收要求 | `plans/v2/execution/*.md`；实际状态仍以 `docs/PROJECT_PLAN.md` 为准 |
+| 2.0/2.5 冻结实现契约 | `plans/v2/12-implementation-contracts.md`；其他文档只链接 |
 
 同一事实只能在一处定义。其他文档只链接，不复制，不另建“第二份进度”或“第二份 PRD”。
 
@@ -58,15 +62,20 @@
 13. Windows 优先功能合并前必须声明支持范围，为其他平台提供明确禁用或降级行为，并保持核心数据语义一致。
 14. 受支持平台的编译或测试失败会阻止合并；临时基础设施豁免必须记录期限和恢复条件。
 15. 长期只维护 `main`；平台差异通过能力层、条件依赖和测试管理，不建立长期平台分支。
+16. 模型外发遵循各自的冻结契约和统一发送门；A2-04 打标的审批、预算、取消与回写细则只在 [实现契约 §4.4](plans/v2/12-implementation-contracts.md#44-ai-打标计划与外发) 定义。新增外发能力先冻结专属契约与发送门，再按该契约补副作用和并发测试。
+17. 修改独立入库工作台时，以[架构 §9.15](docs/ARCHITECTURE.md#915-独立入库工作台a2-05)为行为事实；修改 Agent Host 或 Node↔Rust 协议时，以[内部协议 v1](docs/contracts/agent-host-protocol-v1.md)为行为事实。两处文档承载各自的完整不变量和验证要求，本文件不复制细则。
+18. 不索取或使用用户在聊天、Issue、日志中发送的真实 API 凭据；真实外发只使用用户在本机隔离创建的系统凭据项，并预先明确请求、时长、费用和代理范围。凭据意外暴露时不复述、不复制、不尝试验证，立即停止使用并提醒用户撤销/轮换；具体流程见[开发规范 §4.1](docs/DEVELOPMENT.md#41-rust)。
 
 ## 开发闭环
 
 1. 查看 `git status`，识别用户已有改动。
-2. 明确行为契约、影响面、测试方法和文档落点。
-3. 小步实现，功能与测试同批完成。
-4. 先跑定向测试，再跑相关完整门禁。
-5. 行为、架构、协议或规范发生变化时，同步更新对应权威文档。
-6. 汇报真实结果，包括未执行的测试、环境限制和剩余风险。
+2. 核实当前任务授权、计划卡前置证据和当前工作树，不以代码已存在或旧报告代替验收。
+3. 明确行为契约、影响面、测试方法和权威文档落点。
+4. 小步实现，功能与测试同批完成。
+5. 先跑定向测试，再跑相关完整门禁；并行工作集成后对最终工作区统一验证。验收和独立复核都绑定明确基线与最终差异；复核后改动实现、契约、迁移或测试时，按 [任务验收规则](plans/v2/14-review-and-handoff.md#1-一张卡通过的条件) 重跑受影响验证并复核受影响差异。
+6. 行为、架构、协议或规范发生变化时，同步更新对应权威文档。
+7. 持续授权按计划逐卡推进：一张卡验收通过后，只解锁其依赖已满足的卡；较新的明确授权可更新旧的开发范围限制，但不会替代卡内环境证据，也不扩展真实凭据、素材、外发或发布授权。环境缺项只阻断依赖它的卡；不因模板中的单卡示例重复询问。
+8. 汇报真实结果，包括未执行的测试、环境限制和剩余风险。
 
 ## 质量门禁
 
@@ -82,6 +91,9 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
+
+修改 `packages/agent-host/`、`src-tauri/src/services/agent_runtime/` 或其打包映射时，另外执行 `npm run test:agent-host`；
+该套件串行运行，且不与 Cargo build/test/clippy（全量或定向）和 NSIS 打包并发；全量 Cargo 与定向 Cargo 测试也要串行，避免资源争用误报 Host READY 超时。发送 ACK 未知时必须保留 runId、禁止重放并验证精确取消；挂起 Host 请求时还要验证应用关停预算。修改 Host 资源映射时，额外运行 `npm run test:agent-host-staged` 验证 Tauri overlay 中的 Node/Host 在空 PATH 环境下可握手、开会话、发送、关闭，并构建实际 NSIS 制品核对安装包预算。Windows x64 资源准备和安装包预算按[开发规范](docs/DEVELOPMENT.md)与[性能基线](docs/PERFORMANCE.md#9-20-agent-windows工程预算已独立复核)验证。
 
 Cargo build/test/clippy 会链接 HEIF 原生静态库。先在当前原生平台准备固定版本，再为当前 shell 指定已验证目录；CI 与 `scripts/smoke.ps1` 自动执行同一准备步骤：
 

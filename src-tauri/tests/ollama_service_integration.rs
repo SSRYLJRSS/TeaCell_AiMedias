@@ -9,8 +9,8 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bagertea_ai_media_v2_lib::error::AppResult;
-use bagertea_ai_media_v2_lib::services::ollama_setup::{self, PullProgress};
+use teacell_ai_media_manager_lib::error::AppResult;
+use teacell_ai_media_manager_lib::services::ollama_setup::{self, PullProgress};
 
 use common::{HttpResponse, MockServer};
 

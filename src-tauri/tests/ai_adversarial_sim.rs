@@ -14,20 +14,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bagertea_ai_media_v2_lib::db::ai;
-use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr, SearchScope};
-use bagertea_ai_media_v2_lib::db::search;
-use bagertea_ai_media_v2_lib::db::search_plan::{
+use teacell_ai_media_manager_lib::db::ai;
+use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr, SearchScope};
+use teacell_ai_media_manager_lib::db::search;
+use teacell_ai_media_manager_lib::db::search_plan::{
     self, Ranking, Retriever, SearchPlanV3, WeightedRetriever,
 };
-use bagertea_ai_media_v2_lib::db::settings::{AiSettings, ApiProfile};
-use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
-use bagertea_ai_media_v2_lib::db::{self, assets};
-use bagertea_ai_media_v2_lib::error::AppResult;
-use bagertea_ai_media_v2_lib::services::ai_cloud;
-use bagertea_ai_media_v2_lib::services::importer;
-use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
-use bagertea_ai_media_v2_lib::state::Database;
+use teacell_ai_media_manager_lib::db::settings::{AiSettings, ApiProfile};
+use teacell_ai_media_manager_lib::db::tag_facets::FacetPromptContext;
+use teacell_ai_media_manager_lib::db::{self, assets};
+use teacell_ai_media_manager_lib::error::AppResult;
+use teacell_ai_media_manager_lib::services::ai_cloud;
+use teacell_ai_media_manager_lib::services::importer;
+use teacell_ai_media_manager_lib::services::thumbnail::ThumbnailService;
+use teacell_ai_media_manager_lib::state::Database;
 
 use common::{HttpResponse, MockServer};
 
@@ -224,8 +224,8 @@ fn thumbs_dir_service(dir: &Path) -> AppResult<ThumbnailService> {
 
 // ───────────────────────── 用例 ─────────────────────────
 
-// ① 乱码内容（GBK 转码错误的"锟斤拷"、控制字符）不是 JSON → 单条 rejected，批次 done
-conn_retry_test!(garbled_content_rejected_batch_survives, {
+// ① 乱码内容（GBK 转码错误的"锟斤拷"、控制字符）不是 JSON → 建议保留 pending 并记录错误，批次 done
+conn_retry_test!(garbled_content_failure_keeps_suggestion_pending, {
     let _g = common::net_lock_guard();
     let srv =
         MockServer::start(move |_| HttpResponse::ok_json(&openai_ok_body("锟斤拷烫烫烫\x07\x1b")));
@@ -234,13 +234,13 @@ conn_retry_test!(garbled_content_rejected_batch_survives, {
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done", "乱码输出不得中断批次");
-    assert_eq!(sug[0].status, "rejected");
+    assert_eq!(sug[0].status, "pending");
     assert!(sug[0].last_error.as_deref().is_some_and(|e| !e.is_empty()));
     Ok(())
 });
 
-// ② 退化输出（模型聊天式拒绝："抱歉，我无法分析图片"）→ rejected 而非误当标签
-conn_retry_test!(degenerate_chat_reply_rejected, {
+// ② 退化输出（模型聊天式拒绝："抱歉，我无法分析图片"）→ 保留 pending，且不误当标签
+conn_retry_test!(degenerate_chat_reply_keeps_suggestion_pending, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(move |_| {
         HttpResponse::ok_json(&openai_ok_body(
@@ -252,13 +252,13 @@ conn_retry_test!(degenerate_chat_reply_rejected, {
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done");
-    assert_eq!(sug[0].status, "rejected", "退化文本不得被当成功标签");
+    assert_eq!(sug[0].status, "pending", "模型失败不能替代用户拒绝");
     assert!(sug[0].suggested_tags.is_empty());
     Ok(())
 });
 
-// ③ 越界置信度（1.7 / -0.5）→ 单条 rejected 且错误可定位，批次 done
-conn_retry_test!(out_of_range_confidence_rejected, {
+// ③ 越界置信度（1.7 / -0.5）→ 不落无效结果，建议保留 pending 且错误可定位
+conn_retry_test!(out_of_range_confidence_keeps_suggestion_pending, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(move |_| {
         ok_content(
@@ -270,7 +270,8 @@ conn_retry_test!(out_of_range_confidence_rejected, {
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done");
-    assert_eq!(sug[0].status, "rejected", "越界置信度不得落库");
+    assert_eq!(sug[0].status, "pending", "模型失败不能替代用户拒绝");
+    assert!(sug[0].suggested_tags.is_empty(), "越界置信度不得落库");
     let err = sug[0].last_error.as_deref().unwrap_or("");
     assert!(
         err.contains("0–1") || err.contains("0-1"),
@@ -279,8 +280,8 @@ conn_retry_test!(out_of_range_confidence_rejected, {
     Ok(())
 });
 
-// ④ 未知分面 key（模型幻觉出 "mood"）→ rejected 且错误点名分面，批次 done
-conn_retry_test!(unknown_facet_key_rejected_with_facet_name, {
+// ④ 未知分面 key（模型幻觉出 "mood"）→ pending 且错误点名分面，批次 done
+conn_retry_test!(unknown_facet_key_keeps_pending_with_facet_name, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(move |_| {
         ok_content(
@@ -292,14 +293,14 @@ conn_retry_test!(unknown_facet_key_rejected_with_facet_name, {
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done");
-    assert_eq!(sug[0].status, "rejected");
+    assert_eq!(sug[0].status, "pending");
     let err = sug[0].last_error.as_deref().unwrap_or("");
     assert!(err.contains("mood"), "错误应点名未知分面: {err}");
     Ok(())
 });
 
-// ⑤ 截断 JSON（max_tokens 耗尽）→ 各级降级+重试耗尽后 rejected，批次 done，不 panic
-conn_retry_test!(truncated_json_exhausts_retries_then_rejected, {
+// ⑤ 截断 JSON（max_tokens 耗尽）→ 各级降级+重试耗尽后仍 pending，批次 done，不 panic
+conn_retry_test!(truncated_json_exhaustion_keeps_suggestion_pending, {
     let _g = common::net_lock_guard();
     let calls = Arc::new(AtomicUsize::new(0));
     let calls2 = Arc::clone(&calls);
@@ -315,7 +316,11 @@ conn_retry_test!(truncated_json_exhausts_retries_then_rejected, {
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done", "截断 JSON 不得中断批次");
-    assert_eq!(sug[0].status, "rejected");
+    assert_eq!(sug[0].status, "pending");
+    assert!(sug[0]
+        .last_error
+        .as_deref()
+        .is_some_and(|error| !error.is_empty()));
     assert!(calls.load(Ordering::SeqCst) >= 2, "截断应触发降级重试");
     Ok(())
 });
@@ -399,11 +404,14 @@ conn_retry_test!(consecutive_failures_trip_circuit_breaker, {
     let b = ai::get_batch(&conn, batch.id)?;
     assert_eq!(b.status, "interrupted", "连续失败应熔断而不是硬错误");
     let sug = ai::list_suggestions(&conn, batch.id)?;
-    let rejected = sug.iter().filter(|s| s.status == "rejected").count();
+    let failed = sug
+        .iter()
+        .filter(|s| s.status == "pending" && s.last_error.is_some())
+        .count();
     let pending = sug.iter().filter(|s| s.status == "pending").count();
     assert!(
-        rejected >= 3,
-        "熔断前应有失败记录，实际 rejected={rejected}"
+        failed >= 3,
+        "熔断前应有至少三条 pending 失败记录，实际 failed={failed}"
     );
     assert!(
         pending >= 1,
@@ -738,10 +746,7 @@ conn_retry_test!(
         let dbm = Arc::new(Database::new(db::init_memory()?));
         let tmp = tempfile::tempdir()?;
         let (_batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
-        assert_eq!(
-            sug[0].status, "rejected",
-            "外部 HTTP 失败应作为失败建议记录"
-        );
+        assert_eq!(sug[0].status, "pending", "外部 HTTP 失败应作为失败建议记录");
         let paths = paths.lock().unwrap().clone();
         assert!(
             paths.iter().any(|p| p == "/chat/completions"),
@@ -755,7 +760,7 @@ conn_retry_test!(
     }
 );
 
-// ⑭ 外部服务的 mojibake 仍应 rejected，但不得触发 Ollama 卸载用户服务。
+// ⑭ 外部服务的 mojibake 仍应保留 pending 并记录错误，但不得触发 Ollama 卸载用户服务。
 conn_retry_test!(external_mojibake_does_not_unload_service, {
     let _g = common::net_lock_guard();
     // 有效 V2 JSON（分面齐全不触发修复路径），但 description/标签名都是 Latin-1
@@ -784,7 +789,7 @@ conn_retry_test!(external_mojibake_does_not_unload_service, {
     let (batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done", "退化输出不得中断批次");
-    assert_eq!(sug[0].status, "rejected", "mojibake 不得当成功落库");
+    assert_eq!(sug[0].status, "pending", "模型失败不能替代用户拒绝");
     let err = sug[0].last_error.as_deref().unwrap_or("");
     assert!(
         err.contains("异常") || err.contains("乱码") || err.contains("重启"),

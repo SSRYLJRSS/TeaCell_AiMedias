@@ -1,6 +1,7 @@
 /** AI 打标命令封装（对应 commands/ai_cmd.rs，T05a） */
 import { invoke, on } from "./client";
 import type { AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags } from "@/types/ai";
+import type { TaggingOperation, TaggingPreparation } from "@/types/ai";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export interface AiProgress {
@@ -15,8 +16,37 @@ export function aiCreateBatch(assetIds: number[]): Promise<AiBatch> {
   return invoke<AiBatch>("ai_create_batch", { assetIds, mode: "auto" });
 }
 
-export function aiStartBatch(batchId: number, limit?: number): Promise<AiBatch> {
-  return invoke<AiBatch>("ai_start_batch", { batchId, limit: limit ?? null });
+/** 生成现有 AI batch 的冻结计划预览；不批准、不提交，也不启动联网。 */
+export function aiPrepareBatch(batchId: number, limit?: number): Promise<TaggingPreparation> {
+  return invoke<TaggingPreparation>("ai_prepare_batch", {
+    batchId,
+    limit: limit ?? null,
+  });
+}
+
+export function aiPrepareImportBatch(
+  sourceOperationId: string,
+  sourceStepId: string,
+  includedDuplicateItemIds: string[] = [],
+): Promise<TaggingPreparation> {
+  return invoke<TaggingPreparation>("ai_prepare_import_batch", {
+    sourceOperationId,
+    sourceStepId,
+    includedDuplicateItemIds,
+  });
+}
+
+/** 创建已批准计划对应的待启动操作；submit 命令本身不发送网络请求。 */
+export function aiSubmitTaggingPlan(planRef: string, idempotencyKey: string): Promise<TaggingOperation> {
+  return invoke<TaggingOperation>("ai_submit_tagging_plan", {
+    planRef,
+    idempotencyKey,
+  });
+}
+
+/** 由可信 GUI 显式启动一个已批准 operation/step。 */
+export function aiStartTagging(operationId: string, stepId: string): Promise<AiBatch> {
+  return invoke<AiBatch>("ai_start_tagging", { operationId, stepId });
 }
 
 export function aiCancelBatch(batchId: number): Promise<void> {

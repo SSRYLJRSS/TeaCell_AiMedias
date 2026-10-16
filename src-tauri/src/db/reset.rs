@@ -323,6 +323,29 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(&conn).unwrap().unwrap();
+        conn.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path='plain.jpg',file_identity='fixture-file',
+                    content_sha256=?3,ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset
+            ],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO tag_aliases
                (tag_id, alias, normalized_alias, locale, alias_type, is_searchable, created_at)
              VALUES (?1, 'reset alias', 'reset alias', '', 'synonym', 1, 1)",

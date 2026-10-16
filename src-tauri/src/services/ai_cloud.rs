@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde::Serialize;
 
-use crate::db::ai::{self, CategorizedTags};
+use crate::db::ai::{self, AiSuggestion, CategorizedTags};
 use crate::db::tag_facets::FacetPromptContext;
 use crate::db::{
     assets,
@@ -30,6 +30,213 @@ pub const DEFAULT_CONFIDENCE_MIN_SUGGEST: f64 = 0.30;
 pub const AI_SEARCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
 const AI_SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const AI_SEARCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+type PersistTaggingOutcome = dyn Fn(i64, bool, Option<String>) -> AppResult<()> + Send + Sync;
+
+/// Per-approved-operation request budget. Production persistence runs directly
+/// before each HTTP send; an ambiguous send permanently consumes its slot.
+pub struct RequestBudget {
+    limit: u64,
+    attempted: Cell<u64>,
+    deadline: Option<Instant>,
+    persist_attempt: Option<Box<dyn Fn() -> AppResult<bool> + Send + Sync>>,
+    persist_tagging_attempt: Option<Box<dyn Fn(i64) -> AppResult<bool> + Send + Sync>>,
+    persist_tagging_outcome: Option<Box<PersistTaggingOutcome>>,
+    current_asset_id: Cell<Option<i64>>,
+}
+
+impl RequestBudget {
+    pub fn in_memory(limit: u64) -> Self {
+        Self {
+            limit,
+            attempted: Cell::new(0),
+            deadline: None,
+            persist_attempt: None,
+            persist_tagging_attempt: None,
+            persist_tagging_outcome: None,
+            current_asset_id: Cell::new(None),
+        }
+    }
+
+    pub fn persistent(
+        limit: u64,
+        persist_attempt: impl Fn() -> AppResult<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            limit,
+            attempted: Cell::new(0),
+            deadline: None,
+            persist_attempt: Some(Box::new(persist_attempt)),
+            persist_tagging_attempt: None,
+            persist_tagging_outcome: None,
+            current_asset_id: Cell::new(None),
+        }
+    }
+
+    pub fn persistent_until(
+        limit: u64,
+        deadline: Instant,
+        persist_attempt: impl Fn() -> AppResult<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            limit,
+            attempted: Cell::new(0),
+            deadline: Some(deadline),
+            persist_attempt: Some(Box::new(persist_attempt)),
+            persist_tagging_attempt: None,
+            persist_tagging_outcome: None,
+            current_asset_id: Cell::new(None),
+        }
+    }
+
+    pub fn persistent_tagging_until(
+        limit: u64,
+        deadline: Instant,
+        persist_attempt: impl Fn(i64) -> AppResult<bool> + Send + Sync + 'static,
+        persist_outcome: impl Fn(i64, bool, Option<String>) -> AppResult<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            limit,
+            attempted: Cell::new(0),
+            deadline: Some(deadline),
+            persist_attempt: None,
+            persist_tagging_attempt: Some(Box::new(persist_attempt)),
+            persist_tagging_outcome: Some(Box::new(persist_outcome)),
+            current_asset_id: Cell::new(None),
+        }
+    }
+
+    pub fn set_current_asset(&self, asset_id: i64) {
+        self.current_asset_id.set(Some(asset_id));
+    }
+
+    pub fn mark_current_asset_succeeded(&self) -> AppResult<()> {
+        self.record_current_asset_outcome(true, None)
+    }
+
+    pub fn mark_current_asset_unknown(&self, error_code: impl Into<String>) -> AppResult<()> {
+        self.record_current_asset_outcome(false, Some(error_code.into()))
+    }
+
+    fn has_persistent_tagging_receipts(&self) -> bool {
+        self.persist_tagging_attempt.is_some()
+    }
+
+    fn record_current_asset_outcome(
+        &self,
+        succeeded: bool,
+        error_code: Option<String>,
+    ) -> AppResult<()> {
+        let Some(persist_outcome) = &self.persist_tagging_outcome else {
+            return Ok(());
+        };
+        let asset_id = self
+            .current_asset_id
+            .get()
+            .ok_or_else(|| AppError::internal("打标请求缺少当前素材身份"))?;
+        persist_outcome(asset_id, succeeded, error_code)
+    }
+
+    fn remaining_time(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn ensure_time_remaining(&self) -> AppResult<()> {
+        if self
+            .remaining_time()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
+            return Err(AppError::budget_exceeded(
+                "已达到本次审核批准的打标时长上限，请重新准备并审核计划",
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume(&self) -> AppResult<()> {
+        self.ensure_time_remaining()?;
+        let attempted = self.attempted.get();
+        if attempted >= self.limit {
+            return Err(AppError::budget_exceeded(
+                "已达到本次审核批准的 AI 请求上限，请重新准备并审核计划",
+            ));
+        }
+        if let Some(persist_tagging_attempt) = &self.persist_tagging_attempt {
+            let asset_id = self
+                .current_asset_id
+                .get()
+                .ok_or_else(|| AppError::internal("打标请求缺少当前素材身份"))?;
+            if !persist_tagging_attempt(asset_id)? {
+                return Err(AppError::budget_exceeded(
+                    "已达到本次审核批准的 AI 请求上限，请重新准备并审核计划",
+                ));
+            }
+        } else if let Some(persist_attempt) = &self.persist_attempt {
+            if !persist_attempt()? {
+                return Err(AppError::budget_exceeded(
+                    "已达到本次审核批准的 AI 请求上限，请重新准备并审核计划",
+                ));
+            }
+        }
+        self.attempted.set(attempted + 1);
+        Ok(())
+    }
+}
+
+fn with_request_budget_timeout(
+    request: reqwest::blocking::RequestBuilder,
+    request_budget: Option<&RequestBudget>,
+    default_timeout: Duration,
+) -> AppResult<reqwest::blocking::RequestBuilder> {
+    let Some(budget) = request_budget else {
+        return Ok(request);
+    };
+    let timeout = budget
+        .remaining_time()
+        .map(|remaining| remaining.min(default_timeout))
+        .filter(|timeout| !timeout.is_zero())
+        .ok_or_else(|| {
+            AppError::budget_exceeded("已达到本次审核批准的打标时长上限，请重新准备并审核计划")
+        })?;
+    Ok(request.timeout(timeout))
+}
+
+fn ensure_request_not_cancelled(cancel: &AtomicBool) -> AppResult<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AppError::cancelled("AI 打标请求已取消"));
+    }
+    Ok(())
+}
+
+/// Approved tagging requests must pass this gate immediately before each HTTP send,
+/// including recovery requests. Keep cancellation and durable budget consumption
+/// together so new provider paths cannot accidentally bypass one of them.
+fn authorize_tagging_request_send(
+    cancel: &AtomicBool,
+    request_budget: Option<&RequestBudget>,
+) -> AppResult<()> {
+    ensure_request_not_cancelled(cancel)?;
+    if let Some(budget) = request_budget {
+        budget.consume()?;
+    }
+    ensure_request_not_cancelled(cancel)
+}
+
+fn acquire_tagging_request_permit<'a>(
+    limiter: Option<&'a AiRateLimiter>,
+    cancel: &AtomicBool,
+    request_budget: Option<&RequestBudget>,
+) -> AppResult<Option<ai_rate_limit::RequestPermit<'a>>> {
+    let deadline = request_budget.and_then(RequestBudget::deadline);
+    limiter
+        .map(|rate_limiter| rate_limiter.acquire_until(cancel, deadline))
+        .transpose()
+}
 
 /// 打标业务约束由当前启用的分类说明提供；缺少说明时在服务层阻止启动，
 /// 避免命令层自行解释分类配置。
@@ -262,6 +469,10 @@ fn http_status_from_message(message: &str) -> Option<u16> {
 
 fn is_ai_rate_limited(error: &AppError) -> bool {
     error.code() == "AI_RATE_LIMITED"
+}
+
+fn is_ai_budget_exceeded(error: &AppError) -> bool {
+    error.code() == "BUDGET_EXCEEDED"
 }
 
 /// HTTP 状态错误只保留服务名、状态码和稳定建议，不回显响应体，
@@ -687,7 +898,11 @@ fn is_degenerate(content: &str) -> bool {
 /// 本地（Ollama）档案：触发一次模型卸载（keep_alive=0）。
 /// 长驻 runner 状态损坏后"卸载重载"即恢复（#8235 作者验证）；失败静默，由上层重试兜底。
 /// §8.4：读取响应并记录 done_reason（期望 unload），不再纯 fire-and-forget。
-fn unload_ollama_model(cfg: &ApiProfile) {
+fn unload_ollama_model(
+    cfg: &ApiProfile,
+    request_budget: Option<&RequestBudget>,
+    cancel: &AtomicBool,
+) -> AppResult<()> {
     // 本地档案 base_url 形如 http://localhost:11434/v1 → 原生端点剥掉 /v1
     let base = cfg.base_url.trim_end_matches('/');
     let native = base.strip_suffix("/v1").unwrap_or(base).to_string();
@@ -701,13 +916,11 @@ fn unload_ollama_model(cfg: &ApiProfile) {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
-    match client
-        .post(format!("{native}/api/generate"))
-        .json(&body)
-        .send()
-    {
+    authorize_tagging_request_send(cancel, request_budget)?;
+    let request = client.post(format!("{native}/api/generate")).json(&body);
+    match with_request_budget_timeout(request, request_budget, Duration::from_secs(8))?.send() {
         Ok(resp) => {
             if let Ok(v) = resp.json::<serde_json::Value>() {
                 let done = v.get("done_reason").and_then(|d| d.as_str()).unwrap_or("?");
@@ -722,6 +935,7 @@ fn unload_ollama_model(cfg: &ApiProfile) {
             tracing::warn!("Ollama 卸载请求失败（签名自愈路径不阻塞）：{e}");
         }
     }
+    Ok(())
 }
 
 /// §8.4：只有应用管理的 Windows Ollama 原生请求才注入 keep_alive。
@@ -1059,6 +1273,7 @@ fn openai_vision_request(
     tier: TextJsonTier,
     schema: &serde_json::Value,
     limiter: Option<&AiRateLimiter>,
+    request_budget: Option<&RequestBudget>,
     cancel: &AtomicBool,
 ) -> AppResult<String> {
     let mut body = serde_json::json!({
@@ -1084,28 +1299,20 @@ fn openai_vision_request(
     } else if tier == TextJsonTier::JsonObject {
         body["response_format"] = serde_json::json!({ "type": "json_object" });
     }
-    let _permit = limiter
-        .map(|rate_limiter| rate_limiter.acquire(cancel))
-        .transpose()?;
-    let response = if cfg.api_key.trim().is_empty() {
-        client
-            .post(format!(
-                "{}/chat/completions",
-                cfg.base_url.trim_end_matches('/')
-            ))
-            .json(&body)
-            .send()
+    let _permit = acquire_tagging_request_permit(limiter, cancel, request_budget)?;
+    authorize_tagging_request_send(cancel, request_budget)?;
+    let request = client.post(format!(
+        "{}/chat/completions",
+        cfg.base_url.trim_end_matches('/')
+    ));
+    let request = if cfg.api_key.trim().is_empty() {
+        request.json(&body)
     } else {
-        client
-            .post(format!(
-                "{}/chat/completions",
-                cfg.base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&cfg.api_key)
-            .json(&body)
-            .send()
-    }
-    .map_err(|e| ai_transport_error("视觉请求", e, cfg))?;
+        request.bearer_auth(&cfg.api_key).json(&body)
+    };
+    let response = with_request_budget_timeout(request, request_budget, Duration::from_secs(300))?
+        .send()
+        .map_err(|e| ai_transport_error("视觉请求", e, cfg))?;
     let status = response.status();
     if !status.is_success() {
         let status_code = status.as_u16();
@@ -1163,6 +1370,7 @@ fn ollama_native_vision_request(
     max_tokens: i64,
     schema: &serde_json::Value,
     limiter: Option<&AiRateLimiter>,
+    request_budget: Option<&RequestBudget>,
     cancel: &AtomicBool,
 ) -> AppResult<String> {
     let base = cfg.base_url.trim_end_matches('/');
@@ -1184,12 +1392,10 @@ fn ollama_native_vision_request(
         },
         "keep_alive": KEEP_ALIVE_IDLE
     });
-    let _permit = limiter
-        .map(|rate_limiter| rate_limiter.acquire(cancel))
-        .transpose()?;
-    let response = client
-        .post(format!("{root}/api/chat"))
-        .json(&body)
+    let _permit = acquire_tagging_request_permit(limiter, cancel, request_budget)?;
+    authorize_tagging_request_send(cancel, request_budget)?;
+    let request = client.post(format!("{root}/api/chat")).json(&body);
+    let response = with_request_budget_timeout(request, request_budget, Duration::from_secs(300))?
         .send()
         .map_err(|e| ai_transport_error("Ollama 视觉请求", e, cfg))?;
     let status = response.status();
@@ -1226,6 +1432,7 @@ fn anthropic_vision_request(
     tier: TextJsonTier,
     schema: &serde_json::Value,
     limiter: Option<&AiRateLimiter>,
+    request_budget: Option<&RequestBudget>,
     cancel: &AtomicBool,
 ) -> AppResult<String> {
     let mut body = serde_json::json!({
@@ -1252,14 +1459,14 @@ fn anthropic_vision_request(
             "name": "emit_image_analysis"
         });
     }
-    let _permit = limiter
-        .map(|rate_limiter| rate_limiter.acquire(cancel))
-        .transpose()?;
-    let response = client
+    let _permit = acquire_tagging_request_permit(limiter, cancel, request_budget)?;
+    authorize_tagging_request_send(cancel, request_budget)?;
+    let request = client
         .post(format!("{}/messages", cfg.base_url.trim_end_matches('/')))
         .header("x-api-key", &cfg.api_key)
         .header("anthropic-version", "2023-06-01")
-        .json(&body)
+        .json(&body);
+    let response = with_request_budget_timeout(request, request_budget, Duration::from_secs(300))?
         .send()
         .map_err(|e| ai_transport_error("Anthropic 视觉请求", e, cfg))?;
     let status = response.status();
@@ -1294,6 +1501,7 @@ fn request_analysis(
     min_confidence: f64,
     tier_cache: &Cell<TextJsonTier>,
     limiter: Option<&AiRateLimiter>,
+    request_budget: Option<&RequestBudget>,
     cancel: &AtomicBool,
 ) -> AppResult<MediaAnalysis> {
     let prepare_image = |max_px: u32| {
@@ -1326,13 +1534,32 @@ fn request_analysis(
         let b64 = base64::engine::general_purpose::STANDARD.encode(&payload.bytes);
         if transport == VisionTransport::ExternalAnthropic {
             return anthropic_vision_request(
-                client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema, limiter,
+                client,
+                cfg,
+                &system,
+                prompt,
+                &b64,
+                mime,
+                max_tokens,
+                tier,
+                &schema,
+                limiter,
+                request_budget,
                 cancel,
             );
         }
         if transport == VisionTransport::ManagedWindowsOllama && tier == TextJsonTier::Structured {
             match ollama_native_vision_request(
-                client, cfg, &system, prompt, &b64, max_tokens, &schema, limiter, cancel,
+                client,
+                cfg,
+                &system,
+                prompt,
+                &b64,
+                max_tokens,
+                &schema,
+                limiter,
+                request_budget,
+                cancel,
             ) {
                 Ok(content) => return Ok(content),
                 Err(native_error) => {
@@ -1346,8 +1573,18 @@ fn request_analysis(
                         "Ollama 原生结构化请求失败，尝试 OpenAI 兼容结构化接口"
                     );
                     return openai_vision_request(
-                        client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema,
-                        limiter, cancel,
+                        client,
+                        cfg,
+                        &system,
+                        prompt,
+                        &b64,
+                        mime,
+                        max_tokens,
+                        tier,
+                        &schema,
+                        limiter,
+                        request_budget,
+                        cancel,
                     )
                     .inspect_err(|compat_error| {
                         tracing::warn!(
@@ -1361,7 +1598,18 @@ fn request_analysis(
             }
         }
         openai_vision_request(
-            client, cfg, &system, prompt, &b64, mime, max_tokens, tier, &schema, limiter, cancel,
+            client,
+            cfg,
+            &system,
+            prompt,
+            &b64,
+            mime,
+            max_tokens,
+            tier,
+            &schema,
+            limiter,
+            request_budget,
+            cancel,
         )
     };
 
@@ -1507,7 +1755,7 @@ fn request_analysis(
     }
     if is_degenerate(&content) {
         if is_managed_ollama_profile(cfg) {
-            unload_ollama_model(cfg);
+            unload_ollama_model(cfg, request_budget, cancel)?;
         }
         let snippet: String = content.chars().take(120).collect();
         return Err(AppError::msg(format!(
@@ -1801,12 +2049,12 @@ pub fn request_text_json_with_control(
     let rate_limiter = if is_managed_ollama_profile(cfg) {
         None
     } else {
-        ai_rate_limit::for_connection(
+        Some(ai_rate_limit::for_connection(
             &cfg.id,
             cfg.max_concurrency,
             cfg.requests_per_minute,
             cfg.requests_per_hour,
-        )
+        )?)
     };
     request_text_json_tiers(max_structured_tier, structured_schema, |tier, schema| {
         request_text_raw(
@@ -2245,6 +2493,7 @@ fn analyze_video_frames(
     min_confidence: f64,
     tier_cache: &Cell<TextJsonTier>,
     limiter: Option<&AiRateLimiter>,
+    request_budget: Option<&RequestBudget>,
     cancel: &AtomicBool,
 ) -> AppResult<MediaAnalysis> {
     let dir = std::env::temp_dir().join(format!(
@@ -2278,10 +2527,11 @@ fn analyze_video_frames(
             min_confidence,
             tier_cache,
             limiter,
+            request_budget,
             cancel,
         ) {
             Ok(analysis) => results.push(analysis),
-            Err(error) if is_ai_rate_limited(&error) => {
+            Err(error) if is_ai_rate_limited(&error) || is_ai_budget_exceeded(&error) => {
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(error);
             }
@@ -2370,6 +2620,60 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     cancel: &Arc<AtomicBool>,
     progress: F,
 ) -> AppResult<()> {
+    run_cloud_batch_with_budget(
+        db,
+        batch_id,
+        cfg,
+        facets,
+        facets_video,
+        limit,
+        cancel,
+        None,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_cloud_batch_with_budget<F: Fn(AiProgress)>(
+    db: &Arc<Database>,
+    batch_id: i64,
+    cfg: &AiSettings,
+    facets: &[FacetPromptContext],
+    facets_video: &[FacetPromptContext],
+    limit: Option<i64>,
+    cancel: &Arc<AtomicBool>,
+    request_budget: Option<&RequestBudget>,
+    progress: F,
+) -> AppResult<()> {
+    run_cloud_batch_with_plan(
+        db,
+        batch_id,
+        cfg,
+        facets,
+        facets_video,
+        limit,
+        cancel,
+        request_budget,
+        None,
+        None,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_cloud_batch_with_plan<F: Fn(AiProgress)>(
+    db: &Arc<Database>,
+    batch_id: i64,
+    cfg: &AiSettings,
+    facets: &[FacetPromptContext],
+    facets_video: &[FacetPromptContext],
+    limit: Option<i64>,
+    cancel: &Arc<AtomicBool>,
+    request_budget: Option<&RequestBudget>,
+    allowed_asset_ids: Option<&[i64]>,
+    frozen_top_tags: Option<&[(String, String)]>,
+    progress: F,
+) -> AppResult<()> {
     let lock = || db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
 
     let profile = cfg
@@ -2384,12 +2688,12 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let rate_limiter = if managed_ollama {
         None
     } else {
-        ai_rate_limit::for_connection(
+        Some(ai_rate_limit::for_connection(
             &profile.id,
             profile.max_concurrency,
             profile.requests_per_minute,
             profile.requests_per_hour,
-        )
+        )?)
     };
     // 外部 OpenAI 兼容服务可能是 localhost/局域网部署且不需要密钥；认证要求由服务
     // 自己返回 401/403。Anthropic 协议仍要求标准 API Key。
@@ -2417,9 +2721,12 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         ai::list_suggestions(&conn, batch_id)?
     };
     // W5a（a2/a5）：Top-20 候选词（按使用次数降序 → 标签收敛）进 user 段提示词
-    let top_tags: Vec<(String, String)> = {
-        let conn = lock()?;
-        crate::db::tags::top_tags_per_facet(&conn, 60).unwrap_or_default()
+    let top_tags: Vec<(String, String)> = match frozen_top_tags {
+        Some(values) => values.to_vec(),
+        None => {
+            let conn = lock()?;
+            crate::db::tags::top_tags_per_facet(&conn, 60).unwrap_or_default()
+        }
     };
     // v2.11：可选只处理前 N 张（其余保持 pending，可再次启动）
     // F15a：只处理真正未分析过的 pending。不能只看 suggested_tags 是否为空：
@@ -2431,6 +2738,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 && s.suggested_tags.is_empty()
                 && s.suggested_description.trim().is_empty()
                 && !s.has_analysis
+                && allowed_asset_ids.is_none_or(|allowed| allowed.contains(&s.asset_id))
         })
         .collect();
     let todo: Vec<_> = match limit {
@@ -2500,6 +2808,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     min_confidence,
                     &tier_cache,
                     rate_limiter.as_deref(),
+                    request_budget,
                     cancel,
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
@@ -2513,6 +2822,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     min_confidence,
                     &tier_cache,
                     rate_limiter.as_deref(),
+                    request_budget,
                     cancel,
                 ),
             }
@@ -2528,6 +2838,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 min_confidence,
                 &tier_cache,
                 rate_limiter.as_deref(),
+                request_budget,
                 cancel,
             )
         }
@@ -2538,7 +2849,10 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     // W5a（a12）：连续失败计数（成功清零；≥3 熔断）
     let mut consecutive_failures = 0u32;
     // A2：批次级请求溯源只写一次（取本批首个成功请求的配置；视频帧合并不携带配置，等待后续成功项）
-    let mut batch_config_written = false;
+    let mut batch_config_written = {
+        let conn = lock()?;
+        ai::batch_has_provenance(&conn, batch_id)?
+    };
     // 当前产品统一走人工审核：只拦截低于阈值的标签，其余全部等待用户确认写入。
     let policy = ai::ConfidencePolicy {
         min_suggest: min_confidence,
@@ -2557,18 +2871,41 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         );
         Ok(())
     };
+    let check_time_budget = |suggestion_id: i64| -> AppResult<()> {
+        let Some(budget) = request_budget else {
+            return Ok(());
+        };
+        if let Err(error) = budget.ensure_time_remaining() {
+            let conn = lock()?;
+            ai::set_suggestion_error(&conn, suggestion_id, &error.to_string())?;
+            ai::set_batch_status(&conn, batch_id, "interrupted")?;
+            drop(conn);
+            budget.mark_current_asset_unknown(error.code())?;
+            return Err(error);
+        }
+        Ok(())
+    };
     for chunk in todo.chunks(chunk_size) {
         for s in chunk {
             if cancel.load(Ordering::Relaxed) {
                 mark_cancelled(s.asset_id, processed)?;
                 return Ok(());
             }
+            if let Some(budget) = request_budget {
+                budget.set_current_asset(s.asset_id);
+            }
             let asset = {
                 let conn = lock()?;
-                assets::get(&conn, s.asset_id)?
+                assets::get_managed(&conn, s.asset_id)?
             };
             // 429/额度错误不能重试：继续发送只会放大供应商的限流压力。
             let mut tags = compute(&asset);
+            if let (Some(budget), Err(error)) = (request_budget, &tags) {
+                // The request may have reached the provider even when the
+                // adapter reports a timeout or malformed response. Persist
+                // the ambiguity before any later recovery can select it again.
+                budget.mark_current_asset_unknown(error.code())?;
+            }
             // 限流等待可在网络请求期间收到取消；这条路径必须结束批次而不是把素材误标 rejected。
             if cancel.load(Ordering::Relaxed)
                 || matches!(tags.as_ref(), Err(error) if error.code() == "CANCELLED")
@@ -2576,7 +2913,9 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 mark_cancelled(s.asset_id, processed)?;
                 return Ok(());
             }
-            if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error)) {
+            check_time_budget(s.id)?;
+            if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error) || is_ai_budget_exceeded(error))
+            {
                 let error = match tags {
                     Err(error) => error,
                     Ok(_) => unreachable!("限流分支必须来自 Err"),
@@ -2596,63 +2935,71 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     error_code = error.code(),
                     http_status = ?http_status_from_message(&error_message),
                     error = %error_message,
-                    "AI 服务返回限流错误，停止批次且不再重试"
+                    "AI 服务限流或批准请求预算已用尽，停止批次且保留未完成项"
                 );
                 return Err(error);
             }
-            if let Err(error) = &tags {
-                let error_message = error.to_string();
-                tracing::warn!(
-                    operation = "ai_tagging",
-                    batch_id,
-                    asset_id = s.asset_id,
-                    stage = "request_retry",
-                    attempt = 1,
-                    next_attempt = 2,
-                    backoff_ms = RETRY_SECONDS * 1000,
-                    error_code = error.code(),
-                    http_status = ?http_status_from_message(&error_message),
-                    error = %error_message,
-                    "AI 打标首次请求失败，退避后重试"
-                );
-                if cancel.load(Ordering::Relaxed) {
-                    mark_cancelled(s.asset_id, processed)?;
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(RETRY_SECONDS * 1000));
-                tags = compute(&asset);
-                if cancel.load(Ordering::Relaxed)
-                    || matches!(tags.as_ref(), Err(error) if error.code() == "CANCELLED")
-                {
-                    mark_cancelled(s.asset_id, processed)?;
-                    return Ok(());
-                }
-                // 重试本身也可能撞上供应商限流；仍按 429 语义立即停批，不能把它
-                // 当作普通单条失败 reject 后继续消耗配额。
-                if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error)) {
-                    let error = match tags {
-                        Err(error) => error,
-                        Ok(_) => unreachable!("限流分支必须来自 Err"),
-                    };
+            let may_retry =
+                !request_budget.is_some_and(RequestBudget::has_persistent_tagging_receipts);
+            if may_retry {
+                if let Err(error) = &tags {
                     let error_message = error.to_string();
-                    let conn = lock()?;
-                    ai::set_suggestion_error(&conn, s.id, &error_message)?;
-                    ai::set_batch_status(&conn, batch_id, "interrupted")?;
                     tracing::warn!(
                         operation = "ai_tagging",
                         batch_id,
                         asset_id = s.asset_id,
-                        stage = "rate_limited_after_retry",
-                        processed,
-                        total,
+                        stage = "request_retry",
+                        attempt = 1,
+                        next_attempt = 2,
+                        backoff_ms = RETRY_SECONDS * 1000,
                         error_code = error.code(),
                         http_status = ?http_status_from_message(&error_message),
                         error = %error_message,
-                        "AI 服务重试后返回限流错误，停止批次且不再继续请求"
+                        "AI 打标首次请求失败，退避后重试"
                     );
-                    return Err(error);
+                    if cancel.load(Ordering::Relaxed) {
+                        mark_cancelled(s.asset_id, processed)?;
+                        return Ok(());
+                    }
+                    check_time_budget(s.id)?;
+                    std::thread::sleep(Duration::from_millis(RETRY_SECONDS * 1000));
+                    tags = compute(&asset);
+                    if cancel.load(Ordering::Relaxed)
+                        || matches!(tags.as_ref(), Err(error) if error.code() == "CANCELLED")
+                    {
+                        mark_cancelled(s.asset_id, processed)?;
+                        return Ok(());
+                    }
+                    check_time_budget(s.id)?;
+                    // 重试本身也可能撞上供应商限流；仍按 429 语义立即停批，不能把它
+                    // 当作普通单条失败 reject 后继续消耗配额。
+                    if matches!(tags.as_ref(), Err(error) if is_ai_rate_limited(error) || is_ai_budget_exceeded(error))
+                    {
+                        let error = match tags {
+                            Err(error) => error,
+                            Ok(_) => unreachable!("限流分支必须来自 Err"),
+                        };
+                        let error_message = error.to_string();
+                        let conn = lock()?;
+                        ai::set_suggestion_error(&conn, s.id, &error_message)?;
+                        ai::set_batch_status(&conn, batch_id, "interrupted")?;
+                        tracing::warn!(
+                            operation = "ai_tagging",
+                            batch_id,
+                            asset_id = s.asset_id,
+                            stage = "rate_limited_after_retry",
+                            processed,
+                            total,
+                            error_code = error.code(),
+                            http_status = ?http_status_from_message(&error_message),
+                            error = %error_message,
+                            "AI 服务限流或批准请求预算已用尽，停止批次且保留未完成项"
+                        );
+                        return Err(error);
+                    }
                 }
             }
+            let mut tagging_result_saved = false;
             {
                 let conn = lock()?;
                 match tags {
@@ -2660,14 +3007,36 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                         // W5a（a12）：成功清零连续失败计数（单条内的退避重试不计入熔断）
                         consecutive_failures = 0;
                         // typed 写建议：低置信度在 DB 层拦截，其余全部保持 pending。
-                        let blocked = ai::set_suggestion_result_policy(
+                        let Some(blocked) = ai::set_suggestion_result_policy(
                             &conn,
                             s.id,
                             &a.tags,
                             &a.proposals,
                             &a.description,
                             &policy,
-                        )?;
+                        )?
+                        else {
+                            tracing::info!(
+                                operation = "ai_tagging",
+                                batch_id,
+                                asset_id = s.asset_id,
+                                stage = "review_won_race",
+                                "AI 结果未写回：素材建议已由用户处理"
+                            );
+                            ai::inc_batch_processed(&conn, batch_id)?;
+                            drop(conn);
+                            if let Some(budget) = request_budget {
+                                budget.mark_current_asset_succeeded()?;
+                            }
+                            processed += 1;
+                            progress(AiProgress {
+                                batch_id,
+                                processed,
+                                total,
+                                current_asset_id: s.asset_id,
+                            });
+                            continue;
+                        };
                         a.blocked_low_confidence = blocked;
                         if blocked > 0 {
                             a.warnings
@@ -2723,25 +3092,35 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                                 batch_config_written = true;
                             }
                         }
+                        tagging_result_saved = true;
                     }
                     Err(e) => {
-                        // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）
+                        // 模型执行失败不是用户拒绝：仅记录错误，建议继续 pending 以保留复核/重试入口。
                         let error_code = e.code();
                         let err = e.to_string();
-                        failed_assets += 1;
-                        tracing::warn!(
-                            operation = "ai_tagging",
-                            batch_id,
-                            asset_id = s.asset_id,
-                            stage = "final",
-                            attempts = 2,
-                            error_code,
-                            http_status = ?http_status_from_message(&err),
-                            error = %err,
-                            "AI 打标最终失败"
-                        );
-                        let _ = ai::set_suggestion_error(&conn, s.id, &err);
-                        ai::reject_suggestion(&conn, s.id)?;
+                        let suggestion_is_pending = ai::set_suggestion_error(&conn, s.id, &err)?;
+                        if suggestion_is_pending {
+                            failed_assets += 1;
+                            tracing::warn!(
+                                operation = "ai_tagging",
+                                batch_id,
+                                asset_id = s.asset_id,
+                                stage = "final",
+                                attempts = 2,
+                                error_code,
+                                http_status = ?http_status_from_message(&err),
+                                error = %err,
+                                "AI 打标最终失败；建议仍待处理"
+                            );
+                        } else {
+                            tracing::info!(
+                                operation = "ai_tagging",
+                                batch_id,
+                                asset_id = s.asset_id,
+                                stage = "review_won_race",
+                                "AI 失败未改写建议：素材建议已由用户处理"
+                            );
+                        }
                         // W5a（a12）：熔断 —— 连续失败 ≥3 说明是配置/网络级问题
                         //（key 无效/额度耗尽/断网），继续跑只会浪费请求与时间。
                         consecutive_failures += 1;
@@ -2768,6 +3147,11 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 }
                 ai::inc_batch_processed(&conn, batch_id)?;
             }
+            if tagging_result_saved {
+                if let Some(budget) = request_budget {
+                    budget.mark_current_asset_succeeded()?;
+                }
+            }
             processed += 1;
             progress(AiProgress {
                 batch_id,
@@ -2778,9 +3162,21 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         }
     }
 
+    let has_unstarted_suggestions = allowed_asset_ids.is_some() && {
+        let conn = lock()?;
+        has_unstarted_suggestions(&ai::list_suggestions(&conn, batch_id)?)
+    };
     {
         let conn = lock()?;
-        ai::set_batch_status(&conn, batch_id, "done")?;
+        ai::set_batch_status(
+            &conn,
+            batch_id,
+            if has_unstarted_suggestions {
+                "pending"
+            } else {
+                "done"
+            },
+        )?;
     }
     tracing::info!(
         operation = "ai_tagging",
@@ -2795,15 +3191,25 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     Ok(())
 }
 
+fn has_unstarted_suggestions(suggestions: &[AiSuggestion]) -> bool {
+    suggestions.iter().any(|suggestion| {
+        suggestion.status == "pending"
+            && suggestion.suggested_tags.is_empty()
+            && suggestion.suggested_description.trim().is_empty()
+            && !suggestion.has_analysis
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::CategorizedTags;
     use super::{anthropic_fail_message, join_url, models_url, openai_fail_message};
     use super::{apply_keep_alive, extract_anthropic_text, parse_model_ids, KEEP_ALIVE_IDLE};
     use crate::db::settings::ApiProfile;
     use crate::db::tag_facets::FacetPromptContext;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2894,6 +3300,7 @@ mod tests {
             64,
             super::TextJsonTier::Plain,
             &serde_json::json!({}),
+            None,
             None,
             &AtomicBool::new(false),
         )
@@ -3338,6 +3745,7 @@ mod tests {
             64,
             &serde_json::json!({"type":"object"}),
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -3371,6 +3779,135 @@ mod tests {
             request_openai_vision(&mock_client(Duration::from_millis(30)), &profile).unwrap_err();
         assert_eq!(error.code(), "TIMEOUT");
         let _ = handle.join().unwrap();
+    }
+
+    #[test]
+    fn approved_deadline_bounds_an_in_flight_provider_request() {
+        let (base_url, server) = mock_http_server(
+            200,
+            r#"{"choices":[{"message":{"content":"{}"}}]}"#,
+            Duration::from_secs(2),
+        );
+        let profile = test_profile(base_url, "cloud");
+        let client = mock_client(Duration::from_secs(5));
+        let budget = super::RequestBudget::persistent_until(
+            2,
+            Instant::now() + Duration::from_millis(100),
+            || Ok(true),
+        );
+        let started = Instant::now();
+        let error = super::openai_vision_request(
+            &client,
+            &profile,
+            "system",
+            "user",
+            "aGVsbG8=",
+            "image/jpeg",
+            64,
+            super::TextJsonTier::Plain,
+            &serde_json::json!({}),
+            None,
+            Some(&budget),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "TIMEOUT");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(budget.attempted.get(), 1);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn approved_deadline_bounds_time_waiting_for_provider_limiter() {
+        let cancel = AtomicBool::new(false);
+        let limiter =
+            super::ai_rate_limit::for_connection("approved-deadline-limiter-wait-test", 1, 0, 0)
+                .unwrap();
+        let held = limiter.acquire(&cancel).unwrap();
+        let persisted_attempts = Arc::new(AtomicUsize::new(0));
+        let persisted_attempts_for_budget = Arc::clone(&persisted_attempts);
+        let budget = super::RequestBudget::persistent_until(
+            1,
+            Instant::now() + Duration::from_millis(25),
+            move || {
+                persisted_attempts_for_budget.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+
+        let error = match super::acquire_tagging_request_permit(
+            Some(limiter.as_ref()),
+            &cancel,
+            Some(&budget),
+        ) {
+            Ok(_) => panic!("批准时长耗尽后不能继续等待连接限流额度"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "TIMEOUT");
+        assert_eq!(persisted_attempts.load(Ordering::SeqCst), 0);
+        drop(held);
+    }
+
+    #[test]
+    fn cancellation_after_image_preparation_stops_before_provider_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let profile = test_profile(format!("http://{address}/v1"), "cloud");
+        let client = mock_client(Duration::from_secs(1));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = Arc::clone(&attempts);
+        let budget = super::RequestBudget::persistent(1, move || {
+            callback_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        });
+        let cancelled = AtomicBool::new(true);
+        let error = super::openai_vision_request(
+            &client,
+            &profile,
+            "system",
+            "user",
+            "aGVsbG8=",
+            "image/jpeg",
+            64,
+            super::TextJsonTier::Plain,
+            &serde_json::json!({}),
+            None,
+            Some(&budget),
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "CANCELLED");
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(
+            listener.accept().is_err(),
+            "cancelled requests must not connect"
+        );
+    }
+
+    #[test]
+    fn a_completed_scope_keeps_the_batch_pending_when_other_suggestions_are_unstarted() {
+        let suggestion = |id, has_analysis| super::AiSuggestion {
+            id,
+            batch_id: 7,
+            asset_id: id,
+            asset_path: String::new(),
+            mime_type: Some("image/jpeg".into()),
+            suggested_tags: CategorizedTags::new(),
+            status: "pending".into(),
+            confirmed_tags: CategorizedTags::new(),
+            last_error: None,
+            created_at: 0,
+            suggested_description: String::new(),
+            confirmed_description: None,
+            current_description: String::new(),
+            has_analysis,
+        };
+        let first_scope = [suggestion(1, true), suggestion(2, false)];
+        assert!(super::has_unstarted_suggestions(&first_scope));
+        let completed = [suggestion(1, true)];
+        assert!(!super::has_unstarted_suggestions(&completed));
     }
 
     #[test]

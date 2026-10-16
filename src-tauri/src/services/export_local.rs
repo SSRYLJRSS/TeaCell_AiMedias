@@ -112,7 +112,7 @@ pub fn export_local<F: Fn(ExportProgress)>(
         }
         let asset = {
             let conn = lock()?;
-            assets::get(&conn, id)?
+            assets::get_managed(&conn, id)?
         };
         let src = PathBuf::from(&asset.file_path);
         // R-26：按 layout 解析目标子目录（flat = 目标根目录）
@@ -311,7 +311,7 @@ pub fn write_csv_manifest(
         "文件名,文件路径,标签,宽,高,大小字节,拍摄时间,相机,镜头,ISO,光圈,快门,焦距\r\n".as_bytes(),
     );
     for &id in asset_ids {
-        let Ok(a) = assets::get(conn, id) else {
+        let Ok(a) = assets::get_managed(conn, id) else {
             continue;
         };
         let tags = a

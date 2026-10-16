@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use bagertea_ai_media_v2_lib::services::imaging;
+use teacell_ai_media_manager_lib::services::imaging;
 
 /// R2-5：真实样本目录不再硬编码机器路径 —— 一律经环境变量注入；
 /// 未设置时落到临时目录（不存在 → 各探针自检后优雅跳过）。
@@ -230,7 +230,7 @@ fn probe_raw_library_walk() {
     entries.sort();
     for p in entries {
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
-        if bagertea_ai_media_v2_lib::utils::mime::asset_type_from_ext(ext) != Some("image") {
+        if teacell_ai_media_manager_lib::utils::mime::asset_type_from_ext(ext) != Some("image") {
             continue;
         }
         let t = Instant::now();
@@ -258,10 +258,33 @@ fn probe_raw_library_walk() {
 
 // ═══════════════ W7-3 性能探针（指导书 §W7-3） ═══════════════
 
+fn mark_all_managed(conn: &rusqlite::Connection) {
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .unwrap();
+    let library = teacell_ai_media_manager_lib::db::libraries::current(conn)
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'",
+        rusqlite::params![library.library_id, library.library_epoch, "a".repeat(64)],
+    )
+    .unwrap();
+}
+
 /// 深分页：3 万素材 + 复杂布尔表达式的深翻页耗时（① S6：COUNT + LIMIT/OFFSET 成本随页深增长）
 #[test]
 fn probe_deep_pagination() {
-    use bagertea_ai_media_v2_lib::db::{self, assets};
+    use teacell_ai_media_manager_lib::db::{self, assets};
     let conn = db::init_memory().unwrap();
     // 批量事务插入 3 万条
     let t = std::time::Instant::now();
@@ -284,6 +307,7 @@ fn probe_deep_pagination() {
         }
         tx.commit().unwrap();
     }
+    mark_all_managed(&conn);
     println!("插入 3 万素材: {:?}", t.elapsed());
 
     let filter = assets::AssetFilter {
@@ -308,7 +332,7 @@ fn probe_deep_pagination() {
 /// phash 相似扫描：3 万行分桶 + 汉明比较耗时（验证「毫秒级」断言）
 #[test]
 fn probe_phash_scan_30k() {
-    use bagertea_ai_media_v2_lib::db::{self, assets, dedup};
+    use teacell_ai_media_manager_lib::db::{self, assets, dedup};
     let conn = db::init_memory().unwrap();
     let t = std::time::Instant::now();
     {
@@ -338,6 +362,7 @@ fn probe_phash_scan_30k() {
         }
         tx.commit().unwrap();
     }
+    mark_all_managed(&conn);
     println!("插入 3 万行 + phash: {:?}", t.elapsed());
     let t = std::time::Instant::now();
     let groups = dedup::scan_similar_groups(&conn, 8, false, &[]).unwrap();
@@ -372,7 +397,9 @@ fn probe_raw_dimension_walk() {
     let t = std::time::Instant::now();
     let mut ok = 0;
     for p in &raws {
-        if let Some((w, h)) = bagertea_ai_media_v2_lib::services::raw_decode::probe_dimensions(p) {
+        if let Some((w, h)) =
+            teacell_ai_media_manager_lib::services::raw_decode::probe_dimensions(p)
+        {
             ok += 1;
             let _ = (w, h);
         }
@@ -387,7 +414,7 @@ fn probe_raw_dimension_walk() {
 /// 提示词 token 量级：W5a 后 system + user 实际字符数（近似 token ≈ 字符数，中文 1 字 ≈ 1 token）
 #[test]
 fn probe_prompt_size() {
-    use bagertea_ai_media_v2_lib::db::{self, tag_facets};
+    use teacell_ai_media_manager_lib::db::{self, tag_facets};
     let conn = db::init_memory().unwrap();
     let facets = tag_facets::build_prompt_context(&conn, "all").unwrap();
     // 用中等分面数模拟真实场景（含用户自建分面时）
@@ -408,7 +435,8 @@ fn probe_prompt_size() {
         }
         tag_facets::build_prompt_context(&conn, "all").unwrap()
     };
-    let system = bagertea_ai_media_v2_lib::services::super_search_ai::build_system_prompt(&facets);
+    let system =
+        teacell_ai_media_manager_lib::services::super_search_ai::build_system_prompt(&facets);
     // user 段在 request_intent 内联拼接，这里复刻（含分面说明段；词典与查询句按真实量级估算）
     let mut user = String::from(
         "标签词典（规范名 | aliases: 可搜索别名）

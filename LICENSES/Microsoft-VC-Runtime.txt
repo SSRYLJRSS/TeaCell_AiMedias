@@ -1,0 +1,6 @@
+Microsoft Visual C++ Runtime (x64)
+
+The Windows application bundle contains Microsoft-signed VC143 x64 runtime DLLs required by its native dependencies. They are sourced from the x64 Visual C++ Redistributable installed with Visual Studio Build Tools. Build preparation verifies the Microsoft signatures, common file version, Redistributable package, and SHA-256 hashes.
+
+Redistribution is limited to licensed Visual Studio users and is subject to Microsoft's Software License Terms. See Microsoft's official redistribution guidance:
+https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files?view=msvc-170

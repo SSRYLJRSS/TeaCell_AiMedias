@@ -14,6 +14,10 @@ pub async fn get_thumbnail(
     kind: String,
     size: Option<u32>,
 ) -> AppResult<String> {
+    {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        assets::get_managed(&conn, asset_id)?;
+    }
     let data_dir = state.data_dir.clone();
     let db = std::sync::Arc::clone(&state.db);
     // 高清解码是重活，spawn_blocking 防堵主线程（否则连 asset 协议都被饿死 → 全白+卡死）

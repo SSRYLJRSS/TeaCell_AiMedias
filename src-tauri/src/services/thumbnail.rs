@@ -204,7 +204,7 @@ impl ThumbnailService {
         // 短暂读库（排队期间可能已被前一个任务生成）
         let (asset, out) = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            let asset = assets::get(&conn, asset_id)?;
+            let asset = assets::get_managed(&conn, asset_id)?;
             let size = size.unwrap_or(HD_SIZE);
             let out = if asset.mime_type.starts_with("video/") {
                 self.hd_dir.join(format!("{asset_id}_cover.jpg"))

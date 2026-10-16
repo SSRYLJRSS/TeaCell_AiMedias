@@ -1,4 +1,5 @@
 /** AI 打标（批次管理 + 确认流） */
+import type { PlanPreview } from "@/types/plans";
 
 /** 批次执行类型；auto 仅用于旧 IPC 兼容，实际云端/本地由 tagging 用途绑定解析。 */
 export type AiMode = "cloud" | "local" | "manual" | "auto";
@@ -72,4 +73,21 @@ export interface ModelStatus {
   progress: number;
   sizeMb: number;
   localPath: string | null;
+}
+
+/** Rust serde 响应 DTO：可信计划提交后待启动的打标操作。 */
+export interface TaggingOperation {
+  operationId: string;
+  stepId: string;
+  batchId: number;
+  requestLimit: number;
+  requestsAttempted: number;
+}
+
+/** Rust serde 响应 DTO：打标计划预览及可选的已关联操作。 */
+export interface TaggingPreparation {
+  requiresApproval: boolean;
+  summary: string;
+  preview: PlanPreview | null;
+  operation: TaggingOperation | null;
 }

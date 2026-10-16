@@ -14,7 +14,7 @@ const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RateLimitConfig {
     pub max_concurrency: u32,
     pub requests_per_minute: u32,
@@ -42,12 +42,12 @@ impl RateLimitConfig {
 
 #[derive(Debug, Default)]
 struct LimiterState {
+    config: RateLimitConfig,
     active: u32,
     requests: VecDeque<Instant>,
 }
 
 pub struct AiRateLimiter {
-    config: RateLimitConfig,
     state: Mutex<LimiterState>,
     wake: Condvar,
 }
@@ -55,10 +55,22 @@ pub struct AiRateLimiter {
 impl AiRateLimiter {
     fn new(config: RateLimitConfig) -> Self {
         Self {
-            config,
-            state: Mutex::new(LimiterState::default()),
+            state: Mutex::new(LimiterState {
+                config,
+                ..LimiterState::default()
+            }),
             wake: Condvar::new(),
         }
+    }
+
+    fn update_config(&self, config: RateLimitConfig) -> AppResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("在线服务限流状态锁中毒"))?;
+        state.config = config;
+        self.wake.notify_all();
+        Ok(())
     }
 
     /// 等待一个实际 HTTP 请求的额度。等待期间每 250ms 检查一次取消，
@@ -73,6 +85,25 @@ impl AiRateLimiter {
         cancel: &AtomicBool,
         deadline: Option<Instant>,
     ) -> AppResult<RequestPermit<'_>> {
+        self.acquire_slot(cancel, deadline)?;
+        Ok(RequestPermit { limiter: self })
+    }
+
+    /// Acquire a permit that can remain attached to a streamed request after
+    /// the current worker returns. The connection registry keeps the limiter
+    /// alive while the response is being pulled by the Agent Host.
+    pub fn acquire_until_owned(
+        self: &Arc<Self>,
+        cancel: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> AppResult<OwnedRequestPermit> {
+        self.acquire_slot(cancel, deadline)?;
+        Ok(OwnedRequestPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    fn acquire_slot(&self, cancel: &AtomicBool, deadline: Option<Instant>) -> AppResult<()> {
         let mut state = self
             .state
             .lock()
@@ -86,13 +117,15 @@ impl AiRateLimiter {
                 return Err(AppError::timeout("等待在线服务请求额度超过任务时限"));
             }
             prune_requests(&mut state.requests, now);
-            if self.can_acquire(&state, now) {
+            if Self::can_acquire(&state, now) {
                 state.active = state.active.saturating_add(1);
-                state.requests.push_back(now);
-                return Ok(RequestPermit { limiter: self });
+                if !state.config.is_unlimited() {
+                    state.requests.push_back(now);
+                }
+                return Ok(());
             }
 
-            let mut wait_for = self.wait_duration(&state, now).min(POLL_INTERVAL);
+            let mut wait_for = Self::wait_duration(&state, now).min(POLL_INTERVAL);
             if let Some(deadline) = deadline {
                 wait_for = wait_for.min(deadline.saturating_duration_since(now));
             }
@@ -104,27 +137,27 @@ impl AiRateLimiter {
         }
     }
 
-    fn can_acquire(&self, state: &LimiterState, now: Instant) -> bool {
-        if self.config.max_concurrency > 0 && state.active >= self.config.max_concurrency {
+    fn can_acquire(state: &LimiterState, now: Instant) -> bool {
+        if state.config.max_concurrency > 0 && state.active >= state.config.max_concurrency {
             return false;
         }
-        if self.config.requests_per_minute > 0
-            && count_since(&state.requests, now, MINUTE) >= self.config.requests_per_minute
+        if state.config.requests_per_minute > 0
+            && count_since(&state.requests, now, MINUTE) >= state.config.requests_per_minute
         {
             return false;
         }
-        if self.config.requests_per_hour > 0
-            && state.requests.len() as u32 >= self.config.requests_per_hour
+        if state.config.requests_per_hour > 0
+            && state.requests.len() as u32 >= state.config.requests_per_hour
         {
             return false;
         }
         true
     }
 
-    fn wait_duration(&self, state: &LimiterState, now: Instant) -> Duration {
+    fn wait_duration(state: &LimiterState, now: Instant) -> Duration {
         let mut wait = POLL_INTERVAL;
-        if self.config.requests_per_minute > 0
-            && count_since(&state.requests, now, MINUTE) >= self.config.requests_per_minute
+        if state.config.requests_per_minute > 0
+            && count_since(&state.requests, now, MINUTE) >= state.config.requests_per_minute
         {
             if let Some(oldest) = state
                 .requests
@@ -135,8 +168,8 @@ impl AiRateLimiter {
                 wait = wait.min(MINUTE.saturating_sub(now.duration_since(oldest)));
             }
         }
-        if self.config.requests_per_hour > 0
-            && state.requests.len() as u32 >= self.config.requests_per_hour
+        if state.config.requests_per_hour > 0
+            && state.requests.len() as u32 >= state.config.requests_per_hour
         {
             if let Some(oldest) = state.requests.front().copied() {
                 wait = wait.min(HOUR.saturating_sub(now.duration_since(oldest)));
@@ -152,9 +185,25 @@ pub struct RequestPermit<'a> {
 
 impl Drop for RequestPermit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.limiter.state.lock() {
+        self.limiter.release();
+    }
+}
+
+pub struct OwnedRequestPermit {
+    limiter: Arc<AiRateLimiter>,
+}
+
+impl Drop for OwnedRequestPermit {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+impl AiRateLimiter {
+    fn release(&self) {
+        if let Ok(mut state) = self.state.lock() {
             state.active = state.active.saturating_sub(1);
-            self.limiter.wake.notify_all();
+            self.wake.notify_all();
         }
     }
 }
@@ -175,32 +224,31 @@ fn prune_requests(requests: &mut VecDeque<Instant>, now: Instant) {
     }
 }
 
-type Registry = HashMap<String, (RateLimitConfig, Arc<AiRateLimiter>)>;
+type Registry = HashMap<String, Arc<AiRateLimiter>>;
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 
-/// 取得某个连接的共享限流器。配置全为 0 时返回 None，保持旧行为的零开销路径。
+/// 取得某连接唯一的共享限流器。配置修改时保留正在运行的 permit 和已有窗口计数，
+/// 避免保存连接时通过替换 limiter 重置并发/RPM/RPH 配额。
 pub fn for_connection(
     connection_id: &str,
     max_concurrency: i64,
     requests_per_minute: i64,
     requests_per_hour: i64,
-) -> Option<Arc<AiRateLimiter>> {
+) -> AppResult<Arc<AiRateLimiter>> {
     let config =
         RateLimitConfig::from_values(max_concurrency, requests_per_minute, requests_per_hour);
-    if config.is_unlimited() {
-        return None;
-    }
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut entries = registry.lock().ok()?;
-    if let Some((old_config, limiter)) = entries.get(connection_id) {
-        if *old_config == config {
-            return Some(Arc::clone(limiter));
-        }
+    let mut entries = registry
+        .lock()
+        .map_err(|_| AppError::internal("在线服务限流注册表锁中毒"))?;
+    if let Some(limiter) = entries.get(connection_id) {
+        limiter.update_config(config)?;
+        return Ok(Arc::clone(limiter));
     }
     let limiter = Arc::new(AiRateLimiter::new(config));
-    entries.insert(connection_id.to_string(), (config, Arc::clone(&limiter)));
-    Some(limiter)
+    entries.insert(connection_id.to_string(), Arc::clone(&limiter));
+    Ok(limiter)
 }
 
 #[cfg(test)]
@@ -211,7 +259,7 @@ mod tests {
     fn zero_limits_are_unlimited() {
         let config = RateLimitConfig::from_values(0, 0, 0);
         assert!(config.is_unlimited());
-        assert!(for_connection("unlimited-test", 0, 0, 0).is_none());
+        assert!(for_connection("unlimited-test", 0, 0, 0).is_ok());
     }
 
     #[test]
@@ -240,5 +288,48 @@ mod tests {
         };
         assert_eq!(error.code(), "TIMEOUT");
         drop(permit);
+    }
+
+    #[test]
+    fn connection_config_updates_preserve_active_requests_and_window_usage() {
+        let connection_id = format!("limiter-config-update-{}", uuid::Uuid::new_v4());
+        let cancel = AtomicBool::new(false);
+        let limiter = for_connection(&connection_id, 1, 0, 0).unwrap();
+        let permit = limiter.acquire(&cancel).unwrap();
+
+        let updated = for_connection(&connection_id, 1, 1, 0).unwrap();
+        assert!(Arc::ptr_eq(&limiter, &updated));
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let error = match updated.acquire_until(&cancel, Some(deadline)) {
+            Ok(_) => panic!("保存新限额不能丢失仍活动的共享请求"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "TIMEOUT");
+        drop(permit);
+
+        let error = match updated
+            .acquire_until(&cancel, Some(Instant::now() + Duration::from_millis(25)))
+        {
+            Ok(_) => panic!("更新配置不能清除已有 RPM 窗口记录"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "TIMEOUT");
+    }
+
+    #[test]
+    fn owned_permit_keeps_the_shared_connection_slot_until_stream_drop() {
+        let limiter = Arc::new(AiRateLimiter::new(RateLimitConfig::from_values(1, 0, 0)));
+        let cancel = AtomicBool::new(false);
+        let permit = limiter.acquire_until_owned(&cancel, None).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let error = match limiter.acquire_until(&cancel, Some(deadline)) {
+            Ok(_) => panic!("streaming response must retain its concurrency permit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "TIMEOUT");
+        drop(permit);
+        assert!(limiter
+            .acquire_until(&cancel, Some(Instant::now() + Duration::from_millis(25)))
+            .is_ok());
     }
 }

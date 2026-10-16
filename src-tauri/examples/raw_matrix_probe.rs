@@ -19,7 +19,7 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use bagertea_ai_media_v2_lib::services::imaging;
+use teacell_ai_media_manager_lib::services::imaging;
 
 fn env_or(key: &str, def: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| def.to_string())

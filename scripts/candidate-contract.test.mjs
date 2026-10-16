@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { URL } from "node:url";
+import { assertProductIdentity } from "./product-identity.mjs";
 import {
   assertCandidateCheckout,
   assertRunnerMatchesTarget,
@@ -12,6 +13,26 @@ import {
   packageMetadataMatches,
   RUNNER_BY_TARGET,
 } from "./candidate-contract.mjs";
+
+test("desktop builds reject old branding while retaining persisted compatibility identity", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const cargo = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
+  assert.doesNotThrow(() => assertProductIdentity(pkg, config, cargo));
+  for (const changed of [
+    { ...config, productName: "茶包素材 BagerTea V2" },
+    { ...config, mainBinaryName: "bagertea_ai_media_v2" },
+    { ...config, bundle: { ...config.bundle, homepage: "https://github.com/SSRYLJRSS/old-repo" } },
+    { ...config, identifier: "com.teacell.new-id" },
+  ]) assert.throws(() => assertProductIdentity(pkg, changed, cargo));
+  assert.throws(() => assertProductIdentity({ ...pkg, name: "bagertea" }, config, cargo));
+  assert.throws(() => assertProductIdentity(pkg, config, cargo.replace('name = "teacell_ai_media_manager"', 'name = "bagertea_ai_media_v2"')));
+  assert.throws(() => assertProductIdentity(
+    pkg,
+    config,
+    cargo.replace('name = "teacell_ai_media_manager_lib"', 'name = "bagertea_ai_media_v2_lib"'),
+  ));
+});
 
 test("English package identity preserves the legacy MSI upgrade family", () => {
   const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));

@@ -4,7 +4,9 @@
 //! asset_tags 手工覆盖清 source_batch_id + W5h 同源同步与 remove 对称。
 //! 运行：cargo test --test w7_facet_tests
 
-use bagertea_ai_media_v2_lib::db::{self, asset_tags, assets, settings, tag_facets, tag_ops, tags};
+use teacell_ai_media_manager_lib::db::{
+    self, asset_tags, assets, settings, tag_facets, tag_ops, tags,
+};
 
 fn setup() -> rusqlite::Connection {
     db::init_memory().expect("内存库初始化失败")
@@ -18,7 +20,33 @@ fn add_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
     } else {
         "image/jpeg"
     };
-    assets::insert(conn, path, &name, &ext, 1024, mime, 1700000000000).expect("插入素材失败")
+    let id =
+        assets::insert(conn, path, &name, &ext, 1024, mime, 1700000000000).expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .unwrap();
+    let library = db::libraries::current(conn).unwrap().unwrap();
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .unwrap();
+    id
 }
 
 fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {

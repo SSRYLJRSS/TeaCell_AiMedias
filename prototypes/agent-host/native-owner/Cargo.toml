@@ -1,0 +1,8 @@
+[package]
+name = "teacell-agent-owner-poc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

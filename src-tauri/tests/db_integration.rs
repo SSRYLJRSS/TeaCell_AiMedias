@@ -1,18 +1,46 @@
 //! T02 验收测试：迁移/触发器/搜索/标签树/分页/设置/AI 确认流
 //! 运行：cargo test
 
-use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
-use bagertea_ai_media_v2_lib::db::{
+use teacell_ai_media_manager_lib::db::assets::AssetFilter;
+use teacell_ai_media_manager_lib::db::{
     self, ai, asset_tags, assets, dedup, migrations, settings, tag_facets, tag_ops, tags,
 };
-use bagertea_ai_media_v2_lib::error::AppResult;
+use teacell_ai_media_manager_lib::error::AppResult;
 
 fn setup() -> rusqlite::Connection {
     db::init_memory().expect("内存库初始化失败")
 }
 
 fn add_asset(conn: &rusqlite::Connection, path: &str, name: &str, ext: &str, mime: &str) -> i64 {
-    assets::insert(conn, path, name, ext, 1024, mime, 1700000000000).expect("插入素材失败")
+    let id =
+        assets::insert(conn, path, name, ext, 1024, mime, 1700000000000).expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .expect("登记测试总仓失败");
+    let library = db::libraries::current(conn)
+        .expect("读取测试总仓失败")
+        .expect("测试总仓缺失");
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .expect("登记测试托管定位失败");
+    id
 }
 
 #[test]
@@ -1541,7 +1569,7 @@ fn prompt_context_excludes_manual_only_and_includes_description() -> AppResult<(
 }
 
 // ⑲ P4：布尔表达式树——(含 A 或 含 B) 且 非C 的嵌套查询
-use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr};
 
 #[test]
 fn expr_nested_and_or_not_query() -> AppResult<()> {
@@ -1637,7 +1665,7 @@ fn expr_metadata_combined_with_tag() -> AppResult<()> {
             },
             QueryExpr::Leaf {
                 cond: LeafCond::Metadata {
-                    filter: bagertea_ai_media_v2_lib::db::search_query::MetadataFilter {
+                    filter: teacell_ai_media_manager_lib::db::search_query::MetadataFilter {
                         key: "file_size".into(),
                         op: "gte".into(),
                         value: Some(5242880.into()),
@@ -1866,7 +1894,7 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
     )?;
 
     // ② build_prompt_context 含它（V20 后 input_mode=ai_and_manual 默认参与 AI）
-    let ctx = bagertea_ai_media_v2_lib::db::tag_facets::build_prompt_context(&conn, "all")?;
+    let ctx = teacell_ai_media_manager_lib::db::tag_facets::build_prompt_context(&conn, "all")?;
     assert!(
         ctx.iter().any(|f| f.key == "clothing_color"),
         "自建分面必须进 AI 提示词上下文，实际: {:?}",
@@ -1883,7 +1911,7 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         [batch.id],
         |r| r.get(0),
     )?;
-    let analysis = bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis(
+    let analysis = teacell_ai_media_manager_lib::services::ai_cloud::parse_media_analysis(
         r#"{"description":"人物穿着红色裙子","peoplePresence":{"status":"present","confidence":0.9},"tags":{"clothing_color":[{"name":"红色","confidence":0.95}]}}"#,
         &ctx,
         0.30,
@@ -2123,7 +2151,7 @@ fn query_expr_drops_facet_mismatch() -> AppResult<()> {
         }],
     };
     let sql = {
-        let (frag, _params) = bagertea_ai_media_v2_lib::db::query_expr::compile_leaf(
+        let (frag, _params) = teacell_ai_media_manager_lib::db::query_expr::compile_leaf(
             &conn,
             &LeafCond::Tag {
                 facet_key: "scene".into(),
@@ -2185,7 +2213,7 @@ fn facet_has_any_and_missing_compile() -> AppResult<()> {
     assert_eq!(missing.total, 1);
 
     // F4：未知/不可搜分面 → warning + 整叶剔除（1=1），不再报错整次查询
-    let (frag, _params) = bagertea_ai_media_v2_lib::db::query_expr::compile_leaf(
+    let (frag, _params) = teacell_ai_media_manager_lib::db::query_expr::compile_leaf(
         &conn,
         &LeafCond::FacetHasAny {
             facet_key: "nope".into(),
@@ -2194,7 +2222,7 @@ fn facet_has_any_and_missing_compile() -> AppResult<()> {
     assert_eq!(frag, "1=1", "未知分面剔除为恒真条件，查询继续");
     // validate_expr 覆盖新变体：空 key 报错
     assert!(
-        bagertea_ai_media_v2_lib::db::query_expr::validate_expr(&QueryExpr::Leaf {
+        teacell_ai_media_manager_lib::db::query_expr::validate_expr(&QueryExpr::Leaf {
             cond: LeafCond::FacetMissing {
                 facet_key: "  ".into()
             }

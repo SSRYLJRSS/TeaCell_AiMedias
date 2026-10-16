@@ -197,7 +197,7 @@ pub fn rescan_assets_with(
         // 短锁读素材
         let asset = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            assets::get(&conn, id).ok() // 素材被删/不可读 → skipped
+            assets::get_managed(&conn, id).ok() // 素材被删/不可读 → skipped
         };
         let Some(asset) = asset else {
             summary.skipped += 1;
@@ -337,7 +337,7 @@ pub fn rescan_assets_geo_taken_with(
         }
         let asset = {
             let conn = lock()?;
-            assets::get(&conn, id).ok()
+            assets::get_managed(&conn, id).ok()
         };
         let Some(asset) = asset else {
             summary.skipped += 1;
@@ -430,7 +430,7 @@ pub fn rescan_assets_dimensions(
         }
         let asset = {
             let conn = lock()?;
-            assets::get(&conn, id).ok()
+            assets::get_managed(&conn, id).ok()
         };
         let Some(asset) = asset else {
             summary.skipped += 1;
@@ -491,7 +491,7 @@ pub fn rescan_assets_palette(
         }
         let asset = {
             let conn = lock()?;
-            assets::get(&conn, id).ok()
+            assets::get_managed(&conn, id).ok()
         };
         let Some(asset) = asset else {
             summary.skipped += 1;
@@ -640,7 +640,7 @@ pub fn rescan_assets_phash(
         }
         let asset = {
             let conn = lock()?;
-            assets::get(&conn, id).ok()
+            assets::get_managed(&conn, id).ok()
         };
         let Some(asset) = asset else {
             summary.skipped += 1;
@@ -752,6 +752,33 @@ mod tests {
         Arc::new(Database::new(init_memory().unwrap()))
     }
 
+    fn mark_managed_fixture(c: &Connection, asset_id: i64) {
+        c.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+            [],
+        )
+        .unwrap();
+        let library = crate::db::libraries::current(c).unwrap().unwrap();
+        c.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                asset_id
+            ],
+        )
+        .unwrap();
+    }
+
     fn insert_asset(c: &Connection, id_name: &str, mime: &str, duration: Option<i64>) -> i64 {
         c.execute(
             "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, duration_ms, created_at, modified_at)
@@ -759,10 +786,13 @@ mod tests {
             rusqlite::params![id_name, "a", "mp4", mime, duration],
         )
         .unwrap();
-        c.query_row("SELECT id FROM assets WHERE file_path=?1", [id_name], |r| {
-            r.get(0)
-        })
-        .unwrap()
+        let id = c
+            .query_row("SELECT id FROM assets WHERE file_path=?1", [id_name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        mark_managed_fixture(c, id);
+        id
     }
 
     #[test]

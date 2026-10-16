@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "licenses": [
+    {
+      "id": "pi-monorepo-1.0.4",
+      "path": "pi-1.0.4-LICENSE.txt",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+      "source": "https://github.com/earendil-works/pi/blob/7c10bd4337495ee613f2224843ecdf349b80d1df/LICENSE",
+      "commit": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+      "packages": [
+        {
+          "name": "@earendil-works/pi-ai",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-agent-core",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-coding-agent",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-tui",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-mcp",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-codemode",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/pi-telemetry",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        },
+        {
+          "name": "@earendil-works/chord",
+          "version": "1.0.4",
+          "gitHead": "7c10bd4337495ee613f2224843ecdf349b80d1df",
+          "declaredLicense": "MIT"
+        }
+      ]
+    },
+    {
+      "id": "esbuild-0.28.2",
+      "path": "esbuild-0.28.2-LICENSE.txt",
+      "sha256": "b40ec5baec7bb34fa5b1c09521fa3cd52d5fad7adafed74932a2010d3612a681",
+      "source": "https://github.com/evanw/esbuild/blob/609683d892977362a0f99026cb74b96263d728a9/LICENSE.md",
+      "commit": "609683d892977362a0f99026cb74b96263d728a9",
+      "packages": [
+        {
+          "name": "@esbuild/win32-x64",
+          "version": "0.28.2",
+          "gitHead": "609683d892977362a0f99026cb74b96263d728a9",
+          "declaredLicense": "MIT"
+        }
+      ]
+    },
+    {
+      "id": "standardwebhooks-1.1.1",
+      "path": "standardwebhooks-1.1.1-LICENSE.txt",
+      "sha256": "5ec8c7b26b64d881a6706617bed25c049f97f2f35de034c756de8546fd6dbe27",
+      "source": "https://github.com/standard-webhooks/standard-webhooks/blob/b4d2c14fc5b4ccff3ff271e3b087dff812254c59/libraries/LICENSE",
+      "commit": "b4d2c14fc5b4ccff3ff271e3b087dff812254c59",
+      "packages": [
+        {
+          "name": "standardwebhooks",
+          "version": "1.1.1",
+          "gitHead": "b4d2c14fc5b4ccff3ff271e3b087dff812254c59",
+          "declaredLicense": "MIT"
+        }
+      ]
+    },
+    {
+      "id": "data-uri-to-buffer-4.0.1",
+      "path": "data-uri-to-buffer-4.0.1-README-LICENSE.txt",
+      "sha256": "6d8c05e72e378a28141cdd3d379b776b1e93c72bed785e59c31858caa4b94835",
+      "source": "https://github.com/TooTallNate/node-data-uri-to-buffer/blob/85cd8c854aefbf1bb636789d80364cfac8ea1583/README.md",
+      "commit": "85cd8c854aefbf1bb636789d80364cfac8ea1583",
+      "extraction": "Verbatim License section, before rfc link definition",
+      "sourceBlob": "d0f2e05973586a9e863337877138fe0a600cd2ee",
+      "packages": [
+        {
+          "name": "data-uri-to-buffer",
+          "version": "4.0.1",
+          "gitHead": "85cd8c854aefbf1bb636789d80364cfac8ea1583",
+          "declaredLicense": "MIT"
+        }
+      ]
+    }
+  ]
+}

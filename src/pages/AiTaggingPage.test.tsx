@@ -6,20 +6,27 @@
  *  - 底部全局任务条不出现「AI 打标中」胶囊（taskStore 已移除 AI 订阅），入库/导出不受影响。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import AiTaggingPage from "@/pages/AiTaggingPage";
+import { aiPrepareBatch, aiStartTagging, aiSubmitTaggingPlan } from "@/api/ai";
+import { approvePlan } from "@/api/plans";
 import BottomBar from "@/components/layout/BottomBar";
 import { useAiStore } from "@/stores/aiStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { AiBatch, AiSuggestion } from "@/types/ai";
 import type { Settings } from "@/types/settings";
+import type { PlanPreview } from "@/types/plans";
+import type { TaggingOperation, TaggingPreparation } from "@/types/ai";
 
 const mocks = vi.hoisted(() => ({
   onAiProgress: vi.fn(),
   listAiConnections: vi.fn(),
   getAiUsageBindings: vi.fn(),
   setAiUsageBinding: vi.fn(),
+  aiPrepareBatch: vi.fn(),
+  aiSubmitTaggingPlan: vi.fn(),
+  approvePlan: vi.fn(),
 }));
 
 vi.mock("@/api/ai", () => ({
@@ -32,11 +39,14 @@ vi.mock("@/api/ai", () => ({
   aiListSuggestions: vi.fn().mockResolvedValue([]),
   aiListSuggestionItems: vi.fn().mockResolvedValue([]),
   aiDecideSuggestionItem: vi.fn().mockResolvedValue(undefined),
+  aiPrepareBatch: mocks.aiPrepareBatch,
+  aiSubmitTaggingPlan: mocks.aiSubmitTaggingPlan,
+  aiStartTagging: vi.fn(),
   aiRejectSuggestion: vi.fn(),
   aiRestoreSuggestion: vi.fn(),
-  aiStartBatch: vi.fn(),
   onAiProgress: mocks.onAiProgress,
 }));
+vi.mock("@/api/plans", () => ({ approvePlan: mocks.approvePlan }));
 vi.mock("@/api/tags", () => ({
   recentTagOps: vi.fn().mockResolvedValue([]),
   undoTagBatch: vi.fn(),
@@ -139,7 +149,7 @@ beforeEach(() => {
     return Promise.resolve(() => undefined);
   });
   mocks.listAiConnections.mockResolvedValue([]);
-  mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: null });
+  mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: null, agent: null });
   mocks.setAiUsageBinding.mockResolvedValue(undefined);
   useSettingsStore.setState({ settings: mkSettings(), loaded: true, previewAppearance: null });
   useTaskStore.setState({ tasks: [] });
@@ -192,7 +202,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
         enabled: true,
       },
     ]);
-    mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: "cloud-1" });
+    mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: "cloud-1", agent: null });
     useSettingsStore.setState({ settings: legacySettings, loaded: true });
 
     render(<AiTaggingPage />);
@@ -311,23 +321,120 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
 });
 
 describe("AiTaggingPage 一句话描述草稿同步", () => {
-  it("忽略建议对象的无关更新；有效描述变化时按优先级重置草稿", () => {
+  it("同步未编辑建议，保留正在编辑的草稿，并在用户确认后显示最终值", async () => {
     const suggestion = { ...mkSuggestion(1, 101), suggestedDescription: "初始建议" };
     useAiStore.setState({ batches: [mkBatch({ total: 1 })], currentBatchId: 1, suggestions: [suggestion] });
     render(<AiTaggingPage />);
 
     const input = screen.getByRole("textbox", { name: "一句话描述" });
     expect(input).toHaveValue("初始建议");
-    fireEvent.change(input, { target: { value: "用户正在编辑" } });
 
-    act(() => {
+    await act(async () => {
       useAiStore.setState({ suggestions: [{ ...suggestion, lastError: "无关字段更新" }] });
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("初始建议");
+
+    await act(async () => {
+      useAiStore.setState({ suggestions: [{ ...suggestion, suggestedDescription: "更新建议" }] });
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("更新建议");
+
+    fireEvent.change(input, { target: { value: "用户正在编辑" } });
+    await act(async () => {
+      useAiStore.setState({ suggestions: [{ ...suggestion, suggestedDescription: "更晚模型结果" }] });
+      await Promise.resolve();
     });
     expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("用户正在编辑");
 
-    act(() => {
-      useAiStore.setState({ suggestions: [{ ...suggestion, suggestedDescription: "更新建议" }] });
+    await act(async () => {
+      useAiStore.setState({
+        suggestions: [{ ...suggestion, lastError: "模型请求失败" }],
+      });
+      await Promise.resolve();
     });
-    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("更新建议");
+    expect(useAiStore.getState().suggestions[0]?.status).toBe("pending");
+    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("用户正在编辑");
+
+    await act(async () => {
+      useAiStore.setState({
+        suggestions: [{
+          ...suggestion,
+          status: "confirmed",
+          confirmedDescription: "用户最终确认",
+        }],
+      });
+      await Promise.resolve();
+    });
+    expect(screen.getByText("用户最终确认")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "一句话描述" })).not.toBeInTheDocument();
+  });
+});
+
+describe("AiTaggingPage 打标计划审批", () => {
+  const preview: PlanPreview = {
+    schemaVersion: 1,
+    planId: "plan-tagging-1",
+    capability: "tagging_submit",
+    library: { libraryId: "library-1", libraryEpoch: "epoch-1" },
+    reviewStatus: "pending",
+    reviewKind: "ordinary",
+    itemCount: 1,
+    summary: "已冻结 1 个素材的打标范围",
+    reviewRef: "review-tagging-1",
+    expiresAtUnixSeconds: 1_800_000_000,
+    scope: { scopeRef: "scope-tagging-1" },
+    budget: { maxRequests: 2, maxTokens: 0, maxSeconds: 3600, maxItems: 1 },
+  };
+  const operation: TaggingOperation = {
+    operationId: "operation-tagging-1",
+    stepId: "step-tagging-1",
+    batchId: 1,
+    requestLimit: 2,
+    requestsAttempted: 0,
+  };
+
+  beforeEach(() => {
+    useAiStore.setState({
+      batches: [mkBatch({ total: 1 })],
+      currentBatchId: 1,
+      suggestions: [mkSuggestion(1, 101)],
+    });
+    vi.mocked(aiPrepareBatch).mockResolvedValue({
+      requiresApproval: true,
+      summary: preview.summary,
+      preview,
+      operation: null,
+    } satisfies TaggingPreparation);
+    vi.mocked(approvePlan).mockResolvedValue({
+      schemaVersion: 1,
+      planId: preview.planId,
+      reviewStatus: "approved",
+    });
+    vi.mocked(aiSubmitTaggingPlan).mockResolvedValue(operation);
+    vi.mocked(aiStartTagging).mockResolvedValue(mkBatch({ status: "done", processed: 1 }));
+  });
+
+  it("页面逐步审批、提交并显式启动打标 operation", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<AiTaggingPage />);
+    fireEvent.click(screen.getByRole("button", { name: "开始打标" }));
+
+    await waitFor(() => expect(aiStartTagging).toHaveBeenCalledWith(operation.operationId, operation.stepId));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining(preview.summary));
+    expect(approvePlan).toHaveBeenCalledWith(preview.planId, preview.reviewRef);
+    expect(aiSubmitTaggingPlan).toHaveBeenCalledWith(preview.planId, `tagging_submit_${preview.planId}`);
+  });
+
+  it("用户取消审批时不提交计划也不启动联网步骤", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<AiTaggingPage />);
+    fireEvent.click(screen.getByRole("button", { name: "开始打标" }));
+
+    await waitFor(() => expect(aiPrepareBatch).toHaveBeenCalledWith(1, undefined));
+    expect(approvePlan).not.toHaveBeenCalled();
+    expect(aiSubmitTaggingPlan).not.toHaveBeenCalled();
+    expect(aiStartTagging).not.toHaveBeenCalled();
   });
 });

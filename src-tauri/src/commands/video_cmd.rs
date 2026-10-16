@@ -71,6 +71,7 @@ pub fn get_video_proxy_status(
     variant: Option<String>,
 ) -> AppResult<Option<VideoProxy>> {
     let conn = lock_db(&state)?;
+    crate::db::assets::get_managed(&conn, asset_id)?;
     let (variant, _) = resolve_variant(variant)?;
     crate::db::video_proxy::get(&conn, asset_id, &variant)
 }

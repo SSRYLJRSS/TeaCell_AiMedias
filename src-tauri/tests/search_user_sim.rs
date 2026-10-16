@@ -5,19 +5,19 @@
 //!
 //! 这些用例覆盖复盘中确认的搜索、分页、诊断和 AI 降级行为，作为链路回归基线。
 
-use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr, SearchScope};
-use bagertea_ai_media_v2_lib::db::search::{self};
-use bagertea_ai_media_v2_lib::db::search_plan::{self, Ranking, SearchPlanV3, ShouldClause};
-use bagertea_ai_media_v2_lib::db::{self, asset_tags, assets, tags};
-use bagertea_ai_media_v2_lib::services::super_search_ai as ai;
 use rusqlite::{params, Connection};
+use teacell_ai_media_manager_lib::db::query_expr::{LeafCond, QueryExpr, SearchScope};
+use teacell_ai_media_manager_lib::db::search::{self};
+use teacell_ai_media_manager_lib::db::search_plan::{self, Ranking, SearchPlanV3, ShouldClause};
+use teacell_ai_media_manager_lib::db::{self, asset_tags, assets, tags};
+use teacell_ai_media_manager_lib::services::super_search_ai as ai;
 
 fn setup() -> Connection {
     db::init_memory().expect("内存库初始化失败")
 }
 
 fn add(conn: &Connection, name: &str) -> i64 {
-    assets::insert(
+    let id = assets::insert(
         conn,
         &format!("d:/sim/{name}"),
         name,
@@ -26,7 +26,32 @@ fn add(conn: &Connection, name: &str) -> i64 {
         "image/jpeg",
         1_700_000_000_000,
     )
-    .expect("插入素材失败")
+    .expect("插入素材失败");
+    conn.execute(
+        "UPDATE libraries
+            SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                library_epoch=lower(hex(randomblob(16)))
+          WHERE singleton=1 AND (health!='ready' OR root_identity IS NULL)",
+        [],
+    )
+    .unwrap();
+    let library = db::libraries::current(conn).unwrap().unwrap();
+    conn.execute(
+        "UPDATE managed_asset_locations
+            SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                relative_path=printf('asset-%d.jpg',asset_id),
+                file_identity='fixture-file',content_sha256=?3,
+                ownership_receipt='fixture-receipt'
+          WHERE asset_id=?4",
+        rusqlite::params![
+            library.library_id,
+            library.library_epoch,
+            "a".repeat(64),
+            id
+        ],
+    )
+    .unwrap();
+    id
 }
 
 fn set_desc(conn: &Connection, id: i64, desc: &str) {

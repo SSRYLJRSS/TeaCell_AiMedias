@@ -1,9 +1,9 @@
 //! AI 打标：批次与建议 CRUD + 确认流（确认才写 asset_tags，防污染标签体系）
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use super::{asset_tags, tag_facets, tags};
+use super::{asset_tags, libraries, libraries::VERIFIED_ASSET_SCOPE, tag_facets, tags};
 use crate::error::AppResult;
 
 /// 返回仍待处理或执行中的 AI 批次数量。
@@ -426,22 +426,36 @@ pub fn create_batch_with_retag(
     mode: &str,
     retag: RetagMode,
 ) -> AppResult<AiBatch> {
-    let now = chrono::Utc::now().timestamp_millis();
     let tx = conn.unchecked_transaction()?;
+    let batch = create_batch_with_retag_in_tx(&tx, asset_ids, mode, retag)?;
+    tx.commit()?;
+    Ok(batch)
+}
+
+pub fn create_batch_with_retag_in_tx(
+    tx: &Transaction<'_>,
+    asset_ids: &[i64],
+    mode: &str,
+    retag: RetagMode,
+) -> AppResult<AiBatch> {
+    libraries::ensure_managed_assets(tx, asset_ids)?;
+    let now = chrono::Utc::now().timestamp_millis();
     // W5h-c：同源组内只保留一个代表（非 RAW 优先——JPG 有内嵌预览、解码快）。
     // 代表确认后标签经 assign_inner 自动同步给 RAW → 最终两条都有标签。
     // 批次 total 记去重后数量（与 ai_suggestions 行数一致）。
     // 复用 sync_tags_to_siblings 同一开关：关掉则不去重不同步（回到独立行为）。
     let effective_ids: Vec<i64> = {
-        let sync = super::settings::get_settings(&tx)
+        let sync = super::settings::get_settings(tx)
             .map(|s| s.appearance.kinship.sync_tags_to_siblings)
             .unwrap_or(true);
         if !sync {
             asset_ids.to_vec()
         } else {
             // 读取全库完整同源组；只有恰好 1 RAW + 1 非 RAW 且两者均被选中时，才折叠 RAW。
-            let mut stmt =
-                tx.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT a.id, a.file_path FROM assets a
+                  WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+            ))?;
             let rows: Vec<(i64, String)> = stmt
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
@@ -490,12 +504,11 @@ pub fn create_batch_with_retag(
     // A3：ReplaceAiOnly —— 同事务清旧「未审核 AI 标签」，新批确认后即替换
     //（ai_reviewed/manual 永不触碰，铁律 10 由 asset_tags::retag_clear_unreviewed 守卫）
     if retag == RetagMode::ReplaceAiOnly {
-        asset_tags::retag_clear_unreviewed(&tx, &effective_ids)?;
+        asset_tags::retag_clear_unreviewed(tx, &effective_ids)?;
         // V24（§6.4）：数值同步重跑 —— manual / ai_reviewed 数值行保留
-        crate::db::facet_numbers::retag_clear_unreviewed_numbers(&tx, &effective_ids)?;
+        crate::db::facet_numbers::retag_clear_unreviewed_numbers(tx, &effective_ids)?;
     }
-    tx.commit()?;
-    let mut batch = get_batch(conn, batch_id)?;
+    let mut batch = get_batch(tx, batch_id)?;
     // R2-3：合并组数 = 原始选择 − 去重后代表数（让用户知道省了什么）
     batch.merged_groups = (asset_ids.len() as i64 - effective_ids.len() as i64).max(0);
     Ok(batch)
@@ -686,7 +699,8 @@ pub fn set_suggestion_result_policy(
     proposals: &[TagProposal],
     description: &str,
     policy: &ConfidencePolicy,
-) -> AppResult<usize> {
+) -> AppResult<Option<usize>> {
+    let tx = conn.unchecked_transaction()?;
     // 先按阈值裁剪：低置信词既不入库也不留在 suggested_tags（确认全部不会复活它）
     let filtered_tags: CategorizedTags = {
         let mut out: CategorizedTags = CategorizedTags::new();
@@ -710,15 +724,18 @@ pub fn set_suggestion_result_policy(
         }
         out
     };
-    conn.execute(
-        "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2",
+    let updated = tx.execute(
+        "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2 AND status = 'pending'",
         rusqlite::params![serde_json::to_string(&filtered_tags)?, id],
     )?;
-    conn.execute(
+    if updated != 1 {
+        return Ok(None);
+    }
+    tx.execute(
         "DELETE FROM ai_suggestion_items WHERE suggestion_id = ?1",
         [id],
     )?;
-    conn.execute(
+    tx.execute(
         "UPDATE ai_suggestions SET suggested_description = ?1 WHERE id = ?2",
         rusqlite::params![description, id],
     )?;
@@ -742,14 +759,14 @@ pub fn set_suggestion_result_policy(
         let mut decision_reason: Option<String> = None;
         // F3-a：精确反查（canonical/synonym 命中 → tag_id Some）
         let tag_id: Option<i64> =
-            tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
+            tags::find_by_term(&tx, &p.facet_key, &normalized, tags::TermMatch::Alias)
                 .ok()
                 .and_then(|l| l.hits.into_iter().next())
                 .map(|h| h.tag_id);
         // 近似命中：只提示不自动改写（F6-b）
         if tag_id.is_none() {
             if let Some((_, owner, reason)) =
-                tags::find_similar_tag(conn, &p.facet_key, &normalized)?
+                tags::find_similar_tag(&tx, &p.facet_key, &normalized)?
             {
                 decision_reason = Some(match reason {
                     tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
@@ -758,7 +775,7 @@ pub fn set_suggestion_result_policy(
             }
         }
         let confidence = p.confidence.map(|c| c as f64);
-        conn.execute(
+        tx.execute(
             "INSERT INTO ai_suggestion_items
              (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
@@ -767,7 +784,8 @@ pub fn set_suggestion_result_policy(
             ],
         )?;
     }
-    Ok(blocked_low_confidence)
+    tx.commit()?;
+    Ok(Some(blocked_low_confidence))
 }
 
 /// A4 + V24：数值提议落库（§6.4）—— 建议项写入后追加 item_kind='number' 的条目。
@@ -833,6 +851,14 @@ pub fn set_batch_provenance(
     Ok(())
 }
 
+pub fn batch_has_provenance(conn: &Connection, batch_id: i64) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(request_config_hash,'') != '' FROM ai_batches WHERE id=?1",
+        [batch_id],
+        |row| row.get(0),
+    )?)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSuggestionItem {
@@ -885,7 +911,7 @@ const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_
 pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {SUGG_COLS} FROM ai_suggestions s JOIN assets a ON a.id = s.asset_id
-          WHERE s.batch_id = ?1 ORDER BY s.id"
+          WHERE s.batch_id = ?1 AND {VERIFIED_ASSET_SCOPE} ORDER BY s.id"
     ))?;
     let rows = stmt
         .query_map([batch_id], suggestion_from_row)?
@@ -1095,6 +1121,7 @@ fn confirm_suggestion_inner(
     if status == "confirmed" {
         return Ok(());
     }
+    libraries::ensure_managed_assets(conn, &[asset_id])?;
     let source = if mode == "cloud" {
         "ai_cloud"
     } else {
@@ -1244,6 +1271,7 @@ pub fn apply_tags(conn: &Connection, asset_ids: &[i64], tags: &CategorizedTags) 
     if asset_ids.is_empty() {
         return Ok(());
     }
+    libraries::ensure_managed_assets(conn, asset_ids)?;
     let tx = conn.unchecked_transaction()?;
     let tag_ids = categorized_tag_ids(&tx, tags)?;
     asset_tags::assign_inner(&tx, asset_ids, &tag_ids, "manual", None)?;
@@ -1268,12 +1296,12 @@ pub fn restore_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
 }
 
 /// 记录单条建议打标失败原因（v6）：失败详情落库，前端可展示
-pub fn set_suggestion_error(conn: &Connection, id: i64, error: &str) -> AppResult<()> {
-    conn.execute(
-        "UPDATE ai_suggestions SET last_error = ?1 WHERE id = ?2",
+pub fn set_suggestion_error(conn: &Connection, id: i64, error: &str) -> AppResult<bool> {
+    let changed = conn.execute(
+        "UPDATE ai_suggestions SET last_error = ?1 WHERE id = ?2 AND status = 'pending'",
         rusqlite::params![error, id],
     )?;
-    Ok(())
+    Ok(changed == 1)
 }
 
 pub fn reject_suggestion(conn: &Connection, id: i64) -> AppResult<()> {

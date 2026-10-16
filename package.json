@@ -13,7 +13,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test:unit": "vitest run",
-    "test:tooling": "node --test scripts/build-environment.test.mjs scripts/candidate-contract.test.mjs scripts/heif-contract.test.mjs scripts/verify-candidates.test.mjs",
+    "test:tooling": "node --test scripts/agent-contract.test.mjs scripts/build-environment.test.mjs scripts/candidate-contract.test.mjs scripts/heif-contract.test.mjs scripts/verify-candidates.test.mjs scripts/windows-vc-runtime.test.mjs",
+    "test:agent-host": "npm --prefix packages/agent-host test",
+    "test:agent-host-staged": "node scripts/probe-agent-host-stage.mjs",
     "tauri": "tauri",
     "test:ignored": "cd src-tauri && cargo test --test perf_probe -- --ignored",
     "desktop:dev": "node scripts/desktop.mjs dev",
@@ -21,6 +23,7 @@
     "desktop:check": "node scripts/desktop.mjs check",
     "desktop:check:strict": "node scripts/desktop.mjs check --strict-release",
     "prepare-media-tools": "node scripts/prepare-media-tools.mjs",
+    "prepare-agent-host": "node scripts/prepare-agent-host.mjs",
     "prepare-heif-libraries": "node scripts/prepare-heif-libraries.mjs"
   },
   "dependencies": {

@@ -8,7 +8,17 @@ import Button from "@/components/common/Button";
 import AiTaggingProgress, { assetFileLabel } from "@/components/ai/AiTaggingProgress";
 import Filmstrip from "@/components/ai/Filmstrip";
 import Workbench from "@/components/ai/Workbench";
-import { aiApplyTags, aiDecideSuggestionItem, aiListSuggestionItems, onAiProgress } from "@/api/ai";
+import {
+  aiApplyTags,
+  aiDecideSuggestionItem,
+  aiListSuggestionItems,
+  aiPrepareBatch,
+  aiSubmitTaggingPlan,
+  onAiProgress,
+} from "@/api/ai";
+import { approvePlan } from "@/api/plans";
+import type { PlanPreview } from "@/types/plans";
+import type { TaggingOperation } from "@/types/ai";
 import {
   getAiUsageBindings,
   listAiConnections,
@@ -44,13 +54,14 @@ export default function AiTaggingPage() {
     })),
   );
   const {
-    refreshBatches, openBatch, createBatch, startBatch, cancel, confirm, reject, restore, confirmAll, patchProgress,
+    refreshBatches, openBatch, createBatch, startTagging, setError, cancel, confirm, reject, restore, confirmAll, patchProgress,
   } = useAiStore(
     useShallow((s) => ({
       refreshBatches: s.refreshBatches,
       openBatch: s.openBatch,
       createBatch: s.createBatch,
-      startBatch: s.startBatch,
+      startTagging: s.startTagging,
+      setError: s.setError,
       cancel: s.cancel,
       confirm: s.confirm,
       reject: s.reject,
@@ -79,6 +90,7 @@ export default function AiTaggingPage() {
   // 打标范围（v2.11）：全部 / 仅前 N 张
   const [scopeAll, setScopeAll] = useState(true);
   const [scopeN, setScopeN] = useState("10");
+  const [preparingTaggingPlan, setPreparingTaggingPlan] = useState(false);
 
   useEffect(() => {
     if (!loaded) void load();
@@ -211,6 +223,37 @@ export default function AiTaggingPage() {
   // 「全部确认」必须用「待确认建议」数量（computeAiStats.awaitingConfirmation），不能用待生成数。
   const stats = useMemo(() => computeAiStats(suggestions), [suggestions]);
 
+  const startBatch = useCallback(async (limit?: number) => {
+    if (currentBatchId == null || running || preparingTaggingPlan) return;
+    setPreparingTaggingPlan(true);
+    setError(null);
+    try {
+      const preparation = await aiPrepareBatch(currentBatchId, limit);
+      let operation: TaggingOperation | null = preparation.operation;
+      if (preparation.requiresApproval) {
+        const preview: PlanPreview | null = preparation.preview;
+        if (!preview) throw new Error("AI 打标计划缺少审批预览");
+        if (!window.confirm(`${preparation.summary}\n\n批准后将创建待启动操作。联网只会在你确认此窗口后开始。`)) {
+          return;
+        }
+        const approval = await approvePlan(preview.planId, preview.reviewRef);
+        if (approval.reviewStatus !== "approved") {
+          throw new Error("AI 打标计划未获批准");
+        }
+        operation = await aiSubmitTaggingPlan(
+          preview.planId,
+          `tagging_submit_${preview.planId}`,
+        );
+      }
+      if (!operation) throw new Error("AI 打标计划未生成可启动操作");
+      await startTagging(operation, limit);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreparingTaggingPlan(false);
+    }
+  }, [currentBatchId, preparingTaggingPlan, running, setError, startTagging]);
+
   // 过片走全量建议（胶片条含已确认/已拒绝，状态角标区分）
   const idx = Math.min(reviewIdx, Math.max(0, suggestions.length - 1));
   const currentSuggestion: AiSuggestion | null = suggestions[idx] ?? null;
@@ -222,6 +265,8 @@ export default function AiTaggingPage() {
 
   // 当前张编辑中的标签（切张即重置：已确认张展示 confirmed，其余展示 suggested）
   const [draftTags, setDraftTags] = useState<CategorizedTags>({});
+  const draftEdited = useRef(false);
+  const draftSuggestionId = useRef<number | null>(null);
   // V24（Phase 7-4）：当前建议的数值建议项（itemKind='number'）—— 确认/拒绝后重拉
   const [numberItems, setNumberItems] = useState<WorkbenchNumberItem[]>([]);
   const currentSuggestionId = currentSuggestion?.id;
@@ -277,7 +322,17 @@ export default function AiTaggingPage() {
     [currentSuggestionId, tagFacets],
  );
   useEffect(() => {
+    const suggestionId = currentSuggestion?.id ?? null;
+    const suggestionFinalized = currentSuggestion?.status === "confirmed" || currentSuggestion?.status === "rejected";
+    if (draftSuggestionId.current !== suggestionId || suggestionFinalized) {
+      draftSuggestionId.current = suggestionId;
+      draftEdited.current = false;
+    }
+  }, [currentSuggestion?.id, currentSuggestion?.status]);
+
+  useEffect(() => {
     if (!currentSuggestion) return;
+    if (draftEdited.current) return;
     const src =
       currentSuggestion.status === "confirmed" && Object.keys(currentSuggestion.confirmedTags).length > 0
         ? currentSuggestion.confirmedTags
@@ -296,6 +351,7 @@ export default function AiTaggingPage() {
   const currentSuggestionStatus = currentSuggestion?.status;
   useEffect(() => {
     if (reviewDescription === null) return;
+    if (draftEdited.current) return;
     setDraftDescription(reviewDescription);
   }, [currentSuggestionId, currentSuggestionStatus, reviewDescription]);
 
@@ -445,11 +501,15 @@ export default function AiTaggingPage() {
                 variant="primary"
                 className="mt-1 w-full"
                 disabled={
-                  !scopeAll && (!scopeN || parseInt(scopeN, 10) < 1) || (batchHasVideo && !videoTaggingOn)
+                  preparingTaggingPlan || running || (!scopeAll && (!scopeN || parseInt(scopeN, 10) < 1)) || (batchHasVideo && !videoTaggingOn)
                 }
                 onClick={() => void startBatch(scopeAll ? undefined : parseInt(scopeN, 10))}
               >
-                {batchHasVideo && !videoTaggingOn ? "先开启视频 AI 打标" : "开始打标"}
+                {preparingTaggingPlan
+                  ? "正在准备打标计划…"
+                  : batchHasVideo && !videoTaggingOn
+                    ? "先开启视频 AI 打标"
+                    : "开始打标"}
               </Button>
             </div>
           )}
@@ -620,7 +680,7 @@ export default function AiTaggingPage() {
                         </span>
                       </span>
                     </button>
-                    {canResume && !running && (
+                    {canResume && !running && !preparingTaggingPlan && (
                       <button
                         onClick={() => void startBatch()}
                         title="继续执行剩余未打标项"
@@ -686,9 +746,15 @@ export default function AiTaggingPage() {
               aiGroup={workbenchFacets.aiGroup}
               manualGroup={workbenchFacets.manualGroup}
               tags={draftTags}
-              onTagsChange={setDraftTags}
+              onTagsChange={(next) => {
+                draftEdited.current = true;
+                setDraftTags(next);
+              }}
               description={draftDescription}
-              onDescriptionChange={setDraftDescription}
+              onDescriptionChange={(next) => {
+                draftEdited.current = true;
+                setDraftDescription(next);
+              }}
               numberItems={numberItems}
               onDecideNumberItem={decideNumberItem}
               index={idx}

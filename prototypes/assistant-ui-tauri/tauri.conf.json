@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TeaCell Assistant UI Prototype",
+  "version": "0.1.0",
+  "identifier": "org.teacell.prototype.assistantui",
+  "build": {
+    "devUrl": "http://127.0.0.1:14321/",
+    "frontendDist": "../assistant-ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "url": "http://127.0.0.1:14321/",
+        "title": "茶馆助手交互原型 · A0-06",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../../src-tauri/icons/icon.ico"]
+  }
+}

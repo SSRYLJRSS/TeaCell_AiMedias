@@ -27,27 +27,54 @@ pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
         .ai_config_guard
         .lock()
         .map_err(|_| AppError::msg("AI 配置锁中毒"))?;
-    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-    let has_running_ai_batch = !state
-        .ai_cancel
-        .lock()
-        .map_err(|_| AppError::msg("AI 任务锁中毒"))?
-        .is_empty();
-    if has_running_ai_batch {
+    let mut s = s;
+    let requested_root = s.library_root.trim().to_string();
+    let (current, library) = {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let has_running_ai_batch = !state
+            .ai_cancel
+            .lock()
+            .map_err(|_| AppError::msg("AI 任务锁中毒"))?
+            .is_empty();
         let current = settings::get_settings(&conn)?;
-        let prompt_changed =
-            s.ai.confidence_min_suggest.to_bits() != current.ai.confidence_min_suggest.to_bits();
-        let video_config_changed = s.ai.video_tagging != current.ai.video_tagging
-            || s.ai.video_tagging_mode != current.ai.video_tagging_mode
-            || s.ai.video_frame_count != current.ai.video_frame_count;
-        if prompt_changed || video_config_changed {
+        if has_running_ai_batch {
+            let prompt_changed = s.ai.confidence_min_suggest.to_bits()
+                != current.ai.confidence_min_suggest.to_bits();
+            let video_config_changed = s.ai.video_tagging != current.ai.video_tagging
+                || s.ai.video_tagging_mode != current.ai.video_tagging_mode
+                || s.ai.video_frame_count != current.ai.video_frame_count;
+            if prompt_changed || video_config_changed {
+                return Err(AppError::conflict(
+                    "AI 打标任务运行期间不能修改置信度或视频打标配置，请等待任务结束后重试。",
+                ));
+            }
+        }
+        (current, crate::db::libraries::current(&conn)?)
+    };
+    if requested_root != current.library_root.trim() {
+        if requested_root.is_empty() {
             return Err(AppError::conflict(
-                "AI 打标任务运行期间不能修改置信度或视频打标配置，请等待任务结束后重试。",
+                "已配置总仓不能通过保存设置直接清空，请使用总仓维护流程",
             ));
         }
+        let snapshot = library
+            .as_ref()
+            .ok_or_else(|| AppError::internal("总仓保护状态缺失"))?;
+        // Root inspection/marker IO must complete before the short database
+        // lock that commits the CAS transition and settings write.
+        let prepared = crate::services::managed_library::prepare_initial_root(
+            snapshot,
+            std::path::Path::new(&requested_root),
+        )?;
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let adopted =
+            crate::services::managed_library::commit_initial_root(&conn, snapshot, &prepared)?;
+        s.library_root = adopted.root_path;
+        settings::save_settings(&conn, &s)?;
+    } else {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        settings::save_settings(&conn, &s)?;
     }
-    settings::save_settings(&conn, &s)?;
-    drop(conn);
     if let Err(e) = crate::observability::set_log_level(&s.log_level) {
         // 设置已落库；宿主未初始化 subscriber 或 reload 失败时不能把保存结果伪装成失败。
         tracing::warn!("设置已保存，但日志级别未能立即切换: {e}");

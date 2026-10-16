@@ -1,6 +1,6 @@
 # 协议契约
 
-> 更新日期：2026-09-13
+> 更新日期：2026-10-11
 >
 > 本目录中的契约描述机器协议，不是实现建议。协议变化必须同步 Rust、TypeScript、数据库迁移、UI 行为和测试。
 
@@ -8,6 +8,9 @@
 
 | 契约 | 覆盖范围 | 主要落点 |
 |---|---|---|
+| [agent-v1.md](contracts/agent-v1.md) | Agent 跨入口协议，v1边界契约冻结；业务接入待实现 | `contracts/agent.rs`、`src/types/agent.ts`、生成枚举与漂移测试 |
+| [agent-host-protocol-v1.md](contracts/agent-host-protocol-v1.md) | Rust 与应用自带 Node/Pi Host 的内部进程协议；当前仅 Windows x64、离线模型 fixture | `services/agent_runtime/`、`packages/agent-host/`、Host 集成测试 |
+| [authorization-v1.md](contracts/authorization-v1.md) | 目录授权、主体/会话/世代、受控文件与素材句柄；生产入口按 A1-03 接入 | `services/authorization.rs`、`db/authorization.rs`、`commands/authorization_cmd.rs` |
 | [search-plan-v3.md](contracts/search-plan-v3.md) | SearchPlanV3、must_not 极性、warning、诊断、位置权重 | `db/search_plan.rs`、`superSearchStore.ts`、`QueryBuilder.tsx` |
 | [facets-v2.md](contracts/facets-v2.md) | 分面 key、input_mode、级联删除、标签不变量 | `db/tag_facets.rs`、`tagStore.ts`、`Workbench.tsx` |
 | [super-search-ai-v2.md](contracts/super-search-ai-v2.md) | SearchIntentV2、JSON Schema、三层降级、facet_has_any/missing | `services/super_search_ai.rs`、`db/query_expr.rs`、`AiSearchBar.tsx` |

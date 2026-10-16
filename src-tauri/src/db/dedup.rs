@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::assets::{from_row, Asset, COLUMNS};
+use super::libraries::VERIFIED_ASSET_SCOPE;
 use crate::error::AppResult;
 use crate::services::kinship::{classify_kinship_group, kinship_key, KinshipGroup};
 use crate::services::perceptual::{bucket_by_prefix, hamming};
@@ -36,7 +37,12 @@ pub fn scan_groups(conn: &Connection) -> AppResult<Vec<DupGroup>> {
     let sql = format!(
         "SELECT {COLUMNS} FROM assets a
           WHERE a.hash IS NOT NULL
-            AND a.hash IN (SELECT hash FROM assets WHERE hash IS NOT NULL GROUP BY hash HAVING COUNT(*) > 1)
+            AND {VERIFIED_ASSET_SCOPE}
+            AND a.hash IN (
+                SELECT hash FROM assets a
+                 WHERE a.hash IS NOT NULL AND {VERIFIED_ASSET_SCOPE}
+                 GROUP BY hash HAVING COUNT(*) > 1
+            )
           ORDER BY a.hash, a.created_at, a.id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -79,8 +85,10 @@ pub fn scan_similar_groups(
         return Ok(Vec::new());
     }
     // 1. 一次短锁读全库成员。无 phash 的素材仍计入同源完整组分类，但不参与相似比较。
-    let mut stmt =
-        conn.prepare("SELECT id, file_path, phash FROM assets WHERE deleted_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_path, a.phash FROM assets a
+          WHERE a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -164,7 +172,9 @@ pub fn scan_similar_groups(
     }
 
     // 5. 回读完整 Asset（一次短锁；组内按 created_at 升序，与 scan_groups 语义一致）
-    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM assets WHERE id = ?1"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM assets a WHERE a.id = ?1 AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
     let mut out: Vec<DupGroup> = Vec::new();
     for mut member_ids in member_lists {
         member_ids.sort_unstable();
@@ -218,6 +228,19 @@ mod tests {
     use super::*;
     use crate::db::init_memory;
 
+    fn mem() -> rusqlite::Connection {
+        let conn = init_memory().unwrap();
+        conn.execute(
+            "UPDATE libraries
+                SET health='ready',root_path='C:/fixture-root',root_identity='fixture-root',
+                    library_epoch=lower(hex(randomblob(16)))
+              WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
     fn insert_asset(
         conn: &rusqlite::Connection,
         file_path: &str,
@@ -230,12 +253,29 @@ mod tests {
             rusqlite::params![file_path, hash, phash],
         )
         .unwrap();
-        conn.last_insert_rowid()
+        let id = conn.last_insert_rowid();
+        let library = crate::db::libraries::current(conn).unwrap().unwrap();
+        conn.execute(
+            "UPDATE managed_asset_locations
+                SET status='verified',reason='verified',library_id=?1,library_epoch=?2,
+                    relative_path=printf('asset-%d.jpg',asset_id),
+                    file_identity='fixture-file',content_sha256=?3,
+                    ownership_receipt='fixture-receipt'
+              WHERE asset_id=?4",
+            rusqlite::params![
+                library.library_id,
+                library.library_epoch,
+                "a".repeat(64),
+                id
+            ],
+        )
+        .unwrap();
+        id
     }
 
     #[test]
     fn similar_group_merges_near_hashes() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         let a = insert_asset(
             &conn,
             "C:/photos/a.jpg",
@@ -263,7 +303,7 @@ mod tests {
 
     #[test]
     fn far_hashes_never_group() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         insert_asset(
             &conn,
             "C:/photos/a.jpg",
@@ -282,7 +322,7 @@ mod tests {
 
     #[test]
     fn kinship_exclusion_skips_raw_jpeg_pair() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         // 同目录 + 同主干名（DSC0001）+ 一 RAW 一 JPG = 同源文件
         insert_asset(
             &conn,
@@ -310,7 +350,7 @@ mod tests {
 
     #[test]
     fn ambiguous_kinship_group_is_not_excluded_from_similarity() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         insert_asset(&conn, "C:/p/X.RW2", "r", Some(PH0));
         insert_asset(&conn, "C:/p/X.JPG", "j", Some(PH1));
         insert_asset(&conn, "C:/p/X.PNG", "p", Some(PH2));
@@ -322,7 +362,7 @@ mod tests {
 
     #[test]
     fn need_ids_subset_still_classifies_the_full_kinship_group() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         let raw = insert_asset(&conn, "C:/p/X.RW2", "r", Some(PH0));
         let jpg = insert_asset(&conn, "C:/p/X.JPG", "j", Some(PH1));
         // 即使第三个同源成员没有 phash，也必须计入完整组形状。
@@ -338,7 +378,7 @@ mod tests {
 
     #[test]
     fn threshold_zero_disables_similar() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         insert_asset(
             &conn,
             "C:/photos/a.jpg",
@@ -358,7 +398,7 @@ mod tests {
 
     #[test]
     fn need_ids_restricts_scope() {
-        let conn = init_memory().unwrap();
+        let conn = mem();
         let a = insert_asset(
             &conn,
             "C:/photos/a.jpg",

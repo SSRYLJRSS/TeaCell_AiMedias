@@ -84,6 +84,21 @@ pub fn encode_native_path(path: &Path) -> AppResult<String> {
         .ok_or_else(|| AppError::unsupported("文件名不是有效 UTF-8，首版暂不支持无损入库"))
 }
 
+/// True for symbolic links and Windows reparse points/junctions.
+pub fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 #[cfg(windows)]
 fn path_contains_nul(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
