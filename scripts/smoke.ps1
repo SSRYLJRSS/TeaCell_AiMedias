@@ -42,14 +42,18 @@ Run-Step "Windows background console regression" {
     pwsh ./scripts/test-background-process.ps1
 }
 
-# [1/5] Backend stable group (parallel; network targets excluded to avoid flaky)
+# [1/5] Backend stable group (network targets excluded to avoid flaky).
+# --test-threads=2 matches the documented quality gate in AGENTS.md and keeps
+# Agent Host / SQLite contention low; the default thread count has been observed
+# to wedge the lib group when an installed instance is also running.
 Run-Step "[1/5] cargo test stable group (lib + db_integration + qa_edge + format_matrix + services_integration)" {
     cargo test --manifest-path src-tauri/Cargo.toml `
         --lib `
         --test db_integration `
         --test qa_edge_tests `
         --test format_matrix `
-        --test services_integration
+        --test services_integration `
+        -- --test-threads=2
 }
 
 # [2/5] Network group: AI / Ollama service-level integration (serial + retry)

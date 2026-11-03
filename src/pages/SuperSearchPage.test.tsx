@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SuperSearchPage from "@/pages/SuperSearchPage";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
@@ -128,8 +128,20 @@ beforeEach(() => {
   });
 });
 
+/**
+ * 页面挂载后会异步拉取标签/分面与首屏结果；断言完初始状态后把它们 flush 在 act 内，
+ * 否则更新落在测试之外，成为 act 噪声。
+ */
+async function flushPage() {
+  await act(async () => {
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  });
+}
+
 describe("SuperSearchPage", () => {
-  it("FB6 需求五：无顶栏返回按钮和重复标题；搜索框上方唯一「超级搜索」标识", () => {
+  it("FB6 需求五：无顶栏返回按钮和重复标题；搜索框上方唯一「超级搜索」标识", async () => {
     render(<SuperSearchPage />);
     // 不存在顶栏返回按钮
     expect(screen.queryByText("← 返回")).not.toBeInTheDocument();
@@ -147,9 +159,10 @@ describe("SuperSearchPage", () => {
     expect(screen.getByText(/^\d+ 项$/)).toBeInTheDocument();
     // 新增条件统一从三个区域进入，摘要行不再重复放一个快速添加加号。
     expect(screen.queryByRole("button", { name: "快速添加条件" })).not.toBeInTheDocument();
+    await flushPage();
   });
 
-  it("小窗口布局：页面封住文档溢出，条件区可独立滚动且结果区保留最低高度", () => {
+  it("小窗口布局：页面封住文档溢出，条件区可独立滚动且结果区保留最低高度", async () => {
     const { container } = render(<SuperSearchPage />);
     const page = container.firstElementChild as HTMLElement;
     const filterZone = container.querySelector("[data-filter-zone]") as HTMLElement;
@@ -162,6 +175,7 @@ describe("SuperSearchPage", () => {
     expect(filterZone.className).not.toContain("shrink-0");
     expect(resultScroll.className).toContain("min-h-40");
     expect(resultScroll.className).toContain("overscroll-contain");
+    await flushPage();
   });
 
   function scrollTo(top: number) {
@@ -170,7 +184,7 @@ describe("SuperSearchPage", () => {
     fireEvent.scroll(el);
   }
 
-  it("FB-06：下滚收起详细条件，上滚恢复（FB2-06 改为 grid-template-rows 折叠，面板常驻 DOM）", () => {
+  it("FB-06：下滚收起详细条件，上滚恢复（FB2-06 改为 grid-template-rows 折叠，面板常驻 DOM）", async () => {
     render(<SuperSearchPage />);
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel).toBeInTheDocument();
@@ -184,16 +198,18 @@ describe("SuperSearchPage", () => {
     scrollTo(0);
     expect(panel.style.gridTemplateRows).toBe("1fr");
     expect(panel.getAttribute("aria-hidden")).toBe("false");
+    await flushPage();
   });
 
-  it("FB2-06：顶部区（scrollTop < 48）恒为展开态", () => {
+  it("FB2-06：顶部区（scrollTop < 48）恒为展开态", async () => {
     render(<SuperSearchPage />);
     scrollTo(30); // 低于 minScrollTop，即使下滚也保持展开
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel.style.gridTemplateRows).toBe("1fr");
+    await flushPage();
   });
 
-  it("FB2-06：focus 搜索框强制展开、focus 结果卡片不展开", () => {
+  it("FB2-06：focus 搜索框强制展开、focus 结果卡片不展开", async () => {
     render(<SuperSearchPage />);
     scrollTo(100); // 收起
     const panel = document.getElementById("super-search-filters") as HTMLElement;
@@ -201,10 +217,11 @@ describe("SuperSearchPage", () => {
     // focus 搜索框（在 header data-filter-zone 内）→ 强制展开
     fireEvent.focus(screen.getByRole("searchbox") as HTMLElement);
     expect(panel.style.gridTemplateRows).toBe("1fr");
+    await flushPage();
   });
 
   // FB2-08（FX-09）：结果卡片的色条主色段可点，写入同色系条件
-  it("点结果卡片主色段 → 写入 hue±15 / sat±25 条件；再点另一色系替换而非叠加", () => {
+  it("点结果卡片主色段 → 写入 hue±15 / sat±25 条件；再点另一色系替换而非叠加", async () => {
     useSettingsStore.setState({
       settings: { appearance: { ...DEFAULT_APPEARANCE, colorStrip: { ...DEFAULT_APPEARANCE.colorStrip, enabled: true, showInLibraryGrid: true } } } as never,
       previewAppearance: null,
@@ -221,16 +238,20 @@ describe("SuperSearchPage", () => {
     expect(filters.map((f) => f.key)).toEqual(["dominant_hue", "dominant_sat"]);
 
     // 换一个色系：同 key 替换（叠加两个不相交 hue 区间会 AND 成空集）
-    useSuperSearchStore.setState({
-      items: [mkAsset(2, [{ hex: "#d21b1b", r: 210, g: 27, b: 27, ratio: 0.8 }])],
+    act(() => {
+      useSuperSearchStore.setState({
+        items: [mkAsset(2, [{ hex: "#d21b1b", r: 210, g: 27, b: 27, ratio: 0.8 }])],
+      });
     });
     fireEvent.click(screen.getByRole("button", { name: /^搜索.+系素材$/ }));
     const next = useSuperSearchStore.getState().query.metadataFilters;
     expect(next.filter((f) => f.key === "dominant_hue")).toHaveLength(1);
+    await flushPage();
   });
 
   describe("FB5-03 中央 Chevron 披露按钮（§3.5/§13.4）", () => {
-    it("披露按钮位于中央独立行，只显示 Chevron 图标（无旧文字按钮）", () => {      render(<SuperSearchPage />);
+    it("披露按钮位于中央独立行，只显示 Chevron 图标（无旧文字按钮）", async () => {
+      render(<SuperSearchPage />);
       // 旧文字按钮不复存在
       expect(screen.queryByText(/展开详细条件 ⤵|收起 ⤴/)).not.toBeInTheDocument();
       // 中央披露按钮：仅图标（aria-label 驱动查询）
@@ -242,9 +263,10 @@ describe("SuperSearchPage", () => {
       // 行高 24px
       const row = btn.closest(".h-6") as HTMLElement;
       expect(row).not.toBeNull();
+      await flushPage();
     });
 
-    it("aria-expanded 与面板状态同步；点击切换 Chevron 方向", () => {
+    it("aria-expanded 与面板状态同步；点击切换 Chevron 方向", async () => {
       render(<SuperSearchPage />);
       const btn = screen.getByRole("button", { name: "收起详细条件" });
       expect(btn.getAttribute("aria-expanded")).toBe("true");
@@ -259,9 +281,10 @@ describe("SuperSearchPage", () => {
       fireEvent.click(screen.getByRole("button", { name: "展开详细条件" }));
       expect(screen.getByRole("button", { name: "收起详细条件" }).getAttribute("aria-expanded")).toBe("true");
       expect(panel.style.gridTemplateRows).toBe("1fr");
+      await flushPage();
     });
 
-    it("现有滚动收起/顶部展开/focus 展开逻辑全部保留", () => {
+    it("现有滚动收起/顶部展开/focus 展开逻辑全部保留", async () => {
       render(<SuperSearchPage />);
       const panel = document.getElementById("super-search-filters") as HTMLElement;
       // 下滚收起
@@ -273,6 +296,7 @@ describe("SuperSearchPage", () => {
       // 上滚回顶部保持展开
       scrollTo(0);
       expect(panel.style.gridTemplateRows).toBe("1fr");
+      await flushPage();
     });
   });
 });
@@ -392,6 +416,7 @@ describe("超级搜索 → 详情查看器（联动显示 bug 回归）", () => 
     fireEvent.click(screen.getByRole("button", { name: "下一张" }));
     expect(screen.getByText("2 / 2")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /a20\d\.jpg/ })).not.toBeInTheDocument();
+    await flushPage();
   });
 
   it("关闭查看器：回到超搜页且 viewerOpen 复位（全局 BottomBar 恢复）", async () => {
@@ -408,7 +433,7 @@ describe("超级搜索 → 详情查看器（联动显示 bug 回归）", () => 
 });
 
 describe("FB5-03 条件面板唯一披露按钮（位于面板最底部，不再有第二个向上箭头）", () => {
-  it("展开态：全页只有一个收起按钮，且位于三区条件（条件公式）之后；点它即收起，再点展开", () => {
+  it("展开态：全页只有一个收起按钮，且位于三区条件（条件公式）之后；点它即收起，再点展开", async () => {
     render(<SuperSearchPage />);
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel.style.gridTemplateRows).toBe("1fr");
@@ -427,5 +452,6 @@ describe("FB5-03 条件面板唯一披露按钮（位于面板最底部，不再
     expect(screen.getByRole("button", { name: "展开详细条件" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "展开详细条件" }));
     expect(panel.style.gridTemplateRows).toBe("1fr");
+    await flushPage();
   });
 });

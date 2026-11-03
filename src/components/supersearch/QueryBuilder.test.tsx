@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi, Mock } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import QueryBuilder from "@/components/supersearch/QueryBuilder";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
@@ -69,14 +69,14 @@ beforeEach(() => {
 });
 
 describe("QueryBuilder", () => {
-  it("空状态显示添加条件入口", () => {
-    render(<QueryBuilder />);
+  it("空状态显示添加条件入口", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     const filterZone = within(document.getElementById("qb-zone-filter") as HTMLElement);
     expect(filterZone.getByRole("button", { name: "+ 添加第一个条件" })).toBeInTheDocument();
   });
 
-  it("三区使用统一白色外框并在宽屏网格中等高", () => {
-    render(<QueryBuilder />);
+  it("三区使用统一白色外框并在宽屏网格中等高", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     const zones = ["filter", "should", "mustnot"].map((zone) => document.getElementById(`qb-zone-${zone}`) as HTMLElement);
     expect(zones.every((zone) => zone.className.includes("rounded-md border"))).toBe(true);
     expect(zones.every((zone) => zone.className.includes("p-3"))).toBe(true);
@@ -87,8 +87,8 @@ describe("QueryBuilder", () => {
     expect(screen.getByRole("tablist", { name: "搜索条件分区" })).toBeInTheDocument();
   });
 
-  it("三个区域只保留平铺条件且不重复渲染底部预览", () => {
-    render(<QueryBuilder />);
+  it("三个区域只保留平铺条件且不重复渲染底部预览", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     expect(screen.queryByText(/高级逻辑/)).not.toBeInTheDocument();
     expect(screen.queryByText(/条件组/)).not.toBeInTheDocument();
     expect(screen.queryByText("预览：")).not.toBeInTheDocument();
@@ -106,8 +106,8 @@ describe("QueryBuilder", () => {
     expect(emptyButtons.every((button) => ["h-10", "w-full", "rounded-md", "border"].every((className) => button.className.includes(className)))).toBe(true);
   });
 
-  it("窄窗口页签可以切换三个语义分区", () => {
-    render(<QueryBuilder />);
+  it("窄窗口页签可以切换三个语义分区", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     const tabs = screen.getAllByRole("tab");
     expect(tabs).toHaveLength(3);
     fireEvent.click(screen.getByRole("tab", { name: /排除/ }));
@@ -115,8 +115,8 @@ describe("QueryBuilder", () => {
     expect(document.getElementById("qb-zone-mustnot")).toHaveAttribute("aria-labelledby", "qb-tab-mustNot");
   });
 
-  it("添加条件后生成 expr，并且连接模式可生成 OR", () => {
-    render(<QueryBuilder />);
+  it("添加条件后生成 expr，并且连接模式可生成 OR", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
     pickField("素材类型");
@@ -134,16 +134,16 @@ describe("QueryBuilder", () => {
     expect(screen.getByText("或者")).toBeInTheDocument();
   });
 
-  it("删除行恢复空表达式", () => {
-    render(<QueryBuilder />);
+  it("删除行恢复空表达式", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const del = screen.getByRole("button", { name: "删除条件" });
     fireEvent.click(del);
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
   });
 
-  it("连续输入时保持焦点，不因 store 更新重建输入框", () => {
-    render(<QueryBuilder />);
+  it("连续输入时保持焦点，不因 store 更新重建输入框", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
@@ -156,20 +156,26 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
   });
 
-  it("输入过程中不触发后端查询", () => {
-    render(<QueryBuilder />);
+  it("输入过程中不触发后端查询", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
+    // 上一条用例提交条件时会留下一个 180ms 的刷新防抖（`scheduleRefresh`，模块级单例）。
+    // 先让它在「打字之前」落地并计入基线，本条钉住的才是「打字这一步没有新增后端查询」，
+    // 而不是「整条用例期间后端一次都没被调用」——后者会被上一条用例的遗留防抖误伤，
+    // 测到的其实是用例执行顺序。
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 220)); });
+    const queriesBeforeTyping = (listSuperAssets as Mock).mock.calls.length;
     fireEvent.change(input, { target: { value: "a" } });
     fireEvent.change(input, { target: { value: "ab" } });
     fireEvent.change(input, { target: { value: "abc" } });
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
-    expect(listSuperAssets as Mock).not.toHaveBeenCalled();
+    expect((listSuperAssets as Mock).mock.calls.length).toBe(queriesBeforeTyping);
   });
 
-  it("Enter 提交后查询条件正确", () => {
-    render(<QueryBuilder />);
+  it("Enter 提交后查询条件正确", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
@@ -179,8 +185,8 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "search", value: "海边" } });
   });
 
-  it("失焦提交后查询条件正确", () => {
-    render(<QueryBuilder />);
+  it("失焦提交后查询条件正确", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
@@ -190,8 +196,8 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "search", value: "海边" } });
   });
 
-  it("添加新条件不会破坏已有输入行", () => {
-    render(<QueryBuilder />);
+  it("添加新条件不会破坏已有输入行", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
@@ -202,8 +208,8 @@ describe("QueryBuilder", () => {
     expect((inputs[0] as HTMLInputElement).value).toBe("海边");
   });
 
-  it("删除条件后其余行焦点和值正常", () => {
-    render(<QueryBuilder />);
+  it("删除条件后其余行焦点和值正常", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
@@ -218,8 +224,8 @@ describe("QueryBuilder", () => {
     expect((inputs[0] as HTMLInputElement).value).toBe("海边");
   });
 
-  it("数字条件清空后不会生成等于 0", () => {
-    render(<QueryBuilder />);
+  it("数字条件清空后不会生成等于 0", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("宽度");
     const input = screen.getByRole("spinbutton", { name: "条件值" });
@@ -232,8 +238,8 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
   });
 
-  it("日期条件清空后不会生成 1970 年日期", () => {
-    render(<QueryBuilder />);
+  it("日期条件清空后不会生成 1970 年日期", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("拍摄时间");
     const input = screen.getByLabelText("条件值");
@@ -243,7 +249,7 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
   });
 
-  it("嵌套 AST 以平铺条件显示，编辑叶子时保留原有搜索语义", () => {
+  it("嵌套 AST 以平铺条件显示，编辑叶子时保留原有搜索语义", async () => {
     const orTree: QueryExpr = {
       op: "or",
       children: [
@@ -252,7 +258,7 @@ describe("QueryBuilder", () => {
       ],
     };
     useSuperSearchStore.setState({ expr: orTree });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     // 只显示三个区域的条件行，不出现复杂逻辑专用入口
     expect(screen.queryByText(/复杂条件/)).not.toBeInTheDocument();
     const inputs = screen.getAllByPlaceholderText("输入关键词");
@@ -268,9 +274,9 @@ describe("QueryBuilder", () => {
     expect(children).toContainEqual({ op: "leaf", cond: { type: "search", value: "日落" } });
   });
 
-  it("tagId 不在 tagStore 时从 resolvedTags 生成 synthetic option（§9.8）", () => {
+  it("tagId 不在 tagStore 时从 resolvedTags 生成 synthetic option（§9.8）", async () => {
     useSuperSearchStore.setState({ resolvedTags: [{ facetKey: "subject", text: "银杏", tagId: 99, path: "" }] });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     // 默认 tag 条件：打开面板出现 synthetic 可选项（名称来自 resolvedTags，绝无「选择标签」裸奔）
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
@@ -282,12 +288,12 @@ describe("QueryBuilder", () => {
     expect(screen.getByRole("button", { name: "移除 银杏" })).toBeInTheDocument();
   });
 
-  it("expr 中已含未知 tagId：chip 显示「标签 #id」而非退回空（§9.8；多选语义）", () => {
+  it("expr 中已含未知 tagId：chip 显示「标签 #id」而非退回空（§9.8；多选语义）", async () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "tag", facetKey: "custom", tagIds: [123], mode: "any", includeDescendants: false } },
       resolvedTags: [],
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     // 已选 chip 显示未知 id 占位，可单个移除
     expect(screen.getByRole("button", { name: "移除 标签 #123" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
@@ -297,7 +303,7 @@ describe("QueryBuilder", () => {
 });
 
 describe("W0-3 条件公式包含根级标签", () => {
-  it("queryBuilder_includes_root_tags：根级标签（parentId=null，find_or_create_canonical 的产物）出现在标签下拉中", () => {
+  it("queryBuilder_includes_root_tags：根级标签（parentId=null，find_or_create_canonical 的产物）出现在标签下拉中", async () => {
     const mkTag = (id: number, name: string, facetKey: string) => ({
       id, name, canonicalName: name, normalizedName: name, facetKey,
       parentId: null, status: "active" as const, isSystem: false, isPreset: false,
@@ -312,7 +318,7 @@ describe("W0-3 条件公式包含根级标签", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("包含标签");
     // 标签面板应包含全部三个根级标签（旧代码 walk(root.children) 会漏光）
@@ -331,7 +337,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name, facetEffective: true,
   });
 
-  it("_includes_root_tags：根级标签出现在面板（W0-3 回归守护）", () => {
+  it("_includes_root_tags：根级标签出现在面板（W0-3 回归守护）", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -339,7 +345,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("包含标签");
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
@@ -347,7 +353,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     expect(screen.getByRole("checkbox", { name: "人像" })).toBeInTheDocument();
   });
 
-  it("_groups_by_facet：面板按分面分组显示", () => {
+  it("_groups_by_facet：面板按分面分组显示", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -356,7 +362,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("包含标签");
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
@@ -364,7 +370,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     expect(screen.getByText("subject")).toBeInTheDocument();
   });
 
-  it("_multi_select_tags：面板逐项勾选，多选写入 tagIds（弃用 Ctrl+点击）", () => {
+  it("_multi_select_tags：面板逐项勾选，多选写入 tagIds（弃用 Ctrl+点击）", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -372,7 +378,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("包含标签");
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
@@ -388,8 +394,8 @@ describe("W3-3 QueryBuilder 三合一", () => {
     }
   });
 
-  it("_has_location_field_present：字段下拉只提供可理解的有无定位条件", () => {
-    render(<QueryBuilder />);
+  it("_has_location_field_present：字段下拉只提供可理解的有无定位条件", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const combo = screen.getByRole("combobox", { name: "条件字段" });
     fireEvent.focus(combo);
@@ -404,14 +410,14 @@ describe("W3-3 QueryBuilder 三合一", () => {
 
 /** U-7 ①：文件大小单位下拉 —— 显示按 KB/MB/GB 换算，提交始终是字节。 */
 describe("U-7 数值单位下拉", () => {
-  const openSizeRow = () => {
-    render(<QueryBuilder />);
+  const openSizeRow = async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("文件大小");
   };
 
-  it("queryBuilder_unit_dropdown_converts_to_bytes：选 KB 后输入 5 → 5120 字节", () => {
-    openSizeRow();
+  it("queryBuilder_unit_dropdown_converts_to_bytes：选 KB 后输入 5 → 5120 字节", async () => {
+    await openSizeRow();
     const unit = screen.getByLabelText("数值单位") as HTMLSelectElement;
     expect(unit.value).toBe("MB"); // 默认 MB（旧行为）
     fireEvent.change(unit, { target: { value: "KB" } });
@@ -422,8 +428,8 @@ describe("U-7 数值单位下拉", () => {
     expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5120, unit: "KB" } } });
   });
 
-  it("默认 MB：输入 5 → 5242880 字节", () => {
-    openSizeRow();
+  it("默认 MB：输入 5 → 5242880 字节", async () => {
+    await openSizeRow();
     const input = screen.getByRole("spinbutton", { name: "条件值" });
     fireEvent.change(input, { target: { value: "5" } });
     fireEvent.blur(input);
@@ -431,8 +437,8 @@ describe("U-7 数值单位下拉", () => {
     expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5242880, unit: "MB" } } });
   });
 
-  it("选 GB 后输入 1 → 1073741824 字节", () => {
-    openSizeRow();
+  it("选 GB 后输入 1 → 1073741824 字节", async () => {
+    await openSizeRow();
     fireEvent.change(screen.getByLabelText("数值单位"), { target: { value: "GB" } });
     const input = screen.getByRole("spinbutton", { name: "条件值" });
     fireEvent.change(input, { target: { value: "1" } });
@@ -441,11 +447,11 @@ describe("U-7 数值单位下拉", () => {
     expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 1073741824, unit: "GB" } } });
   });
 
-  it("unit 切换重算已有值（字节不变，显示按新单位换算）", () => {
+  it("unit 切换重算已有值（字节不变，显示按新单位换算）", async () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5 * 1024 * 1024 } } },
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const unit = screen.getByLabelText("数值单位") as HTMLSelectElement;
     expect(unit.value).toBe("MB");
     expect((screen.getByRole("spinbutton", { name: "条件值" }) as HTMLInputElement).value).toBe("5");
@@ -454,11 +460,11 @@ describe("U-7 数值单位下拉", () => {
     expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5242880, unit: "KB" } } });
   });
 
-  it("P1-3 亚 KB 小值不静默归零：500 字节显示 0.488 KB，失焦提交不回写 0 字节", () => {
+  it("P1-3 亚 KB 小值不静默归零：500 字节显示 0.488 KB，失焦提交不回写 0 字节", async () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 500 } } },
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     // 500B 在 MB 下会显示 0.000 → 必须自动落到 KB，避免失焦把条件改成 0 字节
     const unit = screen.getByLabelText("数值单位") as HTMLSelectElement;
     expect(unit.value).toBe("KB");
@@ -480,9 +486,9 @@ describe("U-7 日期快捷 · date_condition_wire_format_is_iso_string", () => {
     return expr.cond.filter.value;
   }
 
-  it("gte + 今天 → 写当天 YYYY-MM-DD 字符串（不是 epoch 数字）", () => {
+  it("gte + 今天 → 写当天 YYYY-MM-DD 字符串（不是 epoch 数字）", async () => {
     const now = new Date();
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("拍摄时间");
     fireEvent.change(screen.getByLabelText("日期快捷"), { target: { value: "today" } });
@@ -493,9 +499,9 @@ describe("U-7 日期快捷 · date_condition_wire_format_is_iso_string", () => {
     expect(typeof value).toBe("string");
   });
 
-  it("lte + 本周 → 写本周最后一天 YYYY-MM-DD 字符串（lte 含当天全天）", () => {
+  it("lte + 本周 → 写本周最后一天 YYYY-MM-DD 字符串（lte 含当天全天）", async () => {
     const now = new Date();
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("入库时间");
     fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "lte" } });
@@ -507,8 +513,8 @@ describe("U-7 日期快捷 · date_condition_wire_format_is_iso_string", () => {
     expect(typeof value).toBe("string");
   });
 
-  it("选中后快捷下拉回到带具体日期的自定义状态，可继续手工改日期（写字符串）", () => {
-    render(<QueryBuilder />);
+  it("选中后快捷下拉回到带具体日期的自定义状态，可继续手工改日期（写字符串）", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("拍摄时间");
     const quick = screen.getByLabelText("日期快捷") as HTMLSelectElement;
@@ -525,12 +531,12 @@ describe("U-7 日期快捷 · date_condition_wire_format_is_iso_string", () => {
     expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: "2025-01-01" } } });
   });
 
-  it("date 输入框回显字符串值（旧 epoch 数字也归一为本地日期显示）", () => {
+  it("date 输入框回显字符串值（旧 epoch 数字也归一为本地日期显示）", async () => {
     // 历史持久化数据：epoch 数字仍能打开并回显，不崩溃
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: new Date("2025-01-01T00:00:00").getTime() } } },
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const date = screen.getByLabelText("条件值") as HTMLInputElement;
     expect(date.type).toBe("date");
     expect(date.value).toBe("2025-01-01");
@@ -542,8 +548,8 @@ describe("U-7 日期快捷 · date_condition_wire_format_is_iso_string", () => {
 
 /** U-1：字段下拉 → 可搜索 combobox（输入过滤 + ↑↓/Enter/Esc + 点外关闭 + 最近使用 3 置顶） */
 describe("U-1 可搜索字段 combobox", () => {
-  it("queryBuilder_field_combobox_searchable：输入过滤 + ↑↓ + Enter 选中", () => {
-    render(<QueryBuilder />);
+  it("queryBuilder_field_combobox_searchable：输入过滤 + ↑↓ + Enter 选中", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const combo = screen.getByRole("combobox", { name: "条件字段" }) as HTMLInputElement;
     // P2：新行自动聚焦字段下拉（方案 §3.3）—— 初始即打开可搜索列表
@@ -559,8 +565,8 @@ describe("U-1 可搜索字段 combobox", () => {
     expect(combo.getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("Esc 关闭并回到当前字段标签；无匹配时显示提示", () => {
-    render(<QueryBuilder />);
+  it("Esc 关闭并回到当前字段标签；无匹配时显示提示", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const combo = screen.getByRole("combobox", { name: "条件字段" }) as HTMLInputElement;
     fireEvent.focus(combo);
@@ -571,9 +577,9 @@ describe("U-1 可搜索字段 combobox", () => {
     expect(combo.value).toBe("包含标签");
   });
 
-  it("最近使用最多 3 个且按最新顺序置顶，字段仍保留在原分组", () => {
+  it("最近使用最多 3 个且按最新顺序置顶，字段仍保留在原分组", async () => {
     localStorage.setItem("qb:recent-fields", JSON.stringify(["height", "width", "mime_type", "excludeTag", "width", "file_size"]));
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.focus(screen.getByRole("combobox", { name: "条件字段" }));
     const listbox = within(screen.getByRole("listbox", { name: "条件字段列表" }));
@@ -591,8 +597,8 @@ describe("U-1 可搜索字段 combobox", () => {
     expect(within(material).getByRole("option", { name: "宽度" })).toBeInTheDocument();
   });
 
-  it("选择字段写入最近使用并持久化（最多 3 个）", () => {
-    render(<QueryBuilder />);
+  it("选择字段写入最近使用并持久化（最多 3 个）", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("文件大小");
     expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["file_size"]);
@@ -603,8 +609,8 @@ describe("U-1 可搜索字段 combobox", () => {
     expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["taken_at", "height", "width"]);
   });
 
-  it("手动字段入口隐藏内部协议和难以理解的技术字段", () => {
-    render(<QueryBuilder />);
+  it("手动字段入口隐藏内部协议和难以理解的技术字段", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const listbox = within(screen.getByRole("listbox", { name: "条件字段列表" }));
     const labels = listbox.getAllByRole("option").map((o) => o.textContent ?? "");
@@ -616,8 +622,8 @@ describe("U-1 可搜索字段 combobox", () => {
     }
   });
 
-  it("鼠标点击 portal 字段选项后可以切换字段", () => {
-    render(<QueryBuilder />);
+  it("鼠标点击 portal 字段选项后可以切换字段", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const combo = screen.getByRole("combobox", { name: "条件字段" }) as HTMLInputElement;
     const listbox = within(screen.getByRole("listbox", { name: "条件字段列表" }));
@@ -642,7 +648,7 @@ describe("U-2 标签 chip 多选", () => {
     sortOrder: 0, assetCount: 0, totalCount: 0, aliases, path: name, facetEffective: true,
   });
 
-  it("queryBuilder_tag_chip_multiselect：chip 展示选中 + 逐条移除", () => {
+  it("queryBuilder_tag_chip_multiselect：chip 展示选中 + 逐条移除", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -650,7 +656,7 @@ describe("U-2 标签 chip 多选", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "海边" }));
@@ -668,7 +674,7 @@ describe("U-2 标签 chip 多选", () => {
     }
   });
 
-  it("queryBuilder_term_match_selector：默认别名，切换精确后别名不可命中", () => {
+  it("queryBuilder_term_match_selector：默认别名，切换精确后别名不可命中", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -676,7 +682,7 @@ describe("U-2 标签 chip 多选", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
     const mode = screen.getByLabelText("匹配模式") as HTMLSelectElement;
@@ -691,7 +697,7 @@ describe("U-2 标签 chip 多选", () => {
     expect(screen.getByText("没有匹配的标签")).toBeInTheDocument();
   });
 
-  it("前缀模式：prefix 命中开头；contains 命中任意位置", () => {
+  it("前缀模式：prefix 命中开头；contains 命中任意位置", async () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -700,7 +706,7 @@ describe("U-2 标签 chip 多选", () => {
       ],
       loading: false, treesByFacet: {}, expanded: new Set(),
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
     fireEvent.change(screen.getByLabelText("搜索标签"), { target: { value: "海" } });
@@ -720,8 +726,8 @@ describe("U-2 标签 chip 多选", () => {
 
 /** U-3：前三色列表 —— 单选 eq（+ 占比阈值 min）/ 多选 in；高级 hue/sat/lum 不作为手动字段入口。 */
 describe("U-3 颜色列表", () => {
-  it("queryBuilder_color_list：颜色名称列表 + 阈值滑块 → eq 带 min；多选 → in；撤选回 eq", () => {
-    render(<QueryBuilder />);
+  it("queryBuilder_color_list：颜色名称列表 + 阈值滑块 → eq 带 min；多选 → in；撤选回 eq", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("前三色包含");
     // 单选「红」→ eq 红（无阈值）
@@ -759,8 +765,8 @@ describe("U-3 颜色列表", () => {
     }
   });
 
-  it("queryBuilder_hides_technical_color_dimensions：手动字段列表不暴露色相/饱和度/明度", () => {
-    render(<QueryBuilder />);
+  it("queryBuilder_hides_technical_color_dimensions：手动字段列表不暴露色相/饱和度/明度", async () => {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.change(screen.getByRole("combobox", { name: "条件字段" }), { target: { value: "主色" } });
     expect(screen.queryByRole("option", { name: /主色色相/ })).not.toBeInTheDocument();
@@ -771,12 +777,12 @@ describe("U-3 颜色列表", () => {
 
 /** 基础连接方式：仅保留三个区域和各区域的基础连接语义。 */
 describe("基础连接方式", () => {
-  it("queryBuilder_min_match_compile：至少N项 —— N=2 展开 C(3,2) 组 OR；N=1 → OR；N=全部 → AND（验收 3）", () => {
+  it("queryBuilder_min_match_compile：至少N项 —— N=2 展开 C(3,2) 组 OR；N=1 → OR；N=全部 → AND（验收 3）", async () => {
     const l1: QueryExpr = { op: "leaf", cond: { type: "search", value: "海边" } };
     const l2: QueryExpr = { op: "leaf", cond: { type: "search", value: "日落" } };
     const l3: QueryExpr = { op: "leaf", cond: { type: "search", value: "夜景" } };
     useSuperSearchStore.setState({ expr: { op: "and", children: [l1, l2, l3] } });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     fireEvent.click(screen.getByRole("radio", { name: "至少N项" }));
     const expr = useSuperSearchStore.getState().expr;
     expect(expr?.op).toBe("or");
@@ -815,9 +821,9 @@ describe("U-5 加分项区", () => {
     });
   };
 
-  it("queryBuilder_should_section_renders：优先满足区（plan.should）显示行编辑 + 空态引导", () => {
+  it("queryBuilder_should_section_renders：优先满足区（plan.should）显示行编辑 + 空态引导", async () => {
     seedShouldPlan([1, 1, 1], 1);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     expect(screen.getByText("优先满足")).toBeInTheDocument();
     // 三条加分项各渲染一个值编辑区（chips 显示标签名）
     expect(screen.getAllByText(/蓝天/).length).toBeGreaterThan(0);
@@ -828,27 +834,27 @@ describe("U-5 加分项区", () => {
     expect(shouldZone.getByRole("button", { name: "+ 添加条件" })).toBeInTheDocument();
   });
 
-  it("queryBuilder_min_should_match_is_always_zero", () => {
+  it("queryBuilder_min_should_match_is_always_zero", async () => {
     seedShouldPlan([1, 1, 1], 0);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     // §3.4：至少满足 N 项默认收起（防误读成「满足几项加几分」），点开高级设置才出现
     expect(screen.queryByRole("button", { name: "高级设置" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("至少满足")).not.toBeInTheDocument();
     expect(useSuperSearchStore.getState().plan?.minimumShouldMatch).toBe(0);
   });
 
-  it("queryBuilder_should_reorder_with_move_controls", () => {
+  it("queryBuilder_should_reorder_with_move_controls", async () => {
     seedShouldPlan([0.5, 1, 2], 1);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     fireEvent.click(screen.getAllByRole("button", { name: "上移优先条件" })[1]);
     const should = useSuperSearchStore.getState().plan?.should;
     expect(should?.map((item) => item.label)).toEqual(["夜景", "蓝天", "女孩"]);
     expect(should?.map((item) => item.weight)).toEqual([2, 1, 0.5]);
   });
 
-  it("queryBuilder_should_has_no_dead_drag_affordance：优先区移除无效拖拽点，仍保留明确的上下移动作", () => {
+  it("queryBuilder_should_has_no_dead_drag_affordance：优先区移除无效拖拽点，仍保留明确的上下移动作", async () => {
     seedShouldPlan([2, 1, 0.5], 0);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     expect(screen.queryByRole("button", { name: /拖动优先条件/ })).not.toBeInTheDocument();
     expect(screen.queryByTestId("should-drop-line")).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "上移优先条件" })).toHaveLength(3);
@@ -860,7 +866,7 @@ describe("U-5 加分项区", () => {
       expr: { op: "leaf", cond: { type: "search", value: "海边" } },
       plan: null,
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个优先条件" }));
     expect(useSuperSearchStore.getState().plan).toBeNull();
     // 草稿默认是空标签；切换到有默认值的素材类型后才满足完整性。
@@ -894,7 +900,7 @@ describe("U-6 四指标诊断", () => {
       should: [],
       warnings: [],
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     // 诊断带 320ms 防抖，使用 waitFor 覆盖定时器 + promise 两层异步。
     await waitFor(() => expect(screen.getByText(/这个条件把结果筛空了/)).toBeInTheDocument(), { timeout: 1000 });
     // 第二行：−5（delta）+ 单独就没有匹配项（self_count=0）
@@ -927,7 +933,7 @@ describe("排除区（mustNot）", () => {
       ],
     };
     seedPlan(mustNot);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const zone = document.getElementById("qb-zone-mustnot");
     expect(zone).not.toBeNull();
     expect(within(zone as HTMLElement).getByText("排除")).toBeInTheDocument();
@@ -949,7 +955,7 @@ describe("排除区（mustNot）", () => {
       ],
     };
     seedPlan(mustNot);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const zone = document.getElementById("qb-zone-mustnot") as HTMLElement;
     await waitFor(() => expect(within(zone).getAllByRole("button", { name: "删除条件" })).toHaveLength(2));
     // 删除第一行（夜景）→ 收敛为单叶
@@ -966,7 +972,7 @@ describe("排除区（mustNot）", () => {
 
   it("queryBuilder_exclusion_zone_add_row：＋ 添加排除条件 → 草稿行出现，未完成不写回 plan", async () => {
     seedPlan(null);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个排除条件" }));
     // 空标签草稿行：行在 UI，但未完成条件不进 mustNot
     expect(useSuperSearchStore.getState().plan?.mustNot).toBeNull();
@@ -984,7 +990,7 @@ describe("排除区（mustNot）", () => {
       ],
     };
     seedPlan(mustNot);
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const zone = document.getElementById("qb-zone-mustnot") as HTMLElement;
     await waitFor(() => expect(within(zone).getAllByRole("button", { name: "删除条件" })).toHaveLength(2));
     // 默认「命中任一」→ 切「全部命中」→ mustNot 根组变 AND，语义「同时命中才排除」
@@ -1013,7 +1019,7 @@ describe("排除区（mustNot）", () => {
       should: [],
       warnings: [],
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const zone = document.getElementById("qb-zone-mustnot") as HTMLElement;
     await waitFor(() => expect(within(zone).getByText(/这个条件把结果筛空了/)).toBeInTheDocument(), { timeout: 1000 });
   });
@@ -1021,7 +1027,7 @@ describe("排除区（mustNot）", () => {
 
 /** §3.5：ShouldClause.evidence 原文回显（AI 判断可逐条改判）。 */
 describe("优先满足 evidence 回显", () => {
-  it("queryBuilder_should_evidence_echo：should 行下方显示「evidence」原文", () => {
+  it("queryBuilder_should_evidence_echo：should 行下方显示「evidence」原文", async () => {
     const filter: QueryExpr = { op: "leaf", cond: { type: "search", value: "海边" } };
     const plan: SearchPlanV3 = {
       planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
@@ -1034,7 +1040,7 @@ describe("优先满足 evidence 回显", () => {
       ranking: { type: "field", key: "created_at", dir: "desc" },
     };
     useSuperSearchStore.setState({ expr: filter, plan, resolvedTags: [{ facetKey: "scene", text: "户外", tagId: 5, path: "" }] });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     expect(screen.getByText("「最好是户外」")).toBeInTheDocument();
   });
 });
@@ -1045,8 +1051,8 @@ describe("Phase 4 · 数值输入统一", () => {
     key, unit: "raw", min: null, max: null, step: 1, decimals: 0, presets: [], circular: false,
     suspiciousBelow: null, allowedOps: ["eq", "gt", "gte", "lt", "lte", "between"], ...extra,
   } as NumericDomain);
-  function openField(label: string) {
-    render(<QueryBuilder />);
+  async function openField(label: string) {
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField(label);
   }
@@ -1056,9 +1062,9 @@ describe("Phase 4 · 数值输入统一", () => {
     return e.cond.filter;
   }
 
-  it("valueInput_respects_domain_bounds：数值输入 clamp 到 NumericDomain 的 min/max", () => {
+  it("valueInput_respects_domain_bounds：数值输入 clamp 到 NumericDomain 的 min/max", async () => {
     useNumericDomainStore.setState({ domains: [domainOf("width", { unit: "pixels", unitLabel: "px", min: 0, max: 100, step: 1 })], loaded: true, loading: false });
-    openField("宽度");
+    await openField("宽度");
     const num = screen.getByRole("spinbutton", { name: "条件值" });
     fireEvent.change(num, { target: { value: "150" } });
     fireEvent.blur(num);
@@ -1067,12 +1073,12 @@ describe("Phase 4 · 数值输入统一", () => {
     expect(f?.value).toBe(100); // 越界 150 被 clamp 回 100
   });
 
-  it("dimension_fields_use_width_and_height_px：手动尺寸筛选只提供宽/高，输入单位明确为 px", () => {
+  it("dimension_fields_use_width_and_height_px：手动尺寸筛选只提供宽/高，输入单位明确为 px", async () => {
     useNumericDomainStore.setState({ domains: [
       domainOf("width", { unit: "pixels", unitLabel: "px", min: 0, step: 1 }),
       domainOf("height", { unit: "pixels", unitLabel: "px", min: 0, step: 1 }),
     ], loaded: true, loading: false });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     const field = screen.getByRole("combobox", { name: "条件字段" });
     fireEvent.focus(field);
@@ -1083,11 +1089,11 @@ describe("Phase 4 · 数值输入统一", () => {
     expect(screen.getByText("px")).toBeInTheDocument();
   });
 
-  it("aspect_ratio_uses_preset_or_ratio_text：预设与自定义宽高比互斥，并按 3:2 格式提交", () => {
+  it("aspect_ratio_uses_preset_or_ratio_text：预设与自定义宽高比互斥，并按 3:2 格式提交", async () => {
     useNumericDomainStore.setState({ domains: [domainOf("aspect_ratio", {
       min: 0, step: 0.01, presets: [["1:1", 1], ["4:3", 4 / 3], ["3:2", 3 / 2], ["16:9", 16 / 9], ["9:16", 9 / 16]],
     })], loaded: true, loading: false });
-    openField("宽高比");
+    await openField("宽高比");
     expect(screen.getByLabelText("宽高比选项")).toHaveValue("custom");
     expect(screen.getByLabelText("宽高比自定义值")).toHaveAttribute("placeholder", "例如 3:2");
 
@@ -1103,9 +1109,9 @@ describe("Phase 4 · 数值输入统一", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("rating_star_picker_writes_number：评级 eq 用 0–5 星选，点击写数值", () => {
+  it("rating_star_picker_writes_number：评级 eq 用 0–5 星选，点击写数值", async () => {
     useNumericDomainStore.setState({ domains: [domainOf("rating", { unit: "stars", min: 0, max: 5, step: 1 })], loaded: true, loading: false });
-    openField("评级");
+    await openField("评级");
     fireEvent.click(screen.getByRole("radio", { name: "4 星" }));
     const f = leafFilter();
     expect(f?.key).toBe("rating");
@@ -1114,9 +1120,9 @@ describe("Phase 4 · 数值输入统一", () => {
     expect(leafFilter()?.value).toBe(0);
   });
 
-  it("between_rejects_inverted_range：非环形倒置不进条件并提示", () => {
+  it("between_rejects_inverted_range：非环形倒置不进条件并提示", async () => {
     useNumericDomainStore.setState({ domains: [domainOf("width", { unit: "pixels", unitLabel: "px", min: 0 })], loaded: true, loading: false });
-    openField("宽度");
+    await openField("宽度");
     fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "between" } });
     const [lo, hi] = screen.getAllByRole("spinbutton", { name: "条件值" });
     fireEvent.change(lo, { target: { value: "80" } }); fireEvent.blur(lo);
@@ -1125,15 +1131,15 @@ describe("Phase 4 · 数值输入统一", () => {
     expect(screen.getByText(/范围下限不能大于上限/)).toBeInTheDocument();
   });
 
-  it("legacy_circular_hue_between_remains_renderable：历史色相条件仍按环形语义显示", () => {
+  it("legacy_circular_hue_between_remains_renderable：历史色相条件仍按环形语义显示", async () => {
     useNumericDomainStore.setState({ domains: [domainOf("dominant_hue", { unit: "degrees", min: 0, max: 359, circular: true })], loaded: true, loading: false });
     useSuperSearchStore.setState({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "dominant_hue", op: "between", min: 345, max: 15 } } }, plan: null });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     expect(screen.getByText(/色相跨 0° 区间/)).toBeInTheDocument();
   });
 
-  it("size_unit_shared_across_between：file_size 区间两侧共用一个单位下拉，切换单位换算一致", () => {
-    openField("文件大小");
+  it("size_unit_shared_across_between：file_size 区间两侧共用一个单位下拉，切换单位换算一致", async () => {
+    await openField("文件大小");
     fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "between" } });
     const units = screen.getAllByLabelText("数值单位");
     expect(units).toHaveLength(1); // 共享单位，不是每侧一个
@@ -1148,22 +1154,23 @@ describe("Phase 4 · 数值输入统一", () => {
   });
 
   it("size_unit_survives_external_expr_change：单位进 filter，外部改写数值后单位不丢", async () => {
-    openField("文件大小");
+    await openField("文件大小");
     fireEvent.change(screen.getByLabelText("数值单位"), { target: { value: "KB" } });
     const input = screen.getByRole("spinbutton", { name: "条件值" });
     fireEvent.change(input, { target: { value: "5" } });
     fireEvent.blur(input);
     expect(leafFilter()?.value).toBe(5120);
-    // 外部（换源/AI 合并）改写数值但保留 unit：重渲染后仍按 KB 显示
-    useSuperSearchStore.setState({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 10240, unit: "KB" as const } } } });
-    await waitFor(() => {
-      expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 10240, unit: "KB" } } });
+    // 外部（换源/AI 合并）改写数值但保留 unit：重渲染后仍按 KB 显示。
+    // 这次写入会驱动组件重渲染，必须走 act，否则 React 会在 act 之外落状态。
+    await act(async () => {
+      useSuperSearchStore.setState({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 10240, unit: "KB" as const } } } });
     });
+    expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 10240, unit: "KB" } } });
     expect((screen.getByLabelText("数值单位") as HTMLSelectElement).value).toBe("KB");
     expect((await screen.findByDisplayValue("10"))).toBeInTheDocument();
   });
 
-  it("enum_value_dropdown_shows_counts：file_ext 的 eq 候选值带命中数", () => {
+  it("enum_value_dropdown_shows_counts：file_ext 的 eq 候选值带命中数", async () => {
     useMetadataStore.setState({
       facets: [{ key: "file_ext", displayName: "文件格式", description: "", items: [
         { value: "jpg", label: "JPG", count: 205 },
@@ -1171,7 +1178,7 @@ describe("Phase 4 · 数值输入统一", () => {
       ] }],
       loading: false, loaded: true,
     });
-    openField("文件格式");
+    await openField("文件格式");
     const select = screen.getByLabelText("条件值") as HTMLSelectElement;
     const opts = Array.from(select.options).map((o) => o.textContent);
     expect(opts).toContain("JPG（205）");
@@ -1181,7 +1188,7 @@ describe("Phase 4 · 数值输入统一", () => {
 
   it("enum_fields_keep_a_valid_control_without_facet_data：有无定位用固定选项，in 用 values 数组", async () => {
     useMetadataStore.setState({ facets: [], loading: false, loaded: true });
-    openField("有无定位");
+    await openField("有无定位");
     const location = screen.getByLabelText("条件值") as HTMLSelectElement;
     expect(Array.from(location.options).map((option) => option.textContent)).toEqual(["选择…", "有定位", "无定位"]);
     fireEvent.change(location, { target: { value: "yes" } });
@@ -1202,6 +1209,20 @@ describe("Phase 4 · 数值输入统一", () => {
       expect(fileExtLeaf).toMatchObject({ op: "leaf", cond: { type: "metadata", filter: { key: "file_ext", op: "in", values: ["jpg", "png"] } } });
     });
   });
+
+  // M-13：枚举多选 chip 在窄栏里会被 truncate，必须能 hover 看到全量值
+  it("enum_multi_select_chips_carry_full_label_via_title：多选 chip 提供 title 全量提示", async () => {
+    useMetadataStore.setState({
+      facets: [{ key: "file_ext", displayName: "文件格式", description: "", items: [{ value: "jpg", label: "JPG 图片", count: 3 }, { value: "png", label: "PNG 图片", count: 2 }] }],
+      loading: false,
+      loaded: true,
+    });
+    await openField("文件格式");
+    fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "in" } });
+    const jpg = screen.getByRole("checkbox", { name: /JPG 图片/ });
+    expect(jpg).toHaveAttribute("title", "JPG 图片");
+    expect(screen.getByRole("checkbox", { name: /PNG 图片/ })).toHaveAttribute("title", "PNG 图片");
+  });
 });
 
 // ═══════════════ Phase 3-6：行尾「⋯ 更多」菜单 —— 移到其他区 ═══════════════
@@ -1219,7 +1240,7 @@ describe("三区移动（MoveMenu）", () => {
       },
       expr: filter,
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
 
     // 第 0 行（未打标）→ ⋯ → 移到「排除」
     const moreButtons = screen.getAllByRole("button", { name: "更多操作" });
@@ -1236,7 +1257,7 @@ describe("三区移动（MoveMenu）", () => {
     });
   });
 
-  it("queryBuilder_move_should_to_must_not：优先区行 → 移到「排除」；should 收敛且 min 自动下降", () => {
+  it("queryBuilder_move_should_to_must_not：优先区行 → 移到「排除」；should 收敛且 min 自动下降", async () => {
     const cond: LeafCond = { type: "search", value: "蓝天" };
     useSuperSearchStore.setState({
       plan: {
@@ -1247,7 +1268,7 @@ describe("三区移动（MoveMenu）", () => {
         retrievers: { retrievers: [] }, ranking: { type: "field", key: "created_at", dir: "desc" },
       },
     });
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     const moreButtons = screen.getAllByRole("button", { name: "更多操作" });
     fireEvent.click(moreButtons[0]);
     fireEvent.click(screen.getByRole("button", { name: "移到排除" }));
@@ -1279,9 +1300,9 @@ describe("数值分面条件行（facetNumber）", () => {
     useNumericDomainStore.setState({ domains: [facetDomain], loading: false, loaded: true });
   }
 
-  it("queryBuilder_facet_number_field_in_dropdown：字段下拉出现「数值分面」组（动态 domain）", () => {
+  it("queryBuilder_facet_number_field_in_dropdown：字段下拉出现「数值分面」组（动态 domain）", async () => {
     setFacetDomain();
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     fireEvent.focus(screen.getAllByRole("combobox", { name: "条件字段" })[0]);
     expect(screen.getByRole("group", { name: "数值分面" })).toBeTruthy();
@@ -1290,7 +1311,7 @@ describe("数值分面条件行（facetNumber）", () => {
 
   it("queryBuilder_facet_number_row_writes_leaf：选「人数」→ 默认 ≥ 下限；改值为 5 → expr 生成 facetNumber 叶", async () => {
     setFacetDomain();
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("人数");
     // 默认 op = gte、默认值 = domain.min（0）→ 已是完整条件
@@ -1308,9 +1329,9 @@ describe("数值分面条件行（facetNumber）", () => {
     });
   });
 
-  it("queryBuilder_facet_number_between：切「介于」→ 两输入共用单位；倒置不进条件", () => {
+  it("queryBuilder_facet_number_between：切「介于」→ 两输入共用单位；倒置不进条件", async () => {
     setFacetDomain();
-    render(<QueryBuilder />);
+    await act(async () => { render(<QueryBuilder />); });
     clickMustFirstCondition();
     pickField("人数");
     const opSelect = screen.getAllByLabelText("条件操作符")[0] as HTMLSelectElement;

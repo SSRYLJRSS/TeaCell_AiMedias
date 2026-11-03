@@ -15,6 +15,9 @@ for (const [name, values] of Object.entries(source.enums)) {
   if (name === 'AgentErrorCode') {
     rust += `\nimpl AgentErrorCode {\n    pub const fn as_str(self) -> &'static str {\n        match self {\n${values.map(value => `            Self::${variant(value)} => ${JSON.stringify(value)},`).join('\n')}\n        }\n    }\n\n    pub const fn public_message(self) -> &'static str {\n        match self {\n${values.map(value => `            Self::${variant(value)} => ${JSON.stringify(source.errorMessages[value])},`).join('\n')}\n        }\n    }\n}\n`;
   }
+  if (name === 'CapabilityId') {
+    rust += `\nimpl CapabilityId {\n    pub const fn as_str(self) -> &'static str {\n        match self {\n${values.map(value => `            Self::${variant(value)} => ${JSON.stringify(value)},`).join('\n')}\n        }\n    }\n}\n`;
+  }
 }
 rust += `\npub const MAX_RESPONSE_BYTES: usize = ${source.maxResponseBytes};\npub const MAX_PAGE_ITEMS: usize = ${source.maxPageItems};\n`;
 rust += `pub const MAX_WORKFLOW_STEPS: usize = ${source.maxWorkflowSteps};\npub const MAX_WORKFLOW_PARAMETERS: usize = ${source.maxWorkflowParameters};\n`;

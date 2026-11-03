@@ -1,0 +1,2434 @@
+//! A4-05: whole-library migration and relocation.
+//!
+//! This is the *service* half of the migration engine; the durable journal lives
+//! in [`crate::db::library_migration`]. Two explicit commands are supported, as
+//! the card requires:
+//!
+//! - *migrate*: the software copies the managed library to a new root, verifies
+//!   every byte, then switches the locator in one short transaction.
+//! - *relocate*: the user already moved the root by hand; the software only
+//!   verifies identity and the manifest, then switches the locator. It never
+//!   copies, never re-imports, and never empties anything.
+//!
+//! Hard constraints (implementation contract §4.3, permissions §7.2):
+//!
+//! 1. The source stays authoritative until every item is verified. Nothing is
+//!    deleted from the source, and no item counts as copied without a digest
+//!    match.
+//! 2. Filesystem work happens outside the database lock; the locator switch is a
+//!    single short transaction. A transaction cannot roll back a filesystem, so
+//!    each durable step is journalled first and reconciled on restart.
+//! 3. The switch rotates `library_epoch`. That rotation is what invalidates every
+//!    plan, resource handle, remembered grant and collection reference made
+//!    against the old root — enforced by `trg_library_locator_requires_new_epoch`
+//!    and the epoch checks in `services/authorization.rs`, not by this module.
+//! 4. The manifest is the *tracked* set. Untracked files under the old root are
+//!    never copied and never deleted; they are reported so the user decides.
+//!
+//! Maintenance gate: switching while a conflicting task is mid-flight is refused
+//! up front, and the switch itself runs under the exclusive
+//! [`crate::state::Database::maintenance`] lease. The long copy phase holds no
+//! database lease at all, because the source is still authoritative there.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::contracts::agent::AgentErrorCode;
+use crate::db::{assets, libraries, library_migration};
+use crate::error::{AppError, AppErrorCode, AppResult};
+use crate::services::managed_library;
+use crate::state::{Database, DatabaseMaintenanceGuard};
+use crate::utils::hash::sha256_full;
+use crate::utils::path::{encode_native_path, normalize_path};
+
+/// Free space is checked with 5% headroom so a copy cannot fill the target disk.
+const SPACE_HEADROOM_NUMERATOR: u64 = 105;
+const SPACE_HEADROOM_DENOMINATOR: u64 = 100;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationWarning {
+    pub code: String,
+    pub message: String,
+}
+
+/// What the user is asked to confirm. Frozen here, re-read from the journal at
+/// switch time, so a confirmation can never apply to a different manifest.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationPreflight {
+    pub run_id: String,
+    pub kind: String,
+    pub library_id: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub total_items: u32,
+    pub total_bytes: u64,
+    pub target_free_bytes: Option<u64>,
+    pub notes: Vec<String>,
+    pub warnings: Vec<MigrationWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationItemView {
+    pub item_id: String,
+    pub relative_path: String,
+    pub byte_size: i64,
+    pub state: String,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationReport {
+    pub run_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub total_items: i64,
+    pub verified_items: i64,
+    pub failed_items: i64,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    /// Items that failed. Reported, never retried silently: the locator has not
+    /// moved when any of these exist.
+    pub failed: Vec<MigrationItemView>,
+    pub items: Vec<MigrationItemView>,
+}
+
+/// One manifest row: the tracked relative path, its recorded size, and the
+/// absolute paths this run touches.
+#[derive(Debug, Clone)]
+struct PlannedItem {
+    item_id: String,
+    relative_path: String,
+    expected_bytes: i64,
+    /// 登记时冻结的内容摘要。重新定位必须靠它证明「目标位置的这个文件就是原文件」，
+    /// 只比路径和大小会把同尺寸的陌生文件当成搬好的总仓接受。
+    expected_sha256: Option<String>,
+    source: PathBuf,
+    target: PathBuf,
+}
+
+/// 清单里一行：登记大小 + 登记时冻结的摘要。
+///
+/// 摘要缺失时不能退化成「只看大小」：那样重新定位会认领陌生目录。缺摘要的行
+/// 在核验阶段会明确失败并报告，由用户先在素材库里重新核验。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestEntry {
+    bytes: i64,
+    content_sha256: Option<String>,
+}
+
+/// Key under which a run's cancel flag is registered.
+///
+/// The preflight `run_id` is generated by the service layer, so a user who wants
+/// to change their mind before pressing "start" has no id to point at. Keying the
+/// flag by the (normalised) target root means the same token works for both
+/// preflight-then-cancel and cancel-while-running, without ever letting the
+/// frontend name a path that the service will then trust.
+pub fn cancel_key(target_root: &Path) -> String {
+    crate::utils::path::normalize_path(&target_root.to_string_lossy())
+}
+
+pub fn migration_item_id(relative_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"teacell-library-migration-item-v1\0");
+    hasher.update(relative_path.as_bytes());
+    let digest = hasher.finalize();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    format!("path_{:016x}", u64::from_be_bytes(prefix))
+}
+
+fn now_unix_ms() -> AppResult<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::internal(format!("系统时间异常：{error}")))?;
+    Ok(now.as_millis() as i64)
+}
+
+fn now_unix_seconds() -> AppResult<i64> {
+    Ok(now_unix_ms()? / 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance gate
+// ---------------------------------------------------------------------------
+
+/// Application-level "the library is in maintenance" flag.
+///
+/// It is deliberately *not* [`crate::state::Database::block_access`]: that flag
+/// stops reads too, and the card requires browsing and old conversations to keep
+/// working (showing a maintenance notice) while only writes stop. Every write
+/// entry point that can add or move managed files must consult this gate; the
+/// locator switch additionally takes the exclusive lifecycle lease, so the
+/// window that actually changes the root cannot race any `db.lock()` at all.
+#[derive(Debug, Default)]
+pub struct LibraryMaintenanceGate {
+    active: AtomicBool,
+    reason: Mutex<Option<String>>,
+    /// 当前租约的编号。0 表示无人持有。
+    ///
+    /// 只有编号匹配的租约才能释放维护状态：第二个请求拿不到租约就必须失败，
+    /// 它随后被丢弃（或提前 `drop`）时不能把真正的持有者的门关掉。
+    holder: Mutex<u64>,
+    next_token: AtomicU64,
+}
+
+impl LibraryMaintenanceGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        self.reason.lock().ok().and_then(|reason| reason.clone())
+    }
+
+    /// Mark the library as being maintained. The returned guard clears the flag
+    /// on drop, including on panic, so a failed migration cannot wedge the app.
+    ///
+    /// 排他：已有租约在持有时直接返回 [`AppErrorCode::Conflict`]，不覆盖理由、
+    /// 不改变状态。这与卡片「两个并发迁仓请求，第二个必须失败」一致——旧实现
+    /// 无条件置位并返回第二个租约，第二租约一 `drop` 就提前开门，写入口随之
+    /// 在真正的迁仓进行中重新放行。
+    pub fn enter(
+        self: &std::sync::Arc<Self>,
+        reason: impl Into<String>,
+    ) -> AppResult<MaintenanceLease> {
+        let token = {
+            let mut holder = self
+                .holder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *holder != 0 {
+                let detail = self
+                    .reason()
+                    .unwrap_or_else(|| "总仓维护进行中".to_string());
+                return Err(AppError::coded(
+                    AppErrorCode::Conflict,
+                    format!("总仓维护已由另一个任务持有，请等它结束或收尾后再试；{detail}"),
+                ));
+            }
+            let token = self.next_token.fetch_add(1, Ordering::AcqRel) + 1;
+            *holder = token;
+            token
+        };
+        if let Ok(mut slot) = self.reason.lock() {
+            *slot = Some(reason.into());
+        }
+        self.active.store(true, Ordering::Release);
+        Ok(MaintenanceLease {
+            gate: std::sync::Arc::clone(self),
+            token,
+        })
+    }
+
+    /// Reject a write that would conflict with an in-flight migration.
+    pub fn ensure_writable(&self, action: &str) -> AppResult<()> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        let detail = self
+            .reason()
+            .unwrap_or_else(|| "总仓维护进行中".to_string());
+        Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("总仓维护正在进行，暂时无法{action}；{detail}"),
+        ))
+    }
+}
+
+pub struct MaintenanceLease {
+    gate: std::sync::Arc<LibraryMaintenanceGate>,
+    token: u64,
+}
+
+impl Drop for MaintenanceLease {
+    fn drop(&mut self) {
+        // 只释放自己持有的那一个租约。旧实现无条件清位，第二个（失败的）租约
+        // 被丢弃时会把仍在进行中的迁仓的门提前关掉，写入口就此重新放行。
+        let owned = {
+            let mut holder = self
+                .gate
+                .holder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *holder == self.token {
+                *holder = 0;
+                true
+            } else {
+                false
+            }
+        };
+        if !owned {
+            return;
+        }
+        self.gate.active.store(false, Ordering::Release);
+        if let Ok(mut slot) = self.gate.reason.lock() {
+            *slot = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preflight
+// ---------------------------------------------------------------------------
+
+/// Check everything before a single byte moves, and produce the plan the user
+/// confirms.
+pub fn preflight_migration(
+    db: &Database,
+    target_root: &Path,
+    kind: &str,
+) -> AppResult<MigrationPreflight> {
+    if !matches!(
+        kind,
+        library_migration::KIND_MIGRATE | library_migration::KIND_RELOCATE
+    ) {
+        return Err(AppError::invalid_arg("未知的总仓迁移类型"));
+    }
+    let (library, manifest) = {
+        let conn = db.lock()?;
+        if let Some(active) = library_migration::active_run(&conn)? {
+            return Err(AppError::conflict(format!(
+                "上一次总仓迁移尚未结束（{}），请先完成或放弃它",
+                describe_phase(&active.phase),
+            )));
+        }
+        let library = libraries::current(&conn)?
+            .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?;
+        let manifest = tracked_manifest(&conn, &library)?;
+        (library, manifest)
+    };
+    // 重新定位的前提恰恰是「用户已把整个总仓手动搬到新位置」，因此旧根此刻
+    // 必然不可达，启动时它会落成 Offline（甚至若新位置还放着旧路径的同名标记
+    // 会判成 WrongRoot）。迁移（软件复制）必须旧仓 Ready 才能复制；重新定位的
+    // 信任根不来自旧仓健康状态，而来自下面在**目标根**上核验到的同一 library_id
+    // 标记与逐文件身份——所以只对非重新定位要求旧仓 Ready。
+    if kind != library_migration::KIND_RELOCATE && library.health != libraries::LibraryHealth::Ready
+    {
+        return Err(AppError::coded(
+            AppErrorCode::InvalidLibraryRoot,
+            "总仓尚未通过身份核验，无法迁移",
+        ));
+    }
+    if manifest.is_empty() {
+        return Err(AppError::conflict("当前总仓没有已登记素材，无需迁移"));
+    }
+    // 源根解析因迁移类型而异：
+    //  - KIND_MIGRATE：软件复制，必须能读到并核验旧总仓。
+    //  - KIND_RELOCATE：用户已把整个总仓手动搬到新位置，旧目录可能已经不存在；
+    //    此时绝不能再去读旧根（否则真实搬仓后被拒），只需记录旧的逻辑根做
+    //    防嵌套的纯词法校验，文件核验全部落在目标根上。
+    let source_root = if kind == library_migration::KIND_RELOCATE {
+        let stored = PathBuf::from(&library.root_path);
+        if !stored.is_absolute() {
+            return Err(AppError::coded(
+                AppErrorCode::InvalidLibraryRoot,
+                "总仓路径记录无效，无法重新定位",
+            ));
+        }
+        stored
+    } else {
+        managed_library::verified_root_path(&library)?
+    };
+    let requested = absolute_directory(target_root)?;
+    let target_canonical = prepare_target(&requested, kind)?;
+    reject_nesting(&source_root, &target_canonical)?;
+
+    let total_bytes: u64 = manifest
+        .values()
+        .map(|entry| u64::try_from(entry.bytes).unwrap_or(0))
+        .sum();
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+
+    match kind {
+        library_migration::KIND_RELOCATE => {
+            // 重新定位的信任根是「目标根带着我们自己的库身份标记」。这一步必须在
+            // 预检就做，而不是等复制/核验走完、要切根时才失败：用户确认之前就该
+            // 知道这个目录是不是自己搬走的原库，而不是白等一轮再被打回。
+            // `create_marker = false` —— 现场写标记等于把任意目录认领成原库。
+            managed_library::prepare_root_for_migration(&library, &target_canonical, false)
+                .map_err(|error| {
+                    AppError::coded(AppErrorCode::Conflict, format!("无法重新定位：{error}"))
+                })?;
+            let missing = manifest
+                .iter()
+                .filter(|(relative, entry)| {
+                    target_complete(&target_canonical, relative, entry).is_none()
+                })
+                .count();
+            if missing > 0 {
+                return Err(AppError::coded(
+                    AppErrorCode::Conflict,
+                    format!(
+                        "无法重新定位：目标目录缺少、大小或内容与登记不符的已登记文件有 {missing} 个。\
+                         重新定位只核对您已经搬过去的总仓，不会复制或重新导入；请先把总仓完整搬过去。"
+                    ),
+                ));
+            }
+            notes.push(
+                "重新定位不复制文件、不清空重导，素材 ID、标签、评分与历史关联保持不变。"
+                    .to_string(),
+            );
+        }
+        _ => {
+            notes.push("目标目录中与已登记文件内容完全相同的位置会跳过复制；内容不同的同名文件会中止该项。".to_string());
+            notes.push("未登记的其他文件不会被读取、复制或删除。".to_string());
+        }
+    }
+    notes.push("源目录在核验通过后仍然完整保留；本流程不会删除搬运来源。".to_string());
+
+    let free = available_bytes(&target_canonical);
+    if let Some(free) = free {
+        let required = mul_headroom(total_bytes);
+        if free < required {
+            return Err(AppError::coded(
+                AppErrorCode::Conflict,
+                format!(
+                    "目标盘剩余空间不足：需要约 {}，当前可用 {}",
+                    format_bytes(required),
+                    format_bytes(free)
+                ),
+            ));
+        }
+    } else {
+        warnings.push(MigrationWarning {
+            code: library_migration::CODE_INSUFFICIENT_SPACE.to_string(),
+            message: "无法读取目标盘剩余空间，请在确认前自行核对容量".to_string(),
+        });
+    }
+    if kind == library_migration::KIND_MIGRATE && !is_directory_empty(&target_canonical) {
+        notes.push("目标目录并非空目录；本流程只写已登记素材的相对路径。".to_string());
+    }
+
+    Ok(MigrationPreflight {
+        run_id: format!("mig_{}", Uuid::new_v4().simple()),
+        kind: kind.to_string(),
+        library_id: library.library_id.clone(),
+        source_root: encode_native_path(&source_root)?,
+        target_root: encode_native_path(&target_canonical)?,
+        total_items: manifest.len() as u32,
+        total_bytes,
+        target_free_bytes: free,
+        notes,
+        warnings,
+    })
+}
+
+fn describe_phase(phase: &str) -> &'static str {
+    match phase {
+        library_migration::PHASE_PREPARING => "准备中",
+        library_migration::PHASE_COPYING => "复制校验中",
+        library_migration::PHASE_SWITCHED => "已切换位置、收尾未完成",
+        library_migration::PHASE_CLEANING => "收尾中",
+        _ => "未结束",
+    }
+}
+
+fn absolute_directory(path: &Path) -> AppResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(AppError::invalid_arg("总仓位置必须是绝对路径"));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Prepare the target directory, rejecting links and non-directories.
+///
+/// Migration may create the target (the software is about to fill it);
+/// relocation must not, because creating a fresh empty directory and then
+/// "verifying" it is exactly the半迁移 the PRD forbids.
+fn prepare_target(requested: &Path, kind: &str) -> AppResult<PathBuf> {
+    if kind == library_migration::KIND_MIGRATE {
+        match fs::symlink_metadata(requested) {
+            Ok(metadata) if is_link(&metadata) || !metadata.is_dir() => {
+                return Err(AppError::conflict("目标位置不能是链接，且必须是目录"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(requested).map_err(|error| {
+                    AppError::coded(AppErrorCode::Conflict, format!("无法创建目标目录：{error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(AppError::coded(
+                    AppErrorCode::Conflict,
+                    format!("目标目录不可访问：{error}"),
+                ))
+            }
+        }
+    } else {
+        let metadata = fs::symlink_metadata(requested).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AppError::conflict("目标目录不存在；重新定位要求您先把整个总仓搬过去")
+            } else {
+                AppError::coded(AppErrorCode::Conflict, format!("目标目录不可访问：{error}"))
+            }
+        })?;
+        if is_link(&metadata) {
+            return Err(AppError::conflict("目标目录不能是链接或重解析点"));
+        }
+        if !metadata.is_dir() {
+            return Err(AppError::invalid_arg("目标位置必须是目录"));
+        }
+    }
+    requested.canonicalize().map_err(|error| {
+        AppError::coded(AppErrorCode::Conflict, format!("目标目录不可访问：{error}"))
+    })
+}
+
+/// A target nested inside the source (or the source inside the target) would
+/// copy the growing tree into itself. Reject both directions.
+fn reject_nesting(source: &Path, target: &Path) -> AppResult<()> {
+    let source_norm = normalize_path(&encode_native_path(source)?);
+    let target_norm = normalize_path(&encode_native_path(target)?);
+    if source_norm == target_norm {
+        return Err(AppError::conflict("目标目录就是当前总仓，无需迁移"));
+    }
+    if is_inside(&target_norm, &source_norm) || is_inside(&source_norm, &target_norm) {
+        return Err(AppError::conflict(
+            "目标目录与当前总仓互相嵌套：无法安全迁移，请换一个独立的目录",
+        ));
+    }
+    Ok(())
+}
+
+/// Lexical containment for already-normalized paths.
+///
+/// A filesystem root has no trailing segment to test against, so the "rest
+/// starts with `/`" check alone would report every real directory as outside
+/// it — and a root genuinely does contain the library.
+fn is_inside(candidate: &str, parent: &str) -> bool {
+    if candidate == parent {
+        return false;
+    }
+    match candidate.strip_prefix(parent) {
+        Some(rest) => rest.starts_with('/') || parent.ends_with('/'),
+        None => false,
+    }
+}
+
+fn is_directory_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true)
+}
+
+/// The frozen manifest: every tracked relative path with its recorded size.
+///
+/// Only rows the library actually tracks are included. Files that happen to sit
+/// in the old root but were never registered are not assets, so they are neither
+/// copied nor removed — the contract forbids promoting or deleting them.
+///
+/// 回收站素材（`deleted_at IS NOT NULL`）**必须纳入**：它们的物理文件仍在总仓里，
+/// 只是被软删除标记。若排除，切代后这些行仍指向旧路径/旧世代，回收站查询会过滤掉
+/// 它们而无法恢复。迁移只搬文件、不改变 deleted 标志。
+fn tracked_manifest(
+    conn: &rusqlite::Connection,
+    library: &libraries::LibrarySnapshot,
+) -> AppResult<BTreeMap<String, ManifestEntry>> {
+    let mut statement = conn.prepare(
+        "SELECT ml.relative_path, a.file_size, ml.content_sha256
+           FROM managed_asset_locations ml
+           JOIN assets a ON a.id = ml.asset_id
+          WHERE ml.library_id = ?1
+            AND coalesce(length(ml.relative_path),0) > 0
+          ORDER BY ml.relative_path",
+    )?;
+    let rows = statement.query_map([&library.library_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut manifest = BTreeMap::new();
+    for row in rows {
+        let (relative, bytes, content_sha256) = row?;
+        manifest.entry(relative).or_insert(ManifestEntry {
+            bytes,
+            content_sha256,
+        });
+    }
+    Ok(manifest)
+}
+
+/// `Some(())` when the target already holds this manifest entry with the
+/// recorded size **and** the frozen digest.
+///
+/// 只比尺寸不够：同路径同尺寸但内容不同，正是「把一个陌生目录当成自己搬走的
+/// 总仓」的入口。摘要缺失时直接判不合格，让调用方明确报告而不是默默放行。
+fn target_complete(root: &Path, relative: &str, entry: &ManifestEntry) -> Option<()> {
+    let path = join_relative(root, relative);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return None;
+    }
+    if metadata.len() != u64::try_from(entry.bytes).ok()? {
+        return None;
+    }
+    let expected = entry.content_sha256.as_deref()?;
+    let opened = File::open(&path).ok()?;
+    let actual = sha256_file(&opened).ok()?;
+    if actual != expected {
+        return None;
+    }
+    Some(())
+}
+
+/// 摘要一个已打开的文件，不重新解析路径：预检与核验之间文件可能被替换，
+/// 必须对「正在读的这个句柄」算摘要才算数。
+fn sha256_file(file: &File) -> AppResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut handle = file.try_clone()?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        let read = handle.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn join_relative(root: &Path, relative: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for part in relative.split('/') {
+        if !part.is_empty() {
+            path.push(part);
+        }
+    }
+    path
+}
+
+fn mul_headroom(bytes: u64) -> u64 {
+    bytes
+        .saturating_mul(SPACE_HEADROOM_NUMERATOR)
+        .saturating_div(SPACE_HEADROOM_DENOMINATOR)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(windows)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call and
+    // the three out-pointers are valid for its duration.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(free)
+    }
+}
+
+#[cfg(not(windows))]
+fn available_bytes(path: &Path) -> Option<u64> {
+    // No portable std API for free space and this repository does not vendor a
+    // filesystem-statistics crate. Report "unknown" rather than pretend the
+    // check passed; the caller surfaces it as a warning the user must accept.
+    let _ = path;
+    None
+}
+
+fn is_link(metadata: &fs::Metadata) -> bool {
+    crate::utils::path::is_link_or_reparse(metadata)
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+/// Run a confirmed migration to completion.
+///
+/// Phase ladder (journalled, see [`crate::db::library_migration`]):
+/// `preparing` (manifest frozen) → `copying` (per-item copy + verify) →
+/// `switched` (locator and epoch) → `cleaning` → `completed`.
+pub fn run_migration(
+    db: &Database,
+    gate: &std::sync::Arc<LibraryMaintenanceGate>,
+    preflight: &MigrationPreflight,
+    cancelled: &AtomicBool,
+) -> AppResult<MigrationReport> {
+    let lease = gate.enter(format!(
+        "正在{}总仓到 {}",
+        if preflight.kind == library_migration::KIND_RELOCATE {
+            "重新定位"
+        } else {
+            "迁移"
+        },
+        preflight.target_root
+    ))?;
+    let result = run_migration_inner(db, preflight, cancelled);
+    drop(lease);
+    result
+}
+
+fn run_migration_inner(
+    db: &Database,
+    preflight: &MigrationPreflight,
+    cancelled: &AtomicBool,
+) -> AppResult<MigrationReport> {
+    let source_root = native(&preflight.source_root)?;
+    let target_root = native(&preflight.target_root)?;
+    let planned = plan_manifest(db, &source_root, &target_root, &preflight.kind)?;
+
+    // --- Phase 1: freeze the manifest in the journal ----------------------
+    {
+        let conn = db.lock()?;
+        let library = libraries::current(&conn)?
+            .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?;
+        if library.library_id != preflight.library_id {
+            return Err(AppError::from(AgentErrorCode::LibraryChanged));
+        }
+        if let Some(active) = library_migration::active_run(&conn)? {
+            return Err(AppError::conflict(format!(
+                "已有一个未结束的总仓迁移（{}）",
+                describe_phase(&active.phase)
+            )));
+        }
+        let now = now_unix_seconds()?;
+        library_migration::open_run(
+            &conn,
+            &preflight.run_id,
+            &preflight.library_id,
+            &library.library_epoch,
+            &preflight.source_root,
+            &preflight.target_root,
+            &preflight.kind,
+            now,
+        )?;
+        let rows: Vec<(String, String, i64)> = planned
+            .iter()
+            .map(|item| {
+                (
+                    item.item_id.clone(),
+                    item.relative_path.clone(),
+                    item.expected_bytes,
+                )
+            })
+            .collect();
+        library_migration::seed_items(&conn, &preflight.run_id, &rows, now)?;
+        library_migration::advance_phase(
+            &conn,
+            &preflight.run_id,
+            library_migration::PHASE_PREPARING,
+            library_migration::PHASE_COPYING,
+            now,
+        )?;
+    }
+
+    // --- Phase 2: copy (or verify in place) every manifest item -----------
+    let migrate = preflight.kind != library_migration::KIND_RELOCATE;
+    for item in &planned {
+        if cancelled.load(Ordering::Acquire) {
+            // The guard must be dropped before `report` re-locks: `Database::lock`
+            // is a non-reentrant mutex, so holding it across the second lock
+            // deadlocks the run.
+            {
+                let conn = db.lock()?;
+                library_migration::finish(
+                    &conn,
+                    &preflight.run_id,
+                    library_migration::PHASE_ABORTED,
+                    now_unix_seconds()?,
+                )?;
+            }
+            return report(db, &preflight.run_id);
+        }
+        let outcome = if migrate {
+            copy_and_digest(item)
+        } else {
+            verify_in_place(item)
+        };
+        let conn = db.lock()?;
+        let now = now_unix_seconds()?;
+        match outcome {
+            Ok(digest) => {
+                library_migration::record_copied(&conn, &preflight.run_id, &item.item_id, now)?;
+                library_migration::record_verified(
+                    &conn,
+                    &preflight.run_id,
+                    &item.item_id,
+                    &digest,
+                    now,
+                )?;
+                library_migration::refresh_counts(&conn, &preflight.run_id, now)?;
+            }
+            Err(error) => {
+                // A single unreadable file must not abort the run: the user gets
+                // a per-file report and the locator stays on the source.
+                library_migration::record_item_failure(
+                    &conn,
+                    &preflight.run_id,
+                    &item.item_id,
+                    classify_failure(&error),
+                    now,
+                )?;
+            }
+        }
+    }
+
+    // A locator switch with unverified items would strand the database pointing
+    // at files that were never proven present.
+    let unverified = {
+        let conn = db.lock()?;
+        let failed = library_migration::items(&conn, &preflight.run_id)?
+            .into_iter()
+            .filter(|item| item.state != library_migration::ITEM_VERIFIED)
+            .count();
+        if failed > 0 {
+            library_migration::record_failure(
+                &conn,
+                &preflight.run_id,
+                library_migration::CODE_CHECKSUM_MISMATCH,
+                &format!("有 {failed} 个文件未能通过核验，总仓位置未切换；源目录仍完整可用"),
+                now_unix_seconds()?,
+            )?;
+        }
+        failed
+    };
+    if unverified > 0 {
+        return report(db, &preflight.run_id);
+    }
+
+    // --- Phase 2.75: the target must carry OUR marker before any switch ---
+    //
+    // 迁移（软件复制）是唯一会“创造”新总仓目录的路径，因此标记必须由这里显式
+    // 写下；重新定位则必须已经带着同一个标记。写标记与切定位分开做，是因为
+    // `switch_locator` 里的那一次 `prepare_root_for_migration` 现在只做**核验**
+    // （`create_marker = false`），不再“顺手认领一个空目录”——否则随便一个空
+    // 文件夹都能被认成搬走的原库。
+    ensure_target_marker(&preflight.library_id, &target_root, &preflight.kind)?;
+
+    // --- Phase 3: switch the locator in one short transaction -------------
+    //
+    // The frozen manifest is re-read here and compared with the journal. The
+    // maintenance gate is advisory (it only covers entry points we remembered to
+    // wire), so this is the real guarantee: if anything registered a new managed
+    // file during the copy, its bytes are still only in the source root and
+    // switching now would leave that asset pointing at a missing file. Refusing
+    // is the only honest outcome.
+    {
+        let conn = db.lock()?;
+        let library = libraries::current(&conn)?
+            .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?;
+        let frozen = library_migration::items(&conn, &preflight.run_id)?
+            .into_iter()
+            .map(|item| item.relative_path)
+            .collect::<std::collections::BTreeSet<_>>();
+        let current = tracked_manifest(&conn, &library)?
+            .into_keys()
+            .collect::<std::collections::BTreeSet<_>>();
+        if frozen != current {
+            let added = current.difference(&frozen).count();
+            let removed = frozen.difference(&current).count();
+            library_migration::record_failure(
+                &conn,
+                &preflight.run_id,
+                library_migration::CODE_LIBRARY_CHANGED,
+                &format!(
+                    "复制期间总仓清单发生变化（新增 {added} 个、减少 {removed} 个已登记文件），\
+                     总仓位置未切换；请结束正在进行的入库或删除后重试"
+                ),
+                now_unix_seconds()?,
+            )?;
+            return report(db, &preflight.run_id);
+        }
+    }
+    let switched = switch_locator(db, &preflight.run_id, &target_root)?;
+
+    // --- Phase 4: rebuild projections, then close the run -----------------
+    {
+        let conn = db.lock()?;
+        library_migration::advance_phase(
+            &conn,
+            &preflight.run_id,
+            library_migration::PHASE_SWITCHED,
+            library_migration::PHASE_CLEANING,
+            now_unix_seconds()?,
+        )?;
+    }
+    rebuild_projections(db, &switched)?;
+    {
+        let conn = db.lock()?;
+        library_migration::finish(
+            &conn,
+            &preflight.run_id,
+            library_migration::PHASE_COMPLETED,
+            now_unix_seconds()?,
+        )?;
+    }
+    report(db, &preflight.run_id)
+}
+
+/// Bind the frozen manifest to concrete source and target paths.
+///
+/// The authoritative paths come from the locator re-read here, never from the
+/// caller's strings, so a stale preflight cannot point the run at another root.
+fn plan_manifest(
+    db: &Database,
+    source_root: &Path,
+    target_root: &Path,
+    kind: &str,
+) -> AppResult<Vec<PlannedItem>> {
+    let (library, manifest) = {
+        let conn = db.lock()?;
+        let library = libraries::current(&conn)?
+            .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?;
+        let manifest = tracked_manifest(&conn, &library)?;
+        (library, manifest)
+    };
+    // 重新定位时旧总仓可能已被用户真实搬走（目录已不存在），此时不核验旧根，
+    // 直接沿用记录的旧逻辑根拼接源路径；该路径仅用于日志/防误判，实际核验全部
+    // 落在目标根（verify_in_place 只读 item.target）。迁移则必须核验旧根。
+    let authoritative_source = if kind == library_migration::KIND_RELOCATE {
+        PathBuf::from(&library.root_path)
+    } else {
+        managed_library::verified_root_path(&library)?
+    };
+    if normalize_path(&encode_native_path(&authoritative_source)?)
+        != normalize_path(&encode_native_path(source_root)?)
+    {
+        return Err(AppError::from(AgentErrorCode::LibraryChanged));
+    }
+    if manifest.is_empty() {
+        return Err(AppError::conflict("当前总仓没有已登记素材，无需迁移"));
+    }
+    Ok(manifest
+        .into_iter()
+        .map(|(relative, entry)| PlannedItem {
+            item_id: migration_item_id(&relative),
+            source: join_relative(&authoritative_source, &relative),
+            target: join_relative(target_root, &relative),
+            relative_path: relative,
+            expected_bytes: entry.bytes,
+            expected_sha256: entry.content_sha256,
+        })
+        .collect())
+}
+
+/// Copy one file and prove it with a digest comparison.
+///
+/// The copy is written under a temporary name in the same directory and renamed
+/// into place only after the digest matches, so an interrupted copy never leaves
+/// a plausible-looking half file at the final path.
+fn copy_and_digest(item: &PlannedItem) -> AppResult<String> {
+    let source_metadata = fs::symlink_metadata(&item.source).map_err(|error| {
+        AppError::coded(
+            AppErrorCode::Conflict,
+            format!("源文件不可读 {}：{error}", item.relative_path),
+        )
+    })?;
+    if is_link(&source_metadata) || !source_metadata.is_file() {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("源位置已不是普通文件：{}", item.relative_path),
+        ));
+    }
+    if source_metadata.len() != u64::try_from(item.expected_bytes).unwrap_or(u64::MAX) {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("源文件大小与登记不一致：{}", item.relative_path),
+        ));
+    }
+    if let Some(parent) = item.target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::coded(
+                AppErrorCode::Conflict,
+                format!(
+                    "无法创建目标目录 {}：{error}",
+                    items_display(&item.relative_path)
+                ),
+            )
+        })?;
+    }
+    // A previous interrupted run may already have copied these very bytes.
+    if let Ok(metadata) = fs::symlink_metadata(&item.target) {
+        if metadata.is_file() && !is_link(&metadata) {
+            let source_digest = sha256_full(&item.source)?;
+            let target_digest = sha256_full(&item.target)?;
+            if source_digest == target_digest {
+                return Ok(target_digest);
+            }
+            return Err(AppError::coded(
+                AppErrorCode::Conflict,
+                format!("目标位置已存在内容不同的同名文件：{}", item.relative_path),
+            ));
+        }
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("目标位置已被非普通文件占用：{}", item.relative_path),
+        ));
+    }
+    let temporary = item
+        .target
+        .with_extension(format!("partial-{}", Uuid::new_v4().simple()));
+    let result = (|| -> AppResult<String> {
+        {
+            let mut source = File::open(&item.source)?;
+            let mut target = File::create(&temporary)?;
+            std::io::copy(&mut source, &mut target)?;
+            target.sync_all()?;
+        }
+        let source_digest = sha256_full(&item.source)?;
+        let target_digest = sha256_full(&temporary)?;
+        if source_digest != target_digest {
+            return Err(AppError::coded(
+                AppErrorCode::Conflict,
+                format!("复制校验不一致：{}", item.relative_path),
+            ));
+        }
+        // 复制前后都要对得上冻结摘要：只在两侧互相比对，等于承认「复制时刻读到的
+        // 内容」就是真身。若清单冻结之后源文件被同尺寸内容替换，这里必须失败，
+        // 否则新代次的证据会绑到一个从未被用户核验过的文件上。
+        require_frozen_digest(item, &source_digest)?;
+        fs::rename(&temporary, &item.target)?;
+        Ok(target_digest)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// 把实测摘要与清单里冻结的摘要对齐；冻结值缺失同样视为不通过。
+fn require_frozen_digest(item: &PlannedItem, actual: &str) -> AppResult<()> {
+    let Some(expected) = item.expected_sha256.as_deref() else {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!(
+                "{} 缺少登记时冻结的内容摘要，无法证明它就是原文件；请先在素材库中重新核验",
+                item.relative_path
+            ),
+        ));
+    };
+    if expected != actual {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("{} 的内容与登记摘要不一致", item.relative_path),
+        ));
+    }
+    Ok(())
+}
+
+fn items_display(relative: &str) -> String {
+    relative.rsplit('/').next().unwrap_or(relative).to_string()
+}
+
+/// Relocation: prove the already-moved file is the very file the library
+/// registered — same relative path, regular file, same size, **and the frozen
+/// digest** — before binding its digest to the new generation.
+///
+/// 只核尺寸会把「用户随手新建的同名同尺寸文件」当成搬好的原库，切根后整个
+/// 素材库的证据就绑在了陌生内容上。冻结摘要缺失时同样不接受：证明不了归属
+/// 就不能切换代次。
+fn verify_in_place(item: &PlannedItem) -> AppResult<String> {
+    let metadata = fs::symlink_metadata(&item.target).map_err(|error| {
+        AppError::coded(
+            AppErrorCode::Conflict,
+            format!("目标缺少已登记文件 {}：{error}", item.relative_path),
+        )
+    })?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("目标位置不是普通文件：{}", item.relative_path),
+        ));
+    }
+    if metadata.len() != u64::try_from(item.expected_bytes).unwrap_or(u64::MAX) {
+        return Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("目标文件大小与登记不一致：{}", item.relative_path),
+        ));
+    }
+    let digest = sha256_full(&item.target)?;
+    require_frozen_digest(item, &digest)?;
+    Ok(digest)
+}
+
+fn classify_failure(error: &AppError) -> &'static str {
+    match error.code() {
+        "INVALID_ARG" => library_migration::CODE_SOURCE_MISSING,
+        "IO" => library_migration::CODE_IO_ERROR,
+        _ => library_migration::CODE_CHECKSUM_MISMATCH,
+    }
+}
+
+/// Give the target root our identity marker, or prove it already has it.
+///
+/// 迁移：目标是我们复制出来的新总仓，标记只能由这里写（`create_new`，绝不覆盖
+/// 已有标记；`AlreadyExists` 说明别人抢了位置，退回核验）。
+/// 重新定位：目标必须是用户搬过去的**原库**，因此标记必须已经存在且内容一致；
+/// 缺失就拒绝——这正是「拒绝把任意空文件夹当原库」的实现点。
+fn ensure_target_marker(library_id: &str, target_root: &Path, kind: &str) -> AppResult<()> {
+    use std::io::Write;
+    let marker = target_root.join(managed_library::ROOT_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if is_link(&metadata) || !metadata.is_file() || metadata.len() > 128 {
+                return Err(AppError::conflict(
+                    "目标目录的总仓身份标记不是普通文件，已拒绝切换位置",
+                ));
+            }
+            let existing = fs::read_to_string(&marker).map_err(|error| {
+                AppError::coded(
+                    AppErrorCode::Conflict,
+                    format!("无法读取目标目录的总仓身份标记：{error}"),
+                )
+            })?;
+            if existing != library_id {
+                return Err(AppError::conflict(
+                    "目标目录已有其他茶馆总仓标记，不能覆盖；请换一个独立目录",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if kind == library_migration::KIND_RELOCATE {
+                return Err(AppError::conflict(
+                    "目标目录不是当前茶馆总仓：缺少库身份标记，无法把它识别为您搬走的原库；\
+                     重新定位不会在现场写入标记",
+                ));
+            }
+            let mut file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return ensure_target_marker(library_id, target_root, kind);
+                }
+                Err(error) => {
+                    return Err(AppError::coded(
+                        AppErrorCode::Conflict,
+                        format!("无法在目标目录写入总仓身份标记：{error}"),
+                    ));
+                }
+            };
+            file.write_all(library_id.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) => Err(AppError::coded(
+            AppErrorCode::Conflict,
+            format!("无法核验目标目录的总仓身份标记：{error}"),
+        )),
+    }
+}
+
+/// The single short transaction that makes the target the current generation.
+///
+/// `mark_root_ready` rotates `library_epoch` because path and identity change;
+/// the trigger `trg_library_locator_requires_new_epoch` refuses anything else.
+/// Every plan, handle, remembered grant and collection reference is bound to the
+/// old epoch, so they all stop resolving here — no separate cleanup pass.
+fn switch_locator(
+    db: &Database,
+    run_id: &str,
+    target_root: &Path,
+) -> AppResult<libraries::LibrarySnapshot> {
+    // The exclusive lifecycle lease is held only for the switch itself: it is
+    // what makes "no write can observe the locator half-updated" true, and it
+    // keeps the connection mutex free during all the copying above.
+    let maintenance: DatabaseMaintenanceGuard = db.maintenance()?;
+    maintenance.with_connection(|conn| {
+        let library = libraries::current(conn)?
+            .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?;
+        let run = library_migration::run(conn, run_id)?
+            .ok_or_else(|| AppError::not_found("总仓迁移日志不存在"))?;
+        if run.phase != library_migration::PHASE_COPYING {
+            return Err(AppError::conflict("总仓迁移阶段已变化，未切换位置"));
+        }
+        if run.source_epoch != library.library_epoch {
+            return Err(AppError::from(AgentErrorCode::LibraryChanged));
+        }
+        // `create_marker = false`: the marker is written or verified explicitly
+        // in `ensure_target_marker` before we get here. This call only re-checks
+        // identity — it must never mint a marker for a directory we were handed,
+        // otherwise any empty folder could be adopted as "the library you moved".
+        let prepared = managed_library::prepare_root_for_migration(&library, target_root, false)?;
+        let transaction = conn.unchecked_transaction()?;
+        let switched = libraries::mark_root_ready(
+            &transaction,
+            &library,
+            &prepared.canonical_root,
+            &prepared.root_identity,
+        )?;
+        library_migration::record_switch(
+            &transaction,
+            run_id,
+            &switched.library_epoch,
+            now_unix_seconds()?,
+        )?;
+        transaction.commit()?;
+        Ok(switched)
+    })
+}
+
+/// Rewrite every tracked asset to the new root and re-note its evidence.
+///
+/// This is a projection rebuild, not a re-import: the relative paths are
+/// unchanged, so asset ids, tags, ratings, operation references and conversation
+/// links are all preserved. What changes is the absolute `file_path` and the
+/// verification evidence bound to the new epoch.
+fn rebuild_projections(db: &Database, library: &libraries::LibrarySnapshot) -> AppResult<()> {
+    // 回归防护：重新定位的旧根已不存在（用户手动搬走），切换后快照可能仍是
+    // Offline。绝不能再在这里要求 Ready，否则真实搬仓会在切换后被卡住。
+    // 标记核对已由 switch_locator 用同一 library_id 完成，本函数只按新根重建。
+    let root = managed_library::verified_root_path(library)?;
+    // 重建定位同样必须覆盖回收站素材：它们被迁移清单搬到了新总仓，
+    // 若不重建，其 file_path 仍指旧路径/旧世代，回收站无法恢复。
+    let rows: Vec<(i64, String, String)> = {
+        let conn = db.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT a.id, a.file_name, ml.relative_path
+               FROM assets a
+               JOIN managed_asset_locations ml ON ml.asset_id = a.id
+              WHERE ml.library_id = ?1
+                AND coalesce(length(ml.relative_path),0) > 0
+              ORDER BY a.id",
+        )?;
+        let rows = statement.query_map([&library.library_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut rows_out = Vec::new();
+        for row in rows {
+            rows_out.push(row?);
+        }
+        rows_out
+    };
+    for (asset_id, file_name, relative) in rows {
+        let path = join_relative(&root, &relative);
+        // Evidence hashing happens outside the database lock (rule: no big file
+        // IO inside it). A file that is gone simply stays unverified; it is not
+        // silently re-linked.
+        let evidence = match managed_library::prepare_import_evidence(library, &path, "") {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::warn!(
+                    asset_id,
+                    relative = %relative,
+                    "迁仓后重建素材定位失败: {error}"
+                );
+                continue;
+            }
+        };
+        let modified_at = modified_at_ms(&path)?;
+        let file_path = normalize_path(&encode_native_path(&path)?);
+        let conn = db.lock()?;
+        let transaction = conn.unchecked_transaction()?;
+        assets::update_file_location(&transaction, asset_id, &file_path, &file_name, modified_at)?;
+        let candidate = libraries::verification_candidate(&transaction, asset_id)?
+            .ok_or_else(|| AppError::not_found("素材记录已不在素材库中"))?;
+        let recorded = libraries::record_verified(
+            &transaction,
+            library,
+            &candidate,
+            &evidence.relative_path,
+            &evidence.file_identity,
+            &evidence.content_sha256,
+            &evidence.ownership_receipt,
+        )?;
+        if !recorded {
+            return Err(AppError::conflict(format!(
+                "素材 {asset_id} 的定位在迁仓收尾期间发生变化，请重启应用后重新核验"
+            )));
+        }
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn modified_at_ms(path: &Path) -> AppResult<i64> {
+    let modified = fs::metadata(path)?.modified()?;
+    let value = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::internal(format!("文件时间异常：{error}")))?;
+    Ok(value.as_millis() as i64)
+}
+
+/// Inspect an interrupted run and move it as far forward as the filesystem
+/// proves it already got. Never deletes anything, never re-copies verified items.
+pub fn reconcile_interrupted_migration(db: &Database) -> AppResult<Vec<String>> {
+    let active = {
+        let conn = db.lock()?;
+        library_migration::active_run(&conn)?
+    };
+    let Some(run) = active else {
+        return Ok(Vec::new());
+    };
+    match run.phase.as_str() {
+        library_migration::PHASE_PREPARING => {
+            // Nothing was copied: the source is untouched and still current.
+            {
+                let conn = db.lock()?;
+                library_migration::finish(
+                    &conn,
+                    &run.run_id,
+                    library_migration::PHASE_ABORTED,
+                    now_unix_seconds()?,
+                )?;
+            }
+            Ok(vec![run.run_id])
+        }
+        library_migration::PHASE_COPYING => {
+            // The locator never switched, so the source is still authoritative.
+            // Report the run as failed; copied files stay in the target and a
+            // retry reuses them because the digest already matches.
+            {
+                let conn = db.lock()?;
+                library_migration::record_failure(
+                    &conn,
+                    &run.run_id,
+                    library_migration::CODE_INTERRUPTED,
+                    "复制阶段被中断，总仓位置未切换；已复制的文件会在重试时复用",
+                    now_unix_seconds()?,
+                )?;
+            }
+            Ok(vec![run.run_id])
+        }
+        library_migration::PHASE_SWITCHED | library_migration::PHASE_CLEANING => {
+            // The locator already switched; from the library's point of view the
+            // move happened. Finish the projection rebuild and close the run.
+            let library = {
+                let conn = db.lock()?;
+                libraries::current(&conn)?
+                    .ok_or_else(|| AppError::from(AgentErrorCode::LibraryChanged))?
+            };
+            rebuild_projections(db, &library)?;
+            {
+                let conn = db.lock()?;
+                library_migration::finish(
+                    &conn,
+                    &run.run_id,
+                    library_migration::PHASE_COMPLETED,
+                    now_unix_seconds()?,
+                )?;
+            }
+            Ok(vec![run.run_id])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub fn migration_report(db: &Database, run_id: &str) -> AppResult<MigrationReport> {
+    report(db, run_id)
+}
+
+/// The open run, if any, so the UI can show "已切换、收尾未完成" as a resumable
+/// state instead of a generic failure.
+pub fn active_migration(db: &Database) -> AppResult<Option<MigrationReport>> {
+    let run_id = {
+        let conn = db.lock()?;
+        library_migration::active_run(&conn)?.map(|run| run.run_id)
+    };
+    match run_id {
+        Some(run_id) => Ok(Some(report(db, &run_id)?)),
+        None => Ok(None),
+    }
+}
+
+fn report(db: &Database, run_id: &str) -> AppResult<MigrationReport> {
+    let conn = db.lock()?;
+    let run = library_migration::run(&conn, run_id)?
+        .ok_or_else(|| AppError::not_found("总仓迁移日志不存在"))?;
+    let items = library_migration::items(&conn, run_id)?;
+    let views: Vec<MigrationItemView> = items.iter().map(item_view).collect();
+    let failed = views
+        .iter()
+        .filter(|item| item.state == library_migration::ITEM_FAILED)
+        .cloned()
+        .collect();
+    Ok(MigrationReport {
+        run_id: run.run_id,
+        kind: run.kind,
+        phase: run.phase,
+        source_root: run.source_root,
+        target_root: run.target_root,
+        total_items: run.total_items,
+        verified_items: items
+            .iter()
+            .filter(|item| item.state == library_migration::ITEM_VERIFIED)
+            .count() as i64,
+        failed_items: run.failed_items,
+        error_code: run.error_code,
+        error_message: run.error_message,
+        failed,
+        items: views,
+    })
+}
+
+fn item_view(item: &library_migration::MigrationItem) -> MigrationItemView {
+    MigrationItemView {
+        item_id: item.item_id.clone(),
+        relative_path: item.relative_path.clone(),
+        byte_size: item.byte_size,
+        state: item.state.clone(),
+        error_code: item.error_code.clone(),
+    }
+}
+
+/// Stored paths use forward slashes; the filesystem needs native form.
+fn native(stored: &str) -> AppResult<PathBuf> {
+    Ok(PathBuf::from(
+        stored.replace('/', std::path::MAIN_SEPARATOR_STR),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_memory;
+    use crate::utils::file_identity::file_identity;
+    use std::time::UNIX_EPOCH;
+
+    /// A real temp library: marker written, files on disk, every asset verified
+    /// against the current generation. Mirrors the fixture used by the other
+    /// migration suites without depending on their private test module.
+    fn seeded_library(names: &[&str]) -> (tempfile::TempDir, Database, Vec<i64>) {
+        seeded_library_with_root(names, || tempfile::tempdir().unwrap())
+    }
+
+    /// Same seeding pipeline, but lets the caller supply the temp-dir factory
+    /// (TempDir::new_in keeps the path short so a recursive copy into a sibling
+    /// tempdir does not exceed Windows' MAX_PATH).
+    fn seeded_library_with_root(
+        names: &[&str],
+        make_root: impl FnOnce() -> tempfile::TempDir,
+    ) -> (tempfile::TempDir, Database, Vec<i64>) {
+        let root = make_root();
+        let conn = init_memory().unwrap();
+        let library = managed_library::adopt_initial_root(&conn, root.path()).unwrap();
+        let mut ids = Vec::new();
+        for name in names {
+            let path = root.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, format!("fixture {name}")).unwrap();
+            let modified_at = std::fs::metadata(&path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let id = assets::insert(
+                &conn,
+                path.to_string_lossy().as_ref(),
+                name,
+                "jpg",
+                std::fs::metadata(&path).unwrap().len() as i64,
+                "image/jpeg",
+                modified_at,
+            )
+            .unwrap();
+            let candidate = libraries::pending_page(&conn, 0, 100)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.asset_id == id)
+                .unwrap();
+            let identity = {
+                let file = File::open(&path).unwrap();
+                file_identity(&file).unwrap()
+            };
+            let digest = crate::utils::hash::sha256_full(&path).unwrap();
+            assert!(libraries::record_verified(
+                &conn,
+                &library,
+                &candidate,
+                name,
+                &identity,
+                &digest,
+                "fixture-receipt",
+            )
+            .unwrap());
+            ids.push(id);
+        }
+        (root, Database::new(conn), ids)
+    }
+
+    /// Copy every directory/file under `from` into `to`, preserving relative
+    /// layout (the manual "user moved the whole vault by hand" fixture).
+    fn copy_dir_recursive(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let src = entry.path();
+            let dst = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir_recursive(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn headroom_and_byte_formatting_are_stable() {
+        assert_eq!(mul_headroom(0), 0);
+        assert_eq!(mul_headroom(1000), 1050);
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn nesting_is_rejected_in_both_directions() {
+        let source = Path::new("C:/library");
+        assert!(reject_nesting(source, Path::new("C:/library/nested")).is_err());
+        assert!(reject_nesting(Path::new("C:/library/nested"), source).is_err());
+        assert!(reject_nesting(source, Path::new("C:/")).is_err());
+        assert!(reject_nesting(source, source).is_err());
+        assert!(reject_nesting(source, Path::new("D:/other")).is_ok());
+        // Sibling directories that merely share a prefix must stay allowed.
+        assert!(reject_nesting(source, Path::new("C:/library2")).is_ok());
+    }
+
+    #[test]
+    fn item_ids_are_derived_and_distinct() {
+        assert_eq!(
+            migration_item_id("2024/a.jpg"),
+            migration_item_id("2024/a.jpg")
+        );
+        assert_ne!(
+            migration_item_id("2024/a.jpg"),
+            migration_item_id("2024/b.jpg")
+        );
+        assert!(migration_item_id("2024/a.jpg").starts_with("path_"));
+    }
+
+    #[test]
+    fn maintenance_gate_blocks_writes_and_clears_on_drop() {
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        assert!(gate.ensure_writable("入库").is_ok());
+        {
+            let _lease = gate.enter("正在迁移总仓").expect("维护门应当能取到租约");
+            assert!(gate.is_active());
+            let error = gate.ensure_writable("入库").unwrap_err();
+            assert!(error.to_string().contains("总仓维护正在进行"));
+        }
+        assert!(!gate.is_active());
+        assert!(gate.reason().is_none());
+        assert!(gate.ensure_writable("入库").is_ok());
+    }
+
+    #[test]
+    fn journal_tables_exist_after_structure_migration() {
+        let conn = init_memory().unwrap();
+        for table in ["library_migration_runs", "library_migration_items"] {
+            let found: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(found, "{table} missing");
+        }
+    }
+
+    /// A migration over a real temp directory: files copied, digests proven,
+    /// locator switched to a NEW epoch, asset identity preserved, and the source
+    /// left untouched.
+    #[test]
+    fn migration_moves_a_library_and_keeps_identity_and_the_source() {
+        let (_source_dir, db, ids) = seeded_library(&["2024/a.jpg", "2024/b.jpg", "c.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_eq!(before.health, libraries::LibraryHealth::Ready);
+        let source_root = PathBuf::from(before.root_path.clone());
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("moved-library");
+
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        assert_eq!(preflight.total_items, 3);
+        assert_eq!(preflight.library_id, before.library_id);
+        assert!(preflight
+            .notes
+            .iter()
+            .any(|note| note.contains("不会删除搬运来源")));
+
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let report = run_migration(&db, &gate, &preflight, &AtomicBool::new(false)).unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_COMPLETED);
+        assert_eq!(report.verified_items, 3);
+        assert_eq!(report.failed_items, 0);
+        assert!(report.failed.is_empty());
+        assert!(!gate.is_active());
+
+        // Every file exists at the new root and still exists at the old one.
+        for relative in ["2024/a.jpg", "2024/b.jpg", "c.jpg"] {
+            assert!(
+                target_root.join(relative).is_file(),
+                "{relative} not copied"
+            );
+            assert!(source_root.join(relative).is_file(), "{relative} removed");
+        }
+
+        let after = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_eq!(
+            after.library_id, before.library_id,
+            "library identity changed"
+        );
+        assert_ne!(
+            after.library_epoch, before.library_epoch,
+            "the switch must rotate the epoch"
+        );
+        assert_eq!(after.health, libraries::LibraryHealth::Ready);
+        assert!(
+            normalize_path(&after.root_path).ends_with("moved-library"),
+            "locator did not switch: {}",
+            after.root_path
+        );
+
+        // Asset ids survive and every asset points at the new root with verified
+        // evidence under the new epoch.
+        let conn = db.lock().unwrap();
+        for id in &ids {
+            let asset = assets::get_managed(&conn, *id).unwrap();
+            assert!(
+                normalize_path(&asset.file_path).contains("moved-library"),
+                "asset {id} still points at {}",
+                asset.file_path
+            );
+            assert!(
+                libraries::verified_location(&conn, *id).unwrap().is_some(),
+                "asset {id} lost verified evidence"
+            );
+        }
+        let visible: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM assets a WHERE {VERIFIED_SCOPE}",
+                    VERIFIED_SCOPE = libraries::VERIFIED_ASSET_SCOPE
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 3, "verified scope must see all migrated assets");
+    }
+
+    #[test]
+    fn relocation_works_after_the_old_root_was_actually_moved_away() {
+        // 真实搬仓：用户把整个总仓目录「移动」到新位置——旧路径在搬走后不再存在，
+        // 且启动后总仓健康度会落到 Offline。旧 relocation 测试把旧目录留着、健康度
+        // 仍 Ready，掩盖了「真实搬仓被拒」的缺陷。本测试显式构造旧根消失 + Offline。
+        let (source_dir, db, ids) =
+            seeded_library_with_root(&["2024/a.jpg", "b.jpg"], || tempfile::tempdir().unwrap());
+        let _ = &source_dir; // 保持 TempDir 存活；旧根稍后由 fs::remove_dir_all 手动移除
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_eq!(before.health, libraries::LibraryHealth::Ready);
+        let source_root = PathBuf::from(before.root_path.clone());
+
+        // 手工把整个总仓搬到新位置（保留标记与全部文件），然后删掉旧目录。
+        let target_dir = tempfile::Builder::new()
+            .prefix("mv")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let target_root = target_dir.path().join("hand-moved");
+        copy_dir_recursive(&source_root, &target_root);
+        assert!(target_root.join("2024/a.jpg").is_file(), "copy incomplete");
+        assert!(target_root.join(managed_library::ROOT_MARKER).is_file());
+        // 真正移除旧根，模拟用户手动搬走后旧路径消失。
+        fs::remove_dir_all(&source_root).unwrap();
+        assert!(!source_root.exists(), "旧根必须真的消失");
+
+        // 模拟重启后的健康判定：旧根已不存在 → Offline。
+        {
+            let conn = db.lock().unwrap();
+            libraries::set_health(&conn, &before, libraries::LibraryHealth::Offline).unwrap();
+        }
+
+        // 关键断言：真实搬仓后重新定位必须仍可用（不被 Ready 前置条件拒绝）。
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_RELOCATE).unwrap();
+        assert_eq!(preflight.kind, library_migration::KIND_RELOCATE);
+        assert_eq!(preflight.total_items, 2);
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let report = run_migration(&db, &gate, &preflight, &AtomicBool::new(false)).unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_COMPLETED);
+        assert_eq!(report.failed_items, 0);
+
+        let after = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_ne!(after.library_epoch, before.library_epoch);
+        assert!(
+            normalize_path(&after.root_path).ends_with("hand-moved"),
+            "locator did not switch to the hand-moved root: {}",
+            after.root_path
+        );
+
+        // 素材身份保留、定位指向新根、核验证据在新世代下重建。
+        let conn = db.lock().unwrap();
+        for id in &ids {
+            let asset = assets::get_managed(&conn, *id).unwrap();
+            assert!(
+                normalize_path(&asset.file_path).contains("hand-moved"),
+                "asset {id} still points at {}",
+                asset.file_path
+            );
+            assert!(
+                libraries::verified_location(&conn, *id).unwrap().is_some(),
+                "asset {id} lost verified evidence after real relocation"
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_requires_a_complete_target_with_our_marker() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let source_root = PathBuf::from(before.root_path.clone());
+
+        // An empty directory is not "the original library".
+        let empty = tempfile::tempdir().unwrap();
+        let error =
+            preflight_migration(&db, empty.path(), library_migration::KIND_RELOCATE).unwrap_err();
+        assert!(error.to_string().contains("库身份标记") || error.to_string().contains("缺少"));
+
+        // A hand-moved root: same content and the library marker copied over.
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("hand-moved");
+        fs::create_dir_all(target_root.join("2024")).unwrap();
+        fs::copy(source_root.join("a.jpg"), target_root.join("a.jpg")).unwrap();
+        fs::copy(
+            source_root.join(managed_library::ROOT_MARKER),
+            target_root.join(managed_library::ROOT_MARKER),
+        )
+        .unwrap();
+
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_RELOCATE).unwrap();
+        assert_eq!(preflight.kind, library_migration::KIND_RELOCATE);
+        assert_eq!(preflight.total_items, 1);
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let report = run_migration(&db, &gate, &preflight, &AtomicBool::new(false)).unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_COMPLETED);
+        let after = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_ne!(after.library_epoch, before.library_epoch);
+        assert!(normalize_path(&after.root_path).ends_with("hand-moved"));
+    }
+
+    #[test]
+    fn a_nested_or_self_target_aborts_before_copying() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let source_root = PathBuf::from(before.root_path.clone());
+        let nested = source_root.join("inner");
+        let error = preflight_migration(&db, &nested, library_migration::KIND_MIGRATE).unwrap_err();
+        assert!(error.to_string().contains("互相嵌套"));
+        let error =
+            preflight_migration(&db, &source_root, library_migration::KIND_MIGRATE).unwrap_err();
+        assert!(error.to_string().contains("无需迁移"));
+        // Nothing was journalled, so the library is untouched and usable.
+        let conn = db.lock().unwrap();
+        assert!(library_migration::active_run(&conn).unwrap().is_none());
+        assert_eq!(
+            libraries::current(&conn).unwrap().unwrap().library_epoch,
+            before.library_epoch
+        );
+    }
+
+    #[test]
+    fn an_interrupted_copy_phase_keeps_the_source_generation() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg", "b.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+
+        // Simulate a crash right after the manifest was frozen and one file was
+        // copied: journal says `copying`, locator untouched.
+        {
+            let conn = db.lock().unwrap();
+            library_migration::open_run(
+                &conn,
+                &preflight.run_id,
+                &preflight.library_id,
+                &before.library_epoch,
+                &preflight.source_root,
+                &preflight.target_root,
+                &preflight.kind,
+                100,
+            )
+            .unwrap();
+            library_migration::seed_items(
+                &conn,
+                &preflight.run_id,
+                &[("path_a".to_string(), "a.jpg".to_string(), 10)],
+                100,
+            )
+            .unwrap();
+            library_migration::advance_phase(
+                &conn,
+                &preflight.run_id,
+                library_migration::PHASE_PREPARING,
+                library_migration::PHASE_COPYING,
+                110,
+            )
+            .unwrap();
+        }
+        let reconciled = reconcile_interrupted_migration(&db).unwrap();
+        assert_eq!(reconciled, vec![preflight.run_id.clone()]);
+
+        let conn = db.lock().unwrap();
+        let run = library_migration::run(&conn, &preflight.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.phase, library_migration::PHASE_FAILED);
+        assert_eq!(
+            run.error_code.as_deref(),
+            Some(library_migration::CODE_INTERRUPTED)
+        );
+        let library = libraries::current(&conn).unwrap().unwrap();
+        assert_eq!(
+            library.library_epoch, before.library_epoch,
+            "an interrupted copy must not rotate the epoch"
+        );
+        assert!(library_migration::active_run(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_switched_but_unfinished_run_completes_on_reconcile() {
+        let (_source_dir, db, ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        // Run the copy phase and the switch, then pretend the process died before
+        // the projections were rebuilt.
+        run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let switched = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_ne!(switched.library_epoch, before.library_epoch);
+
+        // Rewind the journal into the resumable "switched" state and clear the
+        // projections the previous run already rebuilt, so reconcile has work.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE library_migration_runs SET phase='switched',updated_at=999 WHERE run_id=?1",
+                [&preflight.run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE managed_asset_locations SET status='unknown',
+                        file_identity=NULL, content_sha256=NULL, ownership_receipt=NULL,
+                        location_revision=lower(hex(randomblob(16)))",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(library_migration::active_run(&db.lock().unwrap())
+            .unwrap()
+            .is_some());
+        let reconciled = reconcile_interrupted_migration(&db).unwrap();
+        assert_eq!(reconciled, vec![preflight.run_id.clone()]);
+
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            library_migration::run(&conn, &preflight.run_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            library_migration::PHASE_COMPLETED
+        );
+        for id in &ids {
+            assert!(
+                libraries::verified_location(&conn, *id).unwrap().is_some(),
+                "asset {id} was not re-verified after the interrupted tail"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_item_keeps_the_locator_on_the_source_generation() {
+        let (source_dir, db, _ids) = seeded_library(&["a.jpg", "b.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let source_root = PathBuf::from(before.root_path.clone());
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        // Corrupt one source file after preflight so its recorded size no longer
+        // matches: the run must report it and refuse to switch.
+        let victim = source_root.join("b.jpg");
+        fs::write(&victim, vec![0u8; 4096]).unwrap();
+
+        let report = run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_FAILED);
+        assert_eq!(report.failed_items, 1);
+        assert!(!report.failed.is_empty());
+        assert_eq!(
+            report.failed[0].error_code.as_deref(),
+            Some(library_migration::CODE_CHECKSUM_MISMATCH)
+        );
+        let conn = db.lock().unwrap();
+        let library = libraries::current(&conn).unwrap().unwrap();
+        assert_eq!(
+            library.library_epoch, before.library_epoch,
+            "a failed run must not switch the locator"
+        );
+        assert!(source_dir.path().join("b.jpg").is_file());
+    }
+
+    #[test]
+    fn cancellation_before_the_switch_aborts_without_touching_the_locator() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let report = run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_ABORTED);
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            libraries::current(&conn).unwrap().unwrap().library_epoch,
+            before.library_epoch
+        );
+    }
+
+    #[test]
+    fn collections_from_the_previous_epoch_stop_resolving() {
+        use crate::db::collections;
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let old_ref = {
+            let conn = db.lock().unwrap();
+            collections::ensure(&conn, &before.library_id, &before.library_epoch, "", 1)
+                .unwrap()
+                .collection_ref
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let preflight = preflight_migration(
+            &db,
+            &target_dir.path().join("t"),
+            library_migration::KIND_MIGRATE,
+        )
+        .unwrap();
+        run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let after = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_ne!(after.library_epoch, before.library_epoch);
+        // The stored reference still exists but is bound to the old epoch, and a
+        // derived reference for the same directory under the new epoch differs —
+        // which is why old handles cannot keep granting access after the move.
+        let new_ref = collections::collection_ref_for(&after.library_id, &after.library_epoch, "");
+        assert_ne!(old_ref, new_ref);
+        let conn = db.lock().unwrap();
+        let stored = collections::find(&conn, &old_ref).unwrap().unwrap();
+        assert_eq!(stored.library_epoch, before.library_epoch);
+    }
+
+    /// Crash while the manifest is being frozen: nothing has been copied and the
+    /// locator still points at the source, so the only honest recovery is to
+    /// abort the run and leave the library exactly as it was.
+    #[test]
+    fn a_crash_while_preparing_aborts_and_leaves_the_library_untouched() {
+        let (source_dir, db, ids) = seeded_library(&["a.jpg", "b.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        // Simulate the crash: the run row and its frozen manifest exist, but the
+        // process died before `advance_phase(preparing → copying)` committed.
+        {
+            let conn = db.lock().unwrap();
+            library_migration::open_run(
+                &conn,
+                &preflight.run_id,
+                &preflight.library_id,
+                &before.library_epoch,
+                &preflight.source_root,
+                &preflight.target_root,
+                library_migration::KIND_MIGRATE,
+                1,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            library_migration::active_run(&db.lock().unwrap())
+                .unwrap()
+                .unwrap()
+                .phase,
+            library_migration::PHASE_PREPARING
+        );
+
+        let reconciled = reconcile_interrupted_migration(&db).unwrap();
+        assert_eq!(reconciled, vec![preflight.run_id.clone()]);
+
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                library_migration::run(&conn, &preflight.run_id)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                library_migration::PHASE_ABORTED
+            );
+            // No open run remains, so the user can simply start again.
+            assert!(library_migration::active_run(&conn).unwrap().is_none());
+            // The locator never moved and every asset still resolves.
+            let after = libraries::current(&conn).unwrap().unwrap();
+            assert_eq!(after.library_epoch, before.library_epoch);
+            assert_eq!(after.root_path, before.root_path);
+            for id in &ids {
+                assert!(libraries::verified_location(&conn, *id).unwrap().is_some());
+            }
+        }
+        // Nothing was written to the target either.
+        assert!(!target_root.join("a.jpg").exists());
+        assert!(source_dir.path().join("a.jpg").is_file());
+    }
+
+    /// Crash between the locator switch and the projection rebuild: the library
+    /// already lives at the new root, so recovery must *finish* (not abort), and
+    /// it must be idempotent — running it twice must not corrupt anything.
+    #[test]
+    fn a_crash_while_cleaning_finishes_idempotently() {
+        let (_source_dir, db, ids) = seeded_library(&["a.jpg", "b.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let switched = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        assert_ne!(switched.library_epoch, before.library_epoch);
+
+        // Rewind to `cleaning` and strip the evidence the rebuild had written,
+        // so recovery has to reconstruct it from the filesystem.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE library_migration_runs SET phase='cleaning',updated_at=999 WHERE run_id=?1",
+                [&preflight.run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE managed_asset_locations SET status='unknown',
+                        file_identity=NULL, content_sha256=NULL, ownership_receipt=NULL,
+                        location_revision=lower(hex(randomblob(16)))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let reconciled = reconcile_interrupted_migration(&db).unwrap();
+        assert_eq!(reconciled, vec![preflight.run_id.clone()]);
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                library_migration::run(&conn, &preflight.run_id)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                library_migration::PHASE_COMPLETED
+            );
+            for id in &ids {
+                let location = libraries::verified_location(&conn, *id)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("asset {id} was not re-verified"));
+                assert_eq!(location.content_sha256.len(), 64);
+            }
+        }
+
+        // Second pass: nothing is open any more, and the ids/tags are intact.
+        assert!(reconcile_interrupted_migration(&db).unwrap().is_empty());
+        let conn = db.lock().unwrap();
+        let library = libraries::current(&conn).unwrap().unwrap();
+        assert_eq!(library.library_id, before.library_id);
+        assert_eq!(library.library_epoch, switched.library_epoch);
+        assert_eq!(
+            crate::db::assets::count_active(&conn, &ids).unwrap(),
+            ids.len() as u64
+        );
+    }
+
+    /// P0-4 回归：回收站素材必须随总仓迁移一起搬文件、重建定位。
+    /// 迁移前可见的回收站记录，切代后仍须能通过回收站查询恢复（路径/世代已更新）。
+    #[test]
+    fn trashed_assets_are_migrated_and_recoverable_after_switch() {
+        let (_source_dir, db, ids) = seeded_library(&["keep.jpg", "trash.jpg"]);
+        let keep_id = ids[0];
+        let trash_id = ids[1];
+
+        // 软删除 trash.jpg：它进入回收站，但物理文件仍在旧总仓。
+        {
+            let conn = db.lock().unwrap();
+            let n = assets::soft_delete(&conn, &[trash_id]).unwrap();
+            assert_eq!(n, 1);
+            // 迁移前：回收站查询能看到它
+            assert_eq!(assets::trash_records(&conn, &[trash_id]).unwrap().len(), 1);
+        }
+
+        // 迁移到新总仓。
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("target");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        // 清单必须同时包含活动素材与回收站素材。
+        assert_eq!(preflight.total_items, 2, "回收站素材应进入迁移清单");
+        run_migration(
+            &db,
+            &std::sync::Arc::new(LibraryMaintenanceGate::new()),
+            &preflight,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let conn = db.lock().unwrap();
+        // 回收站记录仍可见（未因迁移丢失），且路径已指向新总仓。
+        let records = assets::trash_records(&conn, &[trash_id]).unwrap();
+        assert_eq!(records.len(), 1, "迁移后回收站记录必须仍可查到");
+        let expected_root = normalize_path(&preflight.target_root);
+        assert!(
+            normalize_path(&records[0].file_path).starts_with(&expected_root),
+            "回收站记录路径应已更新到新总仓，实际 {}",
+            records[0].file_path
+        );
+        // 活动素材也仍可查且已重建定位。
+        assert!(libraries::verified_location(&conn, keep_id)
+            .unwrap()
+            .is_some());
+        // 回收站素材物理文件已搬过去并在回收站仍标记删除。
+        let still_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted_at FROM assets WHERE id=?1",
+                [trash_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(still_deleted > 0, "迁移不得清除 deleted_at 标记");
+    }
+
+    /// S1 回归：用户真的把整个总仓手动搬到新位置（旧目录已不存在）后，
+    /// 「重新定位」必须可用：核验新位置并切换 locator，不能因为旧目录消失而被拒。
+    #[test]
+    fn relocation_works_after_the_whole_library_was_manually_moved_away() {
+        let (source_dir, db, ids) = seeded_library(&["a.jpg", "sub/b.jpg"]);
+        let old_root = source_dir.path().to_path_buf();
+
+        // 用户手动把整个总仓搬到新位置，并删掉旧目录（真实搬仓，非复制）。
+        let new_parent = tempfile::tempdir().unwrap();
+        let new_root = new_parent.path().join("moved_library");
+        std::fs::rename(&old_root, &new_root).unwrap();
+        assert!(!old_root.exists(), "旧总仓应已在真实搬仓后消失");
+
+        // 旧路径已不存在：重新定位必须仍能完成核验并切换。
+        let preflight =
+            preflight_migration(&db, &new_root, library_migration::KIND_RELOCATE).unwrap();
+        assert_eq!(preflight.total_items, 2);
+        assert_eq!(preflight.kind, library_migration::KIND_RELOCATE);
+
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        run_migration(&db, &gate, &preflight, &AtomicBool::new(false)).unwrap();
+
+        // locator 切到新位置、素材仍可解析且 ID 不变。
+        let conn = db.lock().unwrap();
+        let library = libraries::current(&conn).unwrap().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&library.root_path).unwrap(),
+            std::fs::canonicalize(&new_root).unwrap(),
+            "重新定位后总仓根应指向新位置"
+        );
+        for id in &ids {
+            assert!(
+                libraries::verified_location(&conn, *id).unwrap().is_some(),
+                "素材 {id} 在重新定位后仍应可解析"
+            );
+        }
+    }
+
+    /// A4-05 回归：维护门必须是排他租约。
+    ///
+    /// 旧实现里第二个 `enter` 会覆盖理由并再返回一个租约，那个租约一 `drop`
+    /// 就把门关了——真正的迁仓还在跑，写入口却重新放行。这里同时钉住三件事：
+    /// 第二个请求失败、失败方拿不到任何可 `drop` 的租约、持有者仍保持封锁，
+    /// 直到持有者自己释放。
+    #[test]
+    fn a_second_maintenance_request_fails_and_cannot_release_the_gate() {
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let lease = gate.enter("正在迁移总仓到 new-root").unwrap();
+        assert!(gate.is_active());
+
+        let blocked = match gate.enter("正在迁移总仓到 other-root") {
+            Ok(_) => panic!("第二个维护请求必须失败，不能抢占或共享租约"),
+            Err(error) => error,
+        };
+        assert!(
+            blocked.to_string().contains("总仓维护"),
+            "错误应说明维护正在进行，实际：{blocked}"
+        );
+        // 失败方的理由绝不能覆盖持有者的理由。
+        assert_eq!(gate.reason().as_deref(), Some("正在迁移总仓到 new-root"));
+        assert!(gate.is_active(), "失败的第二个请求不得清门");
+
+        drop(lease);
+        assert!(!gate.is_active());
+        assert!(gate.reason().is_none());
+        // 门空了以后，下一个请求可以正常拿到租约。
+        let again = gate.enter("重新迁移").unwrap();
+        assert!(gate.is_active());
+        drop(again);
+        assert!(!gate.is_active());
+    }
+
+    /// A4-05 回归：持有者 panic 时门必须随 unwind 释放（否则应用被永久锁死）。
+    #[test]
+    fn a_panicking_holder_releases_the_gate_on_unwind() {
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let gate = std::sync::Arc::clone(&gate);
+            move || {
+                let _lease = gate.enter("正在迁移总仓到 panicking-root").unwrap();
+                assert!(gate.is_active());
+                panic!("模拟迁仓线程崩溃");
+            }
+        }));
+        std::panic::set_hook(hook);
+        assert!(result.is_err());
+        assert!(
+            !gate.is_active(),
+            "持有者 panic 后维护门必须释放，否则写入入口会被永久锁死"
+        );
+        assert!(gate.ensure_writable("入库").is_ok());
+    }
+
+    /// A4-05 回归：目标目录带着**别的**库的标记时必须拒绝。
+    ///
+    /// 这正是「拒绝把任意空文件夹当原库」的另一半：目录里有标记，但不是我们的。
+    #[test]
+    fn relocation_rejects_a_target_that_carries_another_library_marker() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let source_root = PathBuf::from(before.root_path.clone());
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("someone-else");
+        fs::create_dir_all(&target_root).unwrap();
+        fs::copy(source_root.join("a.jpg"), target_root.join("a.jpg")).unwrap();
+        fs::write(
+            target_root.join(managed_library::ROOT_MARKER),
+            "another-library-id",
+        )
+        .unwrap();
+
+        let error =
+            preflight_migration(&db, &target_root, library_migration::KIND_RELOCATE).unwrap_err();
+        assert!(
+            error.to_string().contains("无法重新定位"),
+            "错误应说明重新定位被拒，实际：{error}"
+        );
+    }
+
+    /// A4-05 回归：同路径、同尺寸但内容不同，不能被当成搬好的原库。
+    ///
+    /// 旧实现只比尺寸，于是「用户随手新建的同名同尺寸文件」会被接受、`record_verified`
+    /// 绑上一个陌生摘要、随后切根成功。现在必须按登记时冻结的摘要判定。
+    #[test]
+    fn relocation_rejects_same_size_but_different_content() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let source_root = PathBuf::from(before.root_path.clone());
+        let source_file = source_root.join("a.jpg");
+        let expected_len = fs::metadata(&source_file).unwrap().len() as usize;
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("hand-moved");
+        fs::create_dir_all(&target_root).unwrap();
+        // 尺寸完全一致，内容完全不同。
+        fs::write(target_root.join("a.jpg"), vec![b'X'; expected_len]).unwrap();
+        fs::copy(
+            source_root.join(managed_library::ROOT_MARKER),
+            target_root.join(managed_library::ROOT_MARKER),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(target_root.join("a.jpg")).unwrap().len() as usize,
+            expected_len,
+            "夹具必须构造出同尺寸文件，否则测不到摘要比对"
+        );
+
+        let error =
+            preflight_migration(&db, &target_root, library_migration::KIND_RELOCATE).unwrap_err();
+        assert!(
+            error.to_string().contains("无法重新定位"),
+            "同尺寸不同内容必须在预检就被拒，实际：{error}"
+        );
+        // 而且拒绝必须发生在任何切换之前：定位器仍指向旧根、代次不变。
+        let conn = db.lock().unwrap();
+        let still = libraries::current(&conn).unwrap().unwrap();
+        assert_eq!(still.library_epoch, before.library_epoch);
+        assert!(library_migration::active_run(&conn).unwrap().is_none());
+    }
+
+    /// A4-05 回归：迁移由软件创建目标目录，标记只能由迁移本身写下；
+    /// 切换后目标根必须真的带着我们的标记（否则下次重新定位就认不出自己）。
+    #[test]
+    fn a_migration_writes_the_identity_marker_on_the_target() {
+        let (_source_dir, db, _ids) = seeded_library(&["a.jpg"]);
+        let before = {
+            let conn = db.lock().unwrap();
+            libraries::current(&conn).unwrap().unwrap()
+        };
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_root = target_dir.path().join("new-library");
+        let preflight =
+            preflight_migration(&db, &target_root, library_migration::KIND_MIGRATE).unwrap();
+        let gate = std::sync::Arc::new(LibraryMaintenanceGate::new());
+        let report = run_migration(&db, &gate, &preflight, &AtomicBool::new(false)).unwrap();
+        assert_eq!(report.phase, library_migration::PHASE_COMPLETED);
+
+        let marker = fs::read_to_string(target_root.join(managed_library::ROOT_MARKER)).unwrap();
+        assert_eq!(marker, before.library_id);
+    }
+}

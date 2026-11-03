@@ -245,17 +245,19 @@ pub fn record_number_proposals(
 /// 确认数值建议（§6.4 确认环节）：decision='accepted' → 写 asset_facet_numbers。
 /// 不变量 10：旧行为 manual/ai_reviewed → 跳过并记 warning。
 pub fn confirm_number_item(conn: &Connection, item_id: i64) -> AppResult<Option<String>> {
-    let (suggestion_id, facet_key, _raw_name, num_value, asset_id, batch_id): (
+    let (suggestion_id, facet_key, _raw_name, num_value, asset_id, batch_id, mode): (
         i64,
         String,
         String,
         Option<f64>,
         i64,
         Option<i64>,
+        String,
     ) = conn.query_row(
-        "SELECT i.suggestion_id, i.facet_key, i.raw_name, i.num_value, s.asset_id, s.batch_id
+        "SELECT i.suggestion_id, i.facet_key, i.raw_name, i.num_value, s.asset_id, s.batch_id, b.mode
            FROM ai_suggestion_items i
            JOIN ai_suggestions s ON s.id = i.suggestion_id
+           JOIN ai_batches b ON b.id = s.batch_id
           WHERE i.id = ?1",
         [item_id],
         |r| {
@@ -266,13 +268,16 @@ pub fn confirm_number_item(conn: &Connection, item_id: i64) -> AppResult<Option<
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         },
     )?;
     let Some(value) = num_value else {
         return Err(AppError::msg("该数值建议无确定值（歧义项），请先人工填数"));
     };
-    let source = if batch_id.is_some() {
+    // 来源必须按批次 mode 判（与 ai::confirm_suggestion_inner 的标签来源一致）：
+    // 早前只按 batch_id 有无判定，会让本地模型确认的数值被标成 ai_cloud。
+    let source = if mode == "cloud" {
         "ai_cloud"
     } else {
         "ai_local"

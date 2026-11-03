@@ -23,6 +23,7 @@ import VideoPlayer from "@/components/media/VideoPlayer";
 import ColorStrip, { toPaletteSegments } from "@/components/library/ColorStrip";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
+import { setFavorite, setRating } from "@/api/assets";
 import { removeTags } from "@/api/tags";
 import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -166,6 +167,42 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
     }
   };
 
+  /**
+   * M-14b（PRD R-16 / QA_PLAYBOOK F-05、J-01、J-02）：查看器内 1–5 设评级、0 清除、F 切收藏。
+   * 唯一写入口：侧栏点星与键盘快捷键都走这里，避免两套逻辑各自乐观更新导致星标与库不一致。
+   * 乐观更新 + 失败回滚；输入框/播放器/模态打开时由 isEditableTarget 与 assignOpen 拦住。
+   */
+  const [ratingError, setRatingError] = useState<string | null>(null);
+  const [ratingBusy, setRatingBusy] = useState(false);
+  const applyRating = useCallback(
+    (value: number) => {
+      const previous = { rating: current.rating ?? 0, favorite: current.favorite ?? 0 };
+      setRatingError(null);
+      setRatingBusy(true);
+      patchLocal([current.id], { rating: value });
+      void setRating([current.id], value)
+        .catch((e) => {
+          patchLocal([current.id], previous);
+          setRatingError(e instanceof Error ? e.message : String(e));
+        })
+        .finally(() => setRatingBusy(false));
+    },
+    [current.id, current.rating, current.favorite, patchLocal],
+  );
+  const toggleFavorite = useCallback(() => {
+    const next = current.favorite === 1 ? 0 : 1;
+    const previous = { rating: current.rating ?? 0, favorite: current.favorite ?? 0 };
+    setRatingError(null);
+    setRatingBusy(true);
+    patchLocal([current.id], { favorite: next });
+    void setFavorite([current.id], next === 1)
+      .catch((e) => {
+        patchLocal([current.id], previous);
+        setRatingError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => setRatingBusy(false));
+  }, [current.id, current.favorite, current.rating, patchLocal]);
+
   // 进场动画
   useEffect(() => {
     const raf = requestAnimationFrame(() => setEntered(true));
@@ -249,10 +286,24 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
         onClose();
       } else if (e.key === "ArrowLeft") goto(index - 1);
       else if (e.key === "ArrowRight") goto(index + 1);
+      else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        // M-14b（F-05 / J-01）：1–5 设评级、0 清除、F 切收藏。无修饰键才生效，
+        // 避免和浏览器/系统的 Ctrl 组合撞车；输入框与播放器已在函数开头拦掉。
+        if (e.key >= "1" && e.key <= "5") {
+          e.preventDefault();
+          applyRating(Number(e.key));
+        } else if (e.key === "0") {
+          e.preventDefault();
+          applyRating(0);
+        } else if (e.key === "f" || e.key === "F") {
+          e.preventDefault();
+          toggleFavorite();
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, goto, onClose, assignOpen, immersiveMode]);
+  }, [index, goto, onClose, assignOpen, immersiveMode, applyRating, toggleFavorite]);
 
   const isVideo = isVideoAsset(current);
   // FB3-10（§12.2）：查看器接入算法主色色条（showInViewer 开关此前无实现）。
@@ -333,6 +384,12 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
       data-viewer-immersive={immersive ? "" : undefined}
       className={clsx("h-full min-h-0 transition-all duration-200 ease-out", entered ? "opacity-100" : "opacity-0")}
     >
+      {/* M-14b：评级/收藏写入失败时如实播报，而不是让乐观更新过的星标假装成功 */}
+      {ratingError && (
+        <p role="alert" className="px-4 pt-1 text-xs text-[var(--color-danger)]">
+          评级/收藏没有保存：{ratingError}
+        </p>
+      )}
       <ViewerShell
         immersive={immersive}
         toolbar={
@@ -348,7 +405,13 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
         }
         sidebar={
           detailsOpen && !immersive ? (
-            <ViewerInfoSidebar asset={current} onRefreshed={(a) => patchLocal([a.id], a)} />
+            <ViewerInfoSidebar
+              asset={current}
+              onRefreshed={(a) => patchLocal([a.id], a)}
+              onRate={applyRating}
+              onToggleFavorite={toggleFavorite}
+              busy={ratingBusy}
+            />
           ) : null
         }
         tagBar={

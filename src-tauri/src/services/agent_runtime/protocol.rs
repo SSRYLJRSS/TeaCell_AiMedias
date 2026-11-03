@@ -1,10 +1,12 @@
 use serde_json::Value;
 
 pub(super) const PROTOCOL_VERSION: u64 = 1;
-pub(super) const SCHEMA_VERSION: u64 = 3;
+pub(super) const SCHEMA_VERSION: u64 = 6;
 pub(super) const SDK_VERSION: &str = "1.0.4";
 pub(super) const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PROMPT_BYTES: usize = 4096;
+/// Decoded size of one capability payload (model tool arguments or a tool result).
+pub(super) const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 32 * 1024;
 
 #[derive(Default)]
 pub(super) struct FrameDecoder {

@@ -7,12 +7,13 @@ import {
   aiCreateBatch,
   aiListBatches,
   aiListSuggestions,
+  aiPrepareImportBatch,
   aiRejectSuggestion,
   aiRestoreSuggestion,
   aiStartTagging,
 } from "@/api/ai";
 import type { AiBatch, AiSuggestion, CategorizedTags } from "@/types/ai";
-import type { TaggingOperation } from "@/types/ai";
+import type { TaggingOperation, TaggingPreparation } from "@/types/ai";
 
 interface AiState {
   batches: AiBatch[];
@@ -43,6 +44,15 @@ interface AiState {
   createBatch: () => Promise<void>;
   /** 启动页面已准备并批准的 operation；审批流程由页面编排。 */
   startTagging: (operation: TaggingOperation, limit?: number) => Promise<void>;
+  /** A3-07：从已受理的导入 operation/step 按逐项成功收据准备打标范围。
+   *  `includedDuplicateItemIds` 必须来自用户在重复项上的显式勾选，禁止由数量或目录推断。 */
+  prepareFromImport: (
+    sourceOperationId: string,
+    sourceStepId: string,
+    includedDuplicateItemIds?: string[],
+  ) => Promise<TaggingPreparation | null>;
+  /** A3-07：从导入收据准备打标计划正在进行（按钮禁用与文案用同一状态）。 */
+  preparingFromImport: boolean;
   /** 撤销拒绝（v2.11） */
   restore: (id: number) => Promise<void>;
   cancel: () => Promise<void>;
@@ -62,6 +72,7 @@ export const useAiStore = create<AiState>((set, get) => ({
   runProgress: null,
   lastProgressAssetId: null,
   pendingAssetIds: [],
+  preparingFromImport: false,
 
   setError: (error) => set({ error }),
 
@@ -136,6 +147,30 @@ export const useAiStore = create<AiState>((set, get) => ({
       set({ batches: await aiListBatches() });
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  prepareFromImport: async (sourceOperationId, sourceStepId, includedDuplicateItemIds) => {
+    set({ error: null, preparingFromImport: true });
+    try {
+      // 后端按 (operationId, stepId) 逐个核对成功收据；这里只传用户显式勾选的重复项。
+      const preparation = await aiPrepareImportBatch(
+        sourceOperationId,
+        sourceStepId,
+        includedDuplicateItemIds ?? [],
+      );
+      if (preparation.operation) {
+        // 已有待启动操作：把它所在批次挂到当前视图，避免用户在另一个批次上看进度。
+        const batchId = preparation.operation.batchId;
+        await get().refreshBatches();
+        await get().openBatch(batchId);
+      }
+      return preparation;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return null;
+    } finally {
+      set({ preparingFromImport: false });
     }
   },
 

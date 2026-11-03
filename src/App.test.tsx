@@ -5,13 +5,16 @@
  *  - viewerOpen=true 时全局 BottomBar 隐藏（Viewer 自带胶片条，避免双重导航），TitleBar 保留。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "@/App";
 import { getHelpPageUrl, openHelpPage, saveSettings } from "@/api/settings";
+import { invoke } from "@/api/client";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
+import { useWorkflowPanelStore } from "@/stores/workflowPanelStore";
+import { usePendingPlansStore } from "@/stores/pendingPlansStore";
 import type { Settings } from "@/types/settings";
 
 function mkSettings(): Settings {
@@ -43,6 +46,15 @@ function mkSettings(): Settings {
       colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
       kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
     },
+    navigation: {
+      shortcuts: [
+        { id: "import", visible: true },
+        { id: "library", visible: true },
+        { id: "ai", visible: true },
+        { id: "treasure", visible: true },
+      ],
+      settingsPinned: false,
+    },
   };
 }
 
@@ -68,6 +80,22 @@ vi.mock("@/api/assets", () => ({
 vi.mock("@/api/thumbnail", () => ({
   getThumbnailUrl: mocks.getThumbnailUrl,
   toFileUrl: mocks.toFileUrl,
+}));
+// A4-03：恢复走逐项结果通道，测试里换成可控桩（回收站列表在渲染时不会被调用）。
+vi.mock("@/api/trash", () => ({
+  listTrash: vi.fn().mockResolvedValue([]),
+  trashRetention: vi.fn().mockResolvedValue([]),
+  restoreAssets: vi.fn().mockResolvedValue({
+    operationRef: "operation_test",
+    restored: 0,
+    failed: 0,
+    unknown: 0,
+    skipped: 0,
+    cancelled: false,
+    items: [],
+  }),
+  restoreErrorLabel: () => "",
+  failedRestores: () => [],
 }));
 vi.mock("@/api/settings", () => ({
   getSettings: vi.fn().mockResolvedValue({
@@ -107,6 +135,17 @@ vi.mock("@/api/client", () => ({
 }));
 vi.mock("@/api/platform", () => ({
   getPlatformCapabilities: platformMocks.getPlatformCapabilities,
+}));
+// A3-06：首次引导要显示 AI 服务概况；测试里给出空服务列表与空绑定。
+vi.mock("@/api/connections", () => ({
+  listAiConnections: vi.fn().mockResolvedValue([]),
+  getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: null, agent: null }),
+  setAiUsageBinding: vi.fn().mockResolvedValue(undefined),
+  getSuperSearchServiceResolution: vi.fn().mockResolvedValue(null),
+}));
+// A3-06：首次引导可选择总库目录；测试里不让原生选择器打开。
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn().mockResolvedValue(null),
 }));
 
 vi.stubGlobal("ResizeObserver", class {
@@ -206,30 +245,89 @@ beforeEach(() => {
   });
 });
 
+/**
+ * 首屏启动期会串起「设置 → 平台能力 → 素材库首屏」多层异步回写。
+ * 断言完初始状态后必须把这条链 flush 在 act 内，否则更新落在测试之外，成为 act 噪声。
+ */
+async function flushBoot() {
+  await act(async () => {
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  });
+}
+
 describe("App 启动骨架（§3.2）", () => {
   it("设置未加载时先显示 StartupSkeleton（TitleBar 仍在）", async () => {
     useSettingsStore.setState(emptySettingsStore); // loaded=false → skeleton
     render(<App />);
     expect(screen.getByText("正在准备素材库")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument(); // TitleBar 保留
+    await flushBoot();
   });
 
-  it("新安装首次启动询问是否查看教程，并将选择持久化为已处理", async () => {
+  it("新安装首次启动进入可跳过的引导向导，并将选择持久化为已处理", async () => {
     useSettingsStore.setState({
       ...emptySettingsStore,
       settings: { ...mkSettings(), tutorialPromptHandled: false },
       loaded: true,
     });
     render(<App />);
-    expect(await screen.findByRole("dialog", { name: "使用教程" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "以后再看" }));
+    // A3-06：首次引导是可跳过的多步向导，第一步引导总库位置。
+    expect(await screen.findByRole("dialog", { name: "欢迎使用茶馆" })).toBeInTheDocument();
+    expect(screen.getByLabelText("总库位置")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "跳过引导" }));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenCalledWith(
         expect.objectContaining({ tutorialPromptHandled: true }),
       ),
     );
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "使用教程" })).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "欢迎使用茶馆" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("跳过引导后手动入口照常可用：底栏还能打开入库，也能回到素材库", async () => {
+    // R32「跳过不妨碍手动功能」：跳过只关掉引导，不能连带关掉入库/素材库这些手动入口。
+    useSettingsStore.setState({
+      ...emptySettingsStore,
+      settings: { ...mkSettings(), tutorialPromptHandled: false },
+      loaded: true,
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "跳过引导" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "欢迎使用茶馆" })).not.toBeInTheDocument(),
+    );
+    // 引导关掉后底栏仍在（没有被遮罩或引导层挡住）。
+    expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
+
+    // 一次导航进独立入库工作台：入口可点、目标页面内容真的渲染出来。
+    fireEvent.click(screen.getByRole("button", { name: "入库" }));
+    expect(await screen.findByText("待入库清单")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "入库" })).toHaveAttribute("aria-current", "page");
+    await flushBoot();
+
+    // 同一条底栏回素材库：素材库页面的工具条重新出现。
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    await waitFor(() => expect(screen.getByTestId("toolbar-filters")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "素材库" })).toHaveAttribute("aria-current", "page");
+    await flushBoot();
+  });
+
+  it("首次引导最后一步说明未配置 AI 也不影响手动流程", async () => {
+    useSettingsStore.setState({
+      ...emptySettingsStore,
+      settings: { ...mkSettings(), tutorialPromptHandled: false },
+      loaded: true,
+    });
+    render(<App />);
+    await screen.findByRole("dialog", { name: "欢迎使用茶馆" });
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    expect(screen.getByText(/不配置也能用入库、素材库和手动标签/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    expect(screen.getByText(/执行必须由你在卡片上确认/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "以后再看" })).toBeInTheDocument();
   });
 
   it("默认浏览器打开失败时展示可复制的使用帮助地址", async () => {
@@ -241,12 +339,15 @@ describe("App 启动骨架（§3.2）", () => {
       loaded: true,
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "查看新手教程" }));
+    await screen.findByRole("dialog", { name: "欢迎使用茶馆" });
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看新手教程" }));
     expect(await screen.findByDisplayValue("https://help.example/tutorial")).toBeInTheDocument();
     expect(screen.getByText(/无法自动打开新手教程/)).toBeInTheDocument();
   });
 
-  it("教程选择持久化失败时如实提示，仍允许继续使用且下次可再次邀请", async () => {
+  it("引导选择持久化失败时如实提示，仍允许继续使用且下次可再次邀请", async () => {
     vi.mocked(saveSettings).mockRejectedValueOnce(new Error("设置文件不可写"));
     useSettingsStore.setState({
       ...emptySettingsStore,
@@ -254,19 +355,24 @@ describe("App 启动骨架（§3.2）", () => {
       loaded: true,
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "以后再看" }));
+    fireEvent.click(await screen.findByRole("button", { name: "跳过引导" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("设置文件不可写");
     fireEvent.click(screen.getByRole("button", { name: "继续使用" }));
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "使用教程" })).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "欢迎使用茶馆" })).not.toBeInTheDocument(),
+    );
     expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ tutorialPromptHandled: true }));
   });
 
-  it("全局阻止 WebView 原生右键菜单", () => {
+  it("全局阻止 WebView 原生右键菜单", async () => {
     useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
     render(<App />);
     const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
-    document.body.dispatchEvent(event);
+    act(() => {
+      document.body.dispatchEvent(event);
+    });
     expect(event.defaultPrevented).toBe(true);
+    await flushBoot();
   });
 
   it("启动时加载平台能力，供平台门控与路径显示共享使用", async () => {
@@ -306,7 +412,7 @@ describe("App 启动骨架（§3.2）", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("macOS 与无边框 Tauri 配置一致：报告自绘控件并继续显示可访问标题栏", () => {
+  it("macOS 与无边框 Tauri 配置一致：报告自绘控件并继续显示可访问标题栏", async () => {
     useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
     usePlatformStore.setState({
       status: "ready",
@@ -328,6 +434,7 @@ describe("App 启动骨架（§3.2）", () => {
     expect(screen.getByRole("button", { name: "最小化" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /最大化|还原/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
+    await flushBoot();
   });
 });
 
@@ -350,6 +457,7 @@ describe("App §7.3 方案 A（Viewer 打开隐藏 BottomBar）", () => {
     expect(screen.queryByText("打标")).not.toBeInTheDocument();
     // TitleBar 始终保留
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+    await flushBoot();
   });
 
   it("viewerOpen=false：BottomBar 正常显示", async () => {
@@ -358,6 +466,43 @@ describe("App §7.3 方案 A（Viewer 打开隐藏 BottomBar）", () => {
     expect(screen.getByText("素材库")).toBeInTheDocument();
     expect(screen.getByText("入库")).toBeInTheDocument();
     expect(screen.getByText("打标")).toBeInTheDocument();
+    await flushBoot();
+  });
+});
+
+describe("App A3-09 悬浮助手入口（PRD 第 8 节）", () => {
+  const loadedStore = {
+    settings: mkSettings(),
+    loaded: true,
+    loading: false,
+    loadError: null,
+    saving: false,
+  };
+
+  it("默认显示应用内悬浮助手入口", async () => {
+    useSettingsStore.setState(loadedStore);
+    render(<App />);
+    expect(screen.getByTestId("floating-assistant-logo")).toBeInTheDocument();
+    await flushBoot();
+  });
+
+  it("设置里关掉入口后不渲染，且不影响页面与底栏", async () => {
+    useSettingsStore.setState({
+      ...loadedStore,
+      settings: { ...mkSettings(), floatingAssistant: false },
+    });
+    render(<App />);
+    expect(screen.queryByTestId("floating-assistant-logo")).toBeNull();
+    expect(screen.getByText("素材库")).toBeInTheDocument();
+    await flushBoot();
+  });
+
+  it("打开大图浏览时隐藏浮层入口，避免遮挡全屏预览", async () => {
+    useSettingsStore.setState(loadedStore);
+    useLibraryStore.setState({ viewerOpen: true });
+    render(<App />);
+    expect(screen.queryByTestId("floating-assistant-logo")).toBeNull();
+    await flushBoot();
   });
 });
 
@@ -407,5 +552,163 @@ describe("App palette://updated 全局监听（FB4-03 §6.5/§10.7）", () => {
     render(<App />);
     // 首屏正常（TitleBar 设置按钮在），不抛错
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+  });
+});
+
+describe("App R06 统一视觉体系（助手页与素材库页共用同一壳层）", () => {
+  const loadedStore = {
+    settings: mkSettings(),
+    loaded: true,
+    loading: false,
+    loadError: null,
+    saving: false,
+  };
+
+  /**
+   * 助手页进页时会读会话索引与恢复摘要（`@/api/conversations`、`@/api/operations` 在本文件未 mock，
+   * 走被 mock 的 `@/api/client.invoke`）。给这些只读查询一个空结果，页面才停在正常空态，
+   * 而不是落进 PageErrorBoundary 的错误页 —— 否则比对的就不是真实页面壳层了。
+   */
+  beforeEach(() => {
+    const invokeMock = invoke as unknown as { mockImplementation: (fn: (command: string) => Promise<unknown>) => void };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "agent_host_start") {
+        return {
+          hostInstanceId: "test-host-instance",
+          protocolVersion: 6,
+          sdkVersion: "test",
+          recoveredStrandedHost: false,
+          modelNetworkEnabled: false,
+        };
+      }
+      if (command === "agent_host_conversation_history") return [];
+      return command === "list_conversations" || command === "list_operation_recovery" ? [] : null;
+    });
+  });
+
+  /** 页面的壳层 = `<main>`；PageErrorBoundary 无异常时直接透传 children，firstElementChild 即页面根容器。 */
+  function shell(): HTMLElement {
+    const node = document.querySelector("main");
+    expect(node).not.toBeNull();
+    return node as HTMLElement;
+  }
+
+  function pageRoot(container: HTMLElement): HTMLElement {
+    const node = container.firstElementChild;
+    expect(node).not.toBeNull();
+    return node as HTMLElement;
+  }
+
+  it("换页只换内容不换壳层：素材库页与助手页挂在同一个 main 上", async () => {
+    useSettingsStore.setState(loadedStore);
+    render(<App />);
+    await flushBoot();
+
+    const libraryShell = shell();
+    // 壳层统一承担「撑满剩余高度 + 给底栏留位」；页面自己不再各写一层布局。
+    expect(libraryShell.className).toContain("flex-1");
+    expect(libraryShell.className).toContain("min-h-0");
+    expect(libraryShell.className).toContain("pb-14");
+    const shellClassName = libraryShell.className;
+    expect(pageRoot(libraryShell).className).toContain("h-full");
+
+    fireEvent.click(screen.getByRole("button", { name: "助手" }));
+    await flushBoot();
+
+    // 助手页没有另起一套外壳：仍是同一个 main 节点、同一套 class，当前项由底栏标出。
+    expect(screen.queryByText("页面暂时无法显示")).toBeNull();
+    expect(screen.getByText(/选择左侧对话，或新建一个对话开始/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "助手" })).toHaveAttribute("aria-current", "page");
+    const assistantShell = shell();
+    expect(assistantShell).toBe(libraryShell);
+    expect(assistantShell.className).toBe(shellClassName);
+    expect(pageRoot(assistantShell).className).toContain("h-full");
+    await flushBoot();
+  });
+
+  it("两类页面容器只用主题语义变量，不写死字面颜色", async () => {
+    useSettingsStore.setState(loadedStore);
+    render(<App />);
+    await flushBoot();
+
+    // 内联样式里的颜色只能来自 CSS 变量；出现 #hex / rgb() / hsl() 就说明绕过了主题。
+    const literalColor = /(#[0-9a-f]{3,8}\b|rgba?\(|hsla?\()/i;
+    const inlineColors = (root: Element) =>
+      [...root.querySelectorAll<HTMLElement>("[style]")]
+        .map((node) => node.getAttribute("style") ?? "")
+        .filter((style) => /(^|;)\s*(color|background|background-color|border-color)\s*:/i.test(style))
+        .filter((style) => literalColor.test(style));
+    // 语义变量 class 是统一视觉体系的落点：背景/文字/边框都写 var(--color-*)。
+    // 数语义变量而不是写成「大于 0」：写死颜色的断言是「一个都不许有」（下面几处 toContain），
+    // 这里要求两类容器都真的带上语义变量，数量本身不能退化成装饰性检查。
+    const themeVariableClasses = (root: Element) =>
+      root.querySelectorAll('[class*="var(--color-"]').length;
+    const libraryPage = pageRoot(shell());
+    expect(inlineColors(libraryPage)).toEqual([]);
+    expect(themeVariableClasses(libraryPage)).toBeGreaterThan(0);
+    // 素材库工具条（排序/尺寸档等）同样只引用主题变量。
+    expect(themeVariableClasses(screen.getByTestId("toolbar-actions"))).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "助手" }));
+    await flushBoot();
+
+    const assistantPage = pageRoot(shell());
+    expect(inlineColors(assistantPage)).toEqual([]);
+    expect(themeVariableClasses(assistantPage)).toBeGreaterThan(0);
+    // 助手页自己的入口（新建会话）也走语义变量，没有自成一套配色。
+    expect(screen.getByTestId("empty-new-conversation").className).toContain(
+      "var(--color-accent)",
+    );
+    await flushBoot();
+  });
+});
+
+describe("App 助手页把常用流程/待审计划嵌进右侧栏", () => {
+  /**
+   * 助手页进页会读会话索引、恢复摘要；嵌进右侧栏的两个面板还会读流程列表/步骤目录与
+   * 待审计划。这里统一给只读查询空结果，让页面停在正常空态而不是错误边界。
+   */
+  beforeEach(() => {
+    const invokeMock = invoke as unknown as {
+      mockImplementation: (fn: (command: string) => Promise<unknown>) => void;
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (
+        command === "list_conversations" ||
+        command === "list_operation_recovery" ||
+        command === "list_pending_plans" ||
+        command === "list_workflows" ||
+        command === "workflow_step_catalog"
+      ) {
+        return [];
+      }
+      return null;
+    });
+  });
+
+  it("素材库页照常渲染全局模态框，助手页改为侧栏且不再重复渲染模态框", async () => {
+    useSettingsStore.setState({
+      settings: mkSettings(),
+      loaded: true,
+      loading: false,
+      loadError: null,
+      saving: false,
+    });
+    useWorkflowPanelStore.setState({ open: true, draft: null, draftingFrom: null, error: null });
+    usePendingPlansStore.setState({ open: true, plans: [], loading: false, error: null });
+
+    render(<App />);
+    await flushBoot();
+
+    // 非助手页：外部入口（任务卡「保存为常用流程」、设置页的待审计划）仍靠应用层模态框落地。
+    expect(screen.getByRole("dialog", { name: "常用流程" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "待审计划" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "助手" }));
+    await flushBoot();
+
+    // 助手页：同一份内容由右侧栏承载，模态框不再渲染——否则会盖住对话，
+    // 也正是这次要把两个入口统一成「一个抽屉」的原因。
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });

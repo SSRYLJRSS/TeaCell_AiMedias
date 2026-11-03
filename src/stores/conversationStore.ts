@@ -65,6 +65,10 @@ function messageOf(error: unknown): string {
 let selectionRevision = 0;
 const draftWriteRevisions = new Map<string, Map<DraftKind, number>>();
 let draftWriteRevision = 0;
+/** 列表刷新单飞句柄：相同查询参数并发调用共享同一个 Promise（WP1.4）。
+ *  用于消除「助手页最近恢复」与「历史侧栏挂载」对 list_conversations 的双重请求，
+ *  同时保留 loading 标志与返回值语义（`await refresh()` 仍会在真正加载完成后返回）。 */
+let listInFlight: { key: string; promise: Promise<void> } | null = null;
 
 export const useConversationStore = create<ConversationState>((set, get) => ({
   conversations: [],
@@ -75,13 +79,26 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   error: null,
 
   refresh: async (includeArchived = false, query) => {
-    set({ loading: true, error: null });
+    // 单飞：同一组查询参数正在加载时复用同一 Promise，避免重复请求。
+    // 注意不能用 `if (get().loading) return`：那会让「最近恢复」的 `await refresh()`
+    // 在列表仍为空时提前返回 → 恢复被跳过（A3-04/R10 回归）。
+    const key = `${includeArchived ? 1 : 0}|${query ?? ""}`;
+    if (listInFlight && listInFlight.key === key) return listInFlight.promise;
+    const promise = (async () => {
+      set({ loading: true, error: null });
+      try {
+        const conversations = await listConversations(includeArchived, query);
+        set({ conversations, loading: false });
+      } catch (error) {
+        logger.error("加载会话列表失败", { error: messageOf(error) });
+        set({ loading: false, error: messageOf(error) });
+      }
+    })();
+    listInFlight = { key, promise };
     try {
-      const conversations = await listConversations(includeArchived, query);
-      set({ conversations, loading: false });
-    } catch (error) {
-      logger.error("加载会话列表失败", { error: messageOf(error) });
-      set({ loading: false, error: messageOf(error) });
+      return await promise;
+    } finally {
+      if (listInFlight && listInFlight.promise === promise) listInFlight = null;
     }
   },
 

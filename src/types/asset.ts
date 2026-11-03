@@ -56,6 +56,8 @@ export interface Asset {
   latitude?: number | null;
   longitude?: number | null;
   // V19（W3-1）：评级/手动旋转/phash（可选 + 默认值兼容旧响应）
+  /** 收藏标记（0/1；后端 i64，前端按数字处理以保持与 rating 一致）。M-14b 补：此前类型里缺该字段。 */
+  favorite?: number;
   /** 评级 0–5（0 = 未评级） */
   rating?: number;
   /** 用户手动旋转（0/90/180/270；与 ffprobe 的 rotation 语义分离） */

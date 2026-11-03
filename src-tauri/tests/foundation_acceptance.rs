@@ -2005,6 +2005,8 @@ fn confirm_promotes_to_ai_reviewed() {
     let sug = f6_one_suggestion(&c);
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    // 先让 AI 真的产出建议项：无建议项时确认会被判定为「审核期新增」→ manual（M-07 语义）
+    ai::set_suggestion_tags(&c, sug.id, &tags_map).unwrap();
     ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
     assert_eq!(
         a3_row_state(&c, sug.asset_id, tag.id),
@@ -2054,6 +2056,8 @@ fn undo_batch_respects_review_state() {
         "scene".to_string(),
         vec!["AI标签甲".to_string(), "AI标签乙".to_string()],
     )]);
+    // 先让 AI 真的产出建议项：无建议项时确认会被判定为「审核期新增」→ manual（M-07 语义）
+    ai::set_suggestion_tags(&c, sug.id, &tags_map).unwrap();
     ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
     assert_eq!(a3_row_state(&c, sug.asset_id, t1.id), "ai_reviewed");
     // 用户对 t2 手工覆盖 → manual

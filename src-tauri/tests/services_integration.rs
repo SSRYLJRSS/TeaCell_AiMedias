@@ -5,11 +5,35 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use teacell_ai_media_manager_lib::db::assets::AssetFilter;
-use teacell_ai_media_manager_lib::db::{self, assets, export};
+use teacell_ai_media_manager_lib::db::{self, assets, export, export_items};
 use teacell_ai_media_manager_lib::error::AppResult;
 use teacell_ai_media_manager_lib::services::{export_local, importer, thumbnail::ThumbnailService};
 use teacell_ai_media_manager_lib::state::Database;
 
+/// A4-01 统一入口：只复制、逐文件结果。mode 参数已从服务层移除，
+/// 「移动到库外」在命令层被明确拒绝，不可能再走到这里。
+fn run_export(
+    dbm: &Arc<Database>,
+    task_id: i64,
+    ids: &[i64],
+    dest: &std::path::Path,
+    layout: &str,
+) -> AppResult<export_local::ExportSummary> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let dest_dir = dest.to_string_lossy().into_owned();
+    export_local::export_local(
+        dbm,
+        export_local::ExportRun {
+            task_id,
+            asset_ids: ids,
+            dest_dir: &dest_dir,
+            layout,
+            cancel: &cancel,
+        },
+        |_| {},
+        &mut |_| Ok(()),
+    )
+}
 fn default_import_options(temp_dir: &std::path::Path) -> AppResult<importer::ImportOptions> {
     let library_root = temp_dir.join("library");
     std::fs::create_dir_all(&library_root)?;
@@ -181,6 +205,8 @@ fn export_copy_integrity() -> AppResult<()> {
     let page = assets::list(&dbm.lock().unwrap(), &AssetFilter::default())?;
     let ids: Vec<i64> = page.items.iter().map(|a| a.id).collect();
     let dest = tmp.path().join("out");
+    let dest_string = dest.to_string_lossy().into_owned();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     let task = export::create_task(
         &dbm.lock().unwrap(),
         "local",
@@ -191,24 +217,41 @@ fn export_copy_integrity() -> AppResult<()> {
 
     export_local::export_local(
         &dbm,
-        task.id,
-        &ids,
-        &dest.to_string_lossy(),
-        "copy",
-        "flat",
-        &Arc::new(AtomicBool::new(false)),
+        export_local::ExportRun {
+            task_id: task.id,
+            asset_ids: &ids,
+            dest_dir: &dest_string,
+            layout: "flat",
+            cancel: &cancel_flag,
+        },
         |_| {},
+        &mut |_| Ok(()),
     )?;
 
     let t = export::get_task(&dbm.lock().unwrap(), task.id)?;
     assert_eq!(t.status, "done");
     assert_eq!(t.done, 5);
+    // A4-01：逐文件结果必须全部落成 copied，且源文件与库内记录不变
+    let items = export_items::items(&dbm.lock().unwrap(), task.id)?;
+    assert_eq!(items.len(), 5);
+    assert!(items
+        .iter()
+        .all(|item| item.state == export_items::STATE_COPIED));
     for a in &page.items {
         let copied = dest.join(&a.file_name);
         assert!(copied.exists());
         // 文件完整：尺寸一致
         let src_size = std::fs::metadata(&a.file_path)?.len();
         assert_eq!(std::fs::metadata(&copied)?.len(), src_size);
+        // 复制导出不移动：原件、原路径仍在
+        assert!(
+            std::path::Path::new(&a.file_path).exists(),
+            "复制导出后库内原文件必须仍在: {}",
+            a.file_path
+        );
+        let current = assets::get(&dbm.lock().unwrap(), a.id)?;
+        assert_eq!(current.file_path, a.file_path, "复制导出不得改动库内路径");
+        assert_eq!(current.file_name, a.file_name, "复制导出不得改动文件名");
     }
     Ok(())
 }
@@ -298,9 +341,9 @@ fn managed_library_import() -> AppResult<()> {
     Ok(())
 }
 
-// ⑥ B04：导出 move 模式后库记录 file_path/file_name 同步更新
+// ⑥ A4-01：导出统一为复制——库内原记录、原路径、原文件全部保留
 #[test]
-fn b04_export_move_updates_db_file_path() -> AppResult<()> {
+fn a4_01_export_keeps_library_record_and_source() -> AppResult<()> {
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
@@ -322,9 +365,9 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
     let id = page.items[0].id;
     let old_path = page.items[0].file_path.clone();
     let old_name = page.items[0].file_name.clone();
+    let old_tags: Vec<String> = page.items[0].tags.iter().map(|t| t.name.clone()).collect();
     assert!(std::path::Path::new(&old_path).exists(), "原文件应存在");
 
-    // 导出 move 到 dest 目录
     let dest = tmp.path().join("out");
     let task = export::create_task(
         &dbm.lock().unwrap(),
@@ -333,52 +376,36 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
         Some(&dest.to_string_lossy()),
         None,
     )?;
-    export_local::export_local(
-        &dbm,
-        task.id,
-        &[id],
-        &dest.to_string_lossy(),
-        "move",
-        "flat",
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    )?;
+    let summary = run_export(&dbm, task.id, &[id], &dest, "flat")?;
+    assert_eq!(summary.copied, 1);
+    assert_eq!(summary.failed, 0);
+    assert!(!summary.cancelled);
 
-    // 任务完成
-    let t = export::get_task(&dbm.lock().unwrap(), task.id)?;
-    assert_eq!(t.status, "done", "move 导出应成功: error={:?}", t.error);
-    assert_eq!(t.done, 1);
-
-    // B04：file_path 已更新指向新路径
+    // 目标已落盘
+    assert!(dest.join(&old_name).exists(), "目标文件应存在");
+    // 库内记录与原件原封不动
     let asset = assets::get(&dbm.lock().unwrap(), id)?;
-    assert_ne!(
-        asset.file_path, old_path,
-        "file_path 应已更新（旧={}, 新={})",
-        old_path, asset.file_path
+    assert_eq!(asset.file_path, old_path, "复制导出不得改动库内路径");
+    assert_eq!(asset.file_name, old_name, "复制导出不得改动文件名");
+    assert_eq!(
+        asset
+            .tags
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>(),
+        old_tags,
+        "复制导出不得改动标签"
     );
     assert!(
-        asset.file_path.contains("out"),
-        "file_path 应指向导出目录: {}",
-        asset.file_path
-    );
-    assert_eq!(asset.file_name, old_name, "无同名冲突时 file_name 应不变");
-    // 目标文件存在
-    assert!(
-        std::path::Path::new(&asset.file_path).exists(),
-        "目标文件应存在: {}",
-        asset.file_path
-    );
-    // 源文件已被移动（不存在）
-    assert!(
-        !std::path::Path::new(&old_path).exists(),
-        "源文件应已被移动（不存在）"
+        std::path::Path::new(&old_path).exists(),
+        "复制导出后源文件必须仍在: {old_path}"
     );
     Ok(())
 }
 
-// ⑦ B04：导出 move 到同名冲突目录 → file_name 加 (1) 后缀 + 库记录同步
+// ⑦ A4-01：目标目录已有同名文件 → 新目标自动加 (1)，库内记录不变
 #[test]
-fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
+fn a4_01_export_same_name_suffix_keeps_record() -> AppResult<()> {
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
@@ -399,6 +426,7 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
     let page = assets::list(&dbm.lock().unwrap(), &AssetFilter::default())?;
     let id = page.items[0].id;
     let orig_name = page.items[0].file_name.clone(); // photo000.jpg
+    let orig_path = page.items[0].file_path.clone();
 
     // 预置同名文件，迫使 unique_dest 加 (1) 后缀
     let dest = tmp.path().join("out");
@@ -412,22 +440,10 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
         Some(&dest.to_string_lossy()),
         None,
     )?;
-    export_local::export_local(
-        &dbm,
-        task.id,
-        &[id],
-        &dest.to_string_lossy(),
-        "move",
-        "flat",
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    )?;
+    let summary = run_export(&dbm, task.id, &[id], &dest, "flat")?;
+    assert_eq!(summary.copied, 1);
 
-    let t = export::get_task(&dbm.lock().unwrap(), task.id)?;
-    assert_eq!(t.status, "done", "move 应成功: {:?}", t.error);
-
-    // B04：file_name 应带 (1) 后缀
-    let asset = assets::get(&dbm.lock().unwrap(), id)?;
+    // 原有同名目标未被覆盖，新文件带 (1) 后缀
     let stem = std::path::Path::new(&orig_name)
         .file_stem()
         .unwrap()
@@ -437,15 +453,11 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
         .unwrap()
         .to_string_lossy();
     let expected = format!("{stem}(1).{ext}");
-    assert_eq!(
-        asset.file_name, expected,
-        "file_name 应加 (1) 后缀: 期望={expected}, 实际={}",
-        asset.file_name
-    );
-    assert!(
-        std::path::Path::new(&asset.file_path).exists(),
-        "新路径文件应存在"
-    );
+    assert!(dest.join(&expected).exists(), "应写到 {expected}");
+    // 库内记录仍指向原文件
+    let asset = assets::get(&dbm.lock().unwrap(), id)?;
+    assert_eq!(asset.file_name, orig_name, "库内文件名不得被导出改写");
+    assert_eq!(asset.file_path, orig_path, "库内路径不得被导出改写");
     Ok(())
 }
 
@@ -491,7 +503,7 @@ fn b01_import_cancel_zero_imported() -> AppResult<()> {
     Ok(())
 }
 
-// ⑨ B06b：导出同名冲突超限报错（unique_dest 返回 Err 而非覆盖）
+// ⑨ B06b / A4-01：导出同名冲突超限 → 逐文件失败（不覆盖、不静默），任务落 failed
 #[test]
 fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
     let tmp = tempfile::tempdir()?;
@@ -539,35 +551,37 @@ fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
         Some(&dest.to_string_lossy()),
         None,
     )?;
-    // 导出 copy 到同名耗尽的目录 → unique_dest 应返回 Err
-    let r = export_local::export_local(
-        &dbm,
-        task.id,
-        &[id],
-        &dest.to_string_lossy(),
-        "copy",
-        "flat",
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    );
+    // A4-01：单文件失败不再中断整个任务，而是落一条逐文件失败结果
+    let summary = run_export(&dbm, task.id, &[id], &dest, "flat")?;
+    assert_eq!(summary.copied, 0, "不应有任何文件被写出");
+    assert_eq!(summary.failed, 1);
 
-    // B06b 核心验证：应返回 Err（不静默覆盖已有文件）
-    assert!(r.is_err(), "同名冲突耗尽应报错而非覆盖: {:?}", r);
-    if let Err(e) = &r {
-        let msg = format!("{e}");
-        assert!(
-            msg.contains("同名文件过多"),
-            "错误信息应含'同名文件过多': {msg}"
-        );
-    }
-
-    // BUG-QA-1 修复验证：unique_dest 失败时 r=Err(e) 被 if let Err(e) = r 捕获，
-    // finish_task("failed") 正确执行，任务状态应为 "failed"
-    let t = export::get_task(&dbm.lock().unwrap(), task.id)?;
+    let items = export_items::items(&dbm.lock().unwrap(), task.id)?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].state, export_items::STATE_FAILED);
     assert_eq!(
-        t.status, "failed",
-        "unique_dest 失败应触发 finish_task(\"failed\")，任务状态应为 failed"
+        items[0].error_code.as_deref(),
+        Some(export_items::CODE_TARGET_EXISTS),
+        "同名耗尽应归因为目标已存在"
     );
+    let message = items[0].error_message.clone().unwrap_or_default();
+    assert!(
+        message.contains("同名文件过多"),
+        "错误信息应含'同名文件过多': {message}"
+    );
+    // 原有同名占位未被覆盖，库内记录不变
+    assert_eq!(
+        std::fs::metadata(dest.join(&orig_name))?.len(),
+        0,
+        "占位文件不得被覆盖写入"
+    );
+    let asset = assets::get(&dbm.lock().unwrap(), id)?;
+    assert_eq!(asset.file_name, orig_name);
+    assert_eq!(asset.file_path, page.items[0].file_path);
+
+    // 全部失败 → 任务状态 failed（不是 done、也不是静默成功）
+    let t = export::get_task(&dbm.lock().unwrap(), task.id)?;
+    assert_eq!(t.status, "failed");
     Ok(())
 }
 

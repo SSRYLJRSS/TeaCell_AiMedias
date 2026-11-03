@@ -6,7 +6,7 @@
  *  - 加载失败后点击重试会再次调用 load，成功后进入表单。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -17,7 +17,6 @@ import { exportDiagnostics, getSettings, openAuthorPage, openFeedbackPage, openH
 import { rescanAssetMetadata } from "@/api/assets";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import type { Settings } from "@/types/settings";
-import type { TagFacet } from "@/types/tag";
 
 // ── mock 后端/API 层 ──
 const assetMocks = vi.hoisted(() => ({
@@ -135,6 +134,71 @@ vi.mock("@/api/legacyAssets", () => ({
   cancelLegacyResolution: vi.fn(),
   confirmLegacyResolution: vi.fn(),
   reopenUnlinkedLegacyAsset: vi.fn(),
+  prepareLegacyUnlinkBatch: vi.fn(),
+  prepareLegacyCopyBackBatch: vi.fn(),
+  confirmLegacyResolutionsBatch: vi.fn(),
+  // 下面三个是纯函数，测试要断言真实文案，因此照抄实现而不是换成 mock。
+  batchEntriesNeedingAttention: (report: { entries: { state: string }[] }) =>
+    report.entries.filter((e) => e.state !== "prepared"),
+  batchHeadline: (report: { entries: unknown[] }) => `共 ${report.entries.length} 项`,
+  legacyOutcomeLabel: (state: string) => state,
+}));
+// A5-01：「存储与维护」末尾挂载本机外部接入（MCP）面板，它首载就调 mcpBridgeStatus。
+// 这里只替 5 个命令，保留 accessLabel / connectionStatusLabel 的真实实现。
+vi.mock("@/api/mcp", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  mcpBridgeStatus: vi.fn().mockResolvedValue({
+    enabled: false,
+    running: false,
+    platformSupported: true,
+    instance: null,
+    pipeName: null,
+    endpointPath: null,
+    sessionCount: 0,
+    maxSessions: 8,
+    connections: [],
+    publishable: [],
+  }),
+  setMcpBridgeEnabled: vi.fn(),
+  createMcpPairing: vi.fn(),
+  updateMcpPairing: vi.fn(),
+  revokeMcpPairing: vi.fn(),
+}));
+vi.mock("@/api/libraryMaintenance", () => ({
+  MAINTENANCE_EVENT: "library-maintenance-changed",
+  MIGRATION_PHASE_TEXT: {
+    preparing: "正在核对清单",
+    copying: "正在复制并校验",
+    switched: "已切换总仓位置，正在重建索引",
+    cleaning: "已切换总仓位置，正在收尾",
+    completed: "已完成",
+    failed: "已中止（总仓位置未改变）",
+    aborted: "已取消（总仓位置未改变）",
+  },
+  MIGRATION_ITEM_ERROR_TEXT: {},
+  migrationItemErrorLabel: () => "",
+  failedMigrationItems: () => [],
+  isResumableMigration: () => false,
+  preflightLibraryMigration: vi.fn(),
+  startLibraryMigration: vi.fn(),
+  cancelLibraryMigration: vi.fn().mockResolvedValue(true),
+  libraryMaintenanceStatus: vi.fn().mockResolvedValue({
+    active: false,
+    reason: null,
+    migration: null,
+  }),
+  libraryTaskImpact: vi.fn().mockResolvedValue({
+    runningOperations: 0,
+    runningByCapability: [],
+    pendingAiBatches: 0,
+    importRunning: false,
+    refillRunning: false,
+    runningExports: 0,
+    blocking: false,
+    messages: ["迁移期间入库、复制导出、移动、删除/清空回收站、AI 打标和设置保存都会被暂停；浏览、搜索与旧会话仍然可用。"],
+  }),
+  libraryMigrationReport: vi.fn(),
+  resumeLibraryMigration: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn().mockResolvedValue([
@@ -151,6 +215,11 @@ vi.mock("@/api/connections", () => ({
     message: null,
   }),
   setAiUsageBinding: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/api/authorization", () => ({
+  listDirectoryGrants: vi.fn().mockResolvedValue([]),
+  revokeDirectoryGrant: vi.fn().mockResolvedValue(undefined),
+  revokeAllDirectoryGrants: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
@@ -186,6 +255,15 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
       hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
       colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
       kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
+    },
+    navigation: {
+      shortcuts: [
+        { id: "import", visible: true },
+        { id: "library", visible: true },
+        { id: "ai", visible: true },
+        { id: "treasure", visible: true },
+      ],
+      settingsPinned: false,
     },
     ...over,
   };
@@ -323,6 +401,36 @@ describe("SettingsPage §6.1 信息架构", () => {
     await waitFor(() => expect(openHelpPage).toHaveBeenCalledTimes(1));
   });
 
+  it("A3-06 素材库与入库含「已记住的目录授权」组，撤销后下一次请求会重新询问", async () => {
+    const authorization = await import("@/api/authorization");
+    vi.mocked(authorization.listDirectoryGrants).mockResolvedValueOnce([
+      {
+        grantRef: "grant_import_aaaaaaaaaaaaaaaa",
+        displayName: "下载素材",
+        displayPath: "D:\\素材\\下载",
+        purpose: "import_source",
+        recursive: true,
+        remembered: true,
+        available: true,
+        access: { read: true, write: false, export: false },
+      },
+    ]);
+    vi.mocked(authorization.revokeDirectoryGrant).mockResolvedValueOnce(undefined);
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+
+    expect(await screen.findByText("已记住的目录授权")).toBeInTheDocument();
+    expect(await screen.findByText("下载素材")).toBeInTheDocument();
+    // 导入来源的记住授权只有读取；不能让人误以为带写入或外发许可。
+    expect(screen.getByText(/记住读取不等于入库、写入或外发给 AI 服务的许可/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+    await waitFor(() =>
+      expect(authorization.revokeDirectoryGrant).toHaveBeenCalledWith("grant_import_aaaaaaaaaaaaaaaa"),
+    );
+    expect((await screen.findAllByRole("status")).some((node) => node.textContent?.includes("下一次请求会重新询问"))).toBe(true);
+  });
+
   it("点击「AI 与模型」先进入服务管理，子页顺序为服务管理、超级搜索、自动打标", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
@@ -352,6 +460,29 @@ describe("SettingsPage §6.1 信息架构", () => {
     ).toBe(3);
   });
 
+  // A3-09（PRD 第 8 节）：悬浮助手只做应用内浮层；开关只控制入口显示。
+  it("悬浮助手开关默认开启，关掉只隐藏入口而不取消任务", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("外观与浏览"));
+    await waitFor(() => expect(screen.getByText("悬浮助手")).toBeInTheDocument());
+
+    // 旧设置没有该字段时按「开启」处理（必须是 !== false，而不是 === true）。
+    const toggle = fieldSwitch("显示悬浮助手");
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(/关掉只隐藏入口，正在执行的任务不受影响/)).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    fireEvent.click(toggle);
+    expect(fieldSwitch("显示悬浮助手")).toHaveAttribute("aria-checked", "false");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(vi.mocked(saveSettings)).toHaveBeenCalledWith(
+      expect.objectContaining({ floatingAssistant: false }),
+    );
+  });
   // FB2-08（FX-07）+ FB3-10 + FB4-03：色条设置区块（「入库网格显示」已隐藏——永久 disabled 的噪音控件不保留）
   it("色条区块：切「显示主色色条」Toggle 触发即时预览；总开关关闭后位置/样式行不渲染", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
@@ -601,6 +732,25 @@ describe("SettingsPage 加载与 Hook 安全", () => {
 
     await waitFor(() => expect(rescanImageDimensions).toHaveBeenCalledWith([], "missing"));
     await waitFor(() => expect(screen.getByText(/分辨率更新完成：总数 3，成功 3/)).toBeInTheDocument());
+  });
+
+  it("「总仓位置」分组是迁仓的唯一入口：点按钮打开向导，且页面上没有可提交的路径输入框", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("存储与维护"));
+    // 卡片禁止「用文本框改路径直接提交」：入口只能是一个向导按钮。
+    const entry = await screen.findByRole("button", { name: "打开向导…" });
+    const hint = screen.getByText(/源目录在核验通过后仍然完整保留/);
+    expect(hint).toBeInTheDocument();
+
+    fireEvent.click(entry);
+    const dialog = await screen.findByRole("dialog", { name: "总仓位置" });
+    // 向导里两种操作都必须能选到，且目标位置是只读展示而不是输入框。
+    expect(within(dialog).getByLabelText(/让软件迁移总仓/)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/我已经搬好了，重新定位/)).toBeInTheDocument();
+    expect(within(dialog).queryByRole("textbox")).not.toBeInTheDocument();
   });
 });
 
@@ -908,54 +1058,11 @@ describe("存储与维护 · 重置数据", () => {
 });
 
 // W3：旧「aiFacetConfigs 草稿」路径已删（V20 合表后分面 AI 语义在 tag_facets.input_mode，
-// 由 W4 的分面管理面板直接读写库）。此处的两条旧回归测试随通道一起移除。
-describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：勾选被静默丢弃）", () => {
-  const activeFacet: TagFacet = {
-    key: "purpose",
-    displayName: "用途",
-    description: "",
-    inputMode: "ai_and_manual",
-    selectionMode: "multi",
-    maxItems: 3,
-    sortOrder: 1,
-    isSystem: true,
-    status: "active",
-    appliesTo: "all",
-    createdAt: 1,
-    updatedAt: 1,
-  };
-
-  async function openTagsRoute() {
-    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
-    render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument());
-    fireEvent.click(screen.getAllByText("标签与分类").at(-1)!);
-    fireEvent.click(await screen.findByText("用途"));
-  }
-
-  it("无条目分面的「参与 AI」如实显示为关；勾选后补建条目", async () => {
-    const { listAllTagFacets } = await import("@/api/tags");
-    vi.mocked(listAllTagFacets).mockResolvedValue([activeFacet]);
-    await openTagsRoute();
-
-    // 无条目 = AI 本就不产出该分面（build_prompt_context 只遍历 aiFacetConfigs），如实显示为关
-    const checkbox = await screen.findByRole("checkbox", { name: /参与 AI 打标与搜索/ });
-    expect(checkbox).not.toBeChecked();
-
-    fireEvent.click(checkbox);
-    expect(checkbox).toBeChecked();
-    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
-  });
-
-  it("无条目分面输入「给 AI 的识别规则」也会补建条目（不再静默丢弃）", async () => {
-    const { listAllTagFacets } = await import("@/api/tags");
-    vi.mocked(listAllTagFacets).mockResolvedValue([activeFacet]);
-    await openTagsRoute();
-
-    fireEvent.change(await screen.findByLabelText("给 AI 的识别规则"), { target: { value: "只写稳定用途" } });
-    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
-  });
-});
+// 由 W4 的分面管理面板直接读写库）。原此处的两条回归用例随通道一起删除，而不是继续 skip：
+// 它们断言的「参与 AI 打标与搜索」勾选框与「给 AI 的识别规则」输入框在 SettingsPage 里已不存在
+// （旧的 aiFacetConfigs 通道在 W3/V20 合表时移除，见 normalizeSettings 的 F8 迁移），
+// 留着 skip 只会让 2 项永不执行的死测试继续算进「前端 2 项 skip」。同一行为现在由
+// src/components/settings/FacetManagePanel.test.tsx 的 W4/V24 用例覆盖（直接读写 tag_facets）。
 
 // ── W7 真机复现：切换到「存储与维护」路由不抛 hooks 错误 ──
 describe("存储与维护路由（W5c 备份恢复 + W5d phash 行）", () => {

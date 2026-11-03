@@ -65,30 +65,7 @@ pub fn confirm(
     if view.unsupported_count > 0 {
         return Err(AppError::invalid_arg("请先移除不可处理文件并重新检查"));
     }
-    let draft = plan_service::PlanDraft {
-        capability: CapabilityId::ImportsSubmit,
-        scope: PlanScopeSummary {
-            scope_ref: import_ref.clone(),
-            source_ref: view.source_ref,
-            selection_ref: None,
-            target_ref: None,
-            service_ref: None,
-            service_revision: None,
-            model: None,
-        },
-        item_count: view.item_count,
-        summary: serde_json::from_value(serde_json::json!("执行已确认的导入计划"))
-            .map_err(|_| AppError::internal("导入摘要构造失败"))?,
-        details_json: None,
-        budget: BudgetSummary {
-            max_requests: 0,
-            max_tokens: 0,
-            max_seconds: 3600,
-            max_items: view.item_count,
-            monetary_limit: None,
-        },
-        ttl_seconds: 0,
-    };
+    let draft = submit_draft(&view)?;
     let preview = plan_service::prepare_plan(db, caller, draft.clone())?;
     plan_service::approve_plan(db, caller, &preview.plan_id, &preview.review_ref)?;
     plan_service::submit_plan_with_effect(
@@ -108,6 +85,49 @@ pub fn confirm(
             )
         },
     )
+}
+
+/// Build the `imports.submit` plan draft for a prepared import plan.
+///
+/// This is the single place that decides what an import submission plan looks
+/// like. `plans::submit_plan_with_effect` recomputes `plan_hash` from the draft
+/// passed by the caller and invalidates the stored plan when the two differ, so
+/// any second construction site would drift into `PlanChanged` as soon as one of
+/// them changes. `confirm` builds it here today; the protocol-level
+/// `imports.prepare` adapter (see `docs/contracts/agent-v1.md` §3.4) must reuse
+/// this function instead of assembling its own.
+///
+/// `ImportPlanView` itself is the GUI workbench checklist and is deliberately
+/// not the `PlanPreview` that `imports.prepare` declares: it carries no
+/// `reviewRef`, because a checklist nobody is asked to approve has nothing to
+/// review. The reviewable preview is this draft handed to `plans::prepare_plan`.
+pub(crate) fn submit_draft(
+    view: &import_prepare::ImportPlanView,
+) -> AppResult<plan_service::PlanDraft> {
+    Ok(plan_service::PlanDraft {
+        capability: CapabilityId::ImportsSubmit,
+        scope: PlanScopeSummary {
+            scope_ref: view.plan_ref.clone(),
+            source_ref: view.source_ref.clone(),
+            selection_ref: None,
+            target_ref: None,
+            service_ref: None,
+            service_revision: None,
+            model: None,
+        },
+        item_count: view.item_count,
+        summary: serde_json::from_value(serde_json::json!("执行已确认的导入计划"))
+            .map_err(|_| AppError::internal("导入摘要构造失败"))?,
+        details_json: None,
+        budget: BudgetSummary {
+            max_requests: 0,
+            max_tokens: 0,
+            max_seconds: 3600,
+            max_items: view.item_count,
+            monetary_limit: None,
+        },
+        ttl_seconds: 0,
+    })
 }
 
 pub fn import_ref(db: &Database, operation: &ResourceRef) -> AppResult<ResourceRef> {
@@ -130,31 +150,13 @@ pub fn import_ref(db: &Database, operation: &ResourceRef) -> AppResult<ResourceR
     ResourceRef::from_trusted(plan.scope_ref).map_err(AppError::from)
 }
 
-/// Recover the trusted GUI execution context bound at acceptance (or explicit
-/// resume), never from IPC arguments. This does not renew grants or approvals.
-pub fn execution_context(db: &Database, operation: &ResourceRef) -> AppResult<CallerContext> {
-    let conn = db.lock()?;
-    let op = plans::operation(&conn, operation.as_str())?
-        .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
-    let plan = plans::plan(&conn, &op.plan_id)?
-        .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
-    if op.capability != "imports.submit" || op.principal_id != "principal_gui_host" {
-        return Err(AppError::from(AgentErrorCode::UnsupportedCapability));
-    }
-    Ok(CallerContext {
-        kind: crate::contracts::agent::CallerKind::Gui,
-        principal_id: ResourceRef::from_trusted(op.principal_id)?,
-        session_id: plan.session_id.map(ResourceRef::from_trusted).transpose()?,
-        instance_id: ResourceRef::from_trusted(plan.instance_id)?,
-        request_id: ResourceRef::generated("request"),
-        grant_epoch: ResourceRef::from_trusted(plan.grant_epoch)?,
-        library: crate::contracts::agent::LibraryScope {
-            library_id: ResourceRef::from_trusted(op.library_id)?,
-            library_epoch: ResourceRef::from_trusted(op.library_epoch)?,
-        },
-        origin_chain: Vec::new(),
-    })
-}
+// Execution context reconstruction used to live here as `execution_context`,
+// hard-coded to `principal_gui_host`. It is now `operation_dispatch::execution_caller`,
+// which rebuilds the same principal/session/instance/grantEpoch fields from the
+// persisted plan and operation rows but derives the caller kind from
+// `plan.origin_kind` instead of asserting the GUI principal. Keeping a second,
+// narrower copy here is what let a Pi-created import operation be accepted and
+// then never drained.
 
 #[cfg(test)]
 mod tests {
@@ -266,6 +268,48 @@ mod tests {
             "LIBRARY_OFFLINE"
         );
     }
+    /// The submitted plan row must be exactly what `submit_draft` produces.
+    ///
+    /// `plans::submit_plan_with_effect` recomputes `plan_hash` from the caller's
+    /// draft and invalidates the stored plan on any difference, so this asserts
+    /// the invariant that keeps `confirm` and the future protocol-level
+    /// `imports.prepare` adapter from drifting apart: both must build their
+    /// draft through `submit_draft`, and what ends up persisted must match it.
+    #[test]
+    fn the_submitted_plan_is_exactly_the_draft_submit_draft_builds() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let file = source.path().join("ok.jpg");
+        image::RgbImage::new(8, 8).save(&file).unwrap();
+        let (db, caller) = fixture(root.path());
+        let plan = prepare(&db, &caller, &file);
+        confirm(&db, &caller, &plan, &ResourceRef::generated("idempotency")).unwrap();
+
+        let view = import_prepare::get_import_plan(&db, &caller, &plan).unwrap();
+        let draft = submit_draft(&view).unwrap();
+        let conn = db.lock().unwrap();
+        // Exactly one reviewed plan exists; its scope points back at the
+        // prepared import plan.
+        let plan_id: String = conn
+            .query_row(
+                "SELECT plan_id FROM plans WHERE scope_ref = ?1",
+                [plan.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let row = plans::plan(&conn, &plan_id).unwrap().unwrap();
+        assert_eq!(row.scope_ref, draft.scope.scope_ref.as_str());
+        assert_eq!(
+            row.source_ref.as_deref(),
+            draft.scope.source_ref.as_ref().map(ResourceRef::as_str)
+        );
+        assert_eq!(row.item_count, i64::from(draft.item_count));
+        assert_eq!(row.summary, draft.summary.as_str());
+        assert_eq!(row.max_seconds, draft.budget.max_seconds as i64);
+        assert_eq!(row.max_items, i64::from(draft.budget.max_items));
+        assert_eq!(row.capability, "imports.submit");
+    }
+
     #[test]
     fn concurrent_confirmations_accept_once() {
         let root = tempfile::tempdir().unwrap();

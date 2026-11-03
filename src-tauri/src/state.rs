@@ -12,6 +12,7 @@ use rusqlite::Connection;
 
 use crate::db::schema_features::SchemaFeatureStatus;
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::library_migration::LibraryMaintenanceGate;
 use crate::services::ollama_runtime::OllamaRuntimeState;
 use crate::services::operations::OperationQueue;
 
@@ -166,6 +167,16 @@ pub struct AppState {
     pub schema_features: Arc<Mutex<Vec<SchemaFeatureStatus>>>,
     /// A1-05：长业务任务单活动槽；查询、浏览和聊天不经过该队列。
     pub operation_queue: Arc<OperationQueue>,
+    /// A4-05：总仓维护门。迁仓/重新定位期间置位，写命令在入口拒绝，
+    /// 读与旧会话继续可用（与 `Database::blocked` 的「全部暂停」不同）。
+    pub library_maintenance: Arc<LibraryMaintenanceGate>,
+    /// A4-05：迁仓取消标志注册表（目标根路径 → flag）。
+    /// 用目标路径作键而不是 run_id：预检阶段的 run_id 由服务层生成，用户在点「开始」前
+    /// 拿不到它，而这时最需要能反悔。
+    pub library_migration_cancel: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// A5-01：本机外部接入（MCP）的运行态。端点文件与监听线程都由它持有，
+    /// 关闭时删端点文件并断开会话（契约 §8）。
+    pub mcp_bridge: Arc<crate::services::mcp_bridge::McpBridge>,
 }
 
 impl AppState {
@@ -188,6 +199,9 @@ impl AppState {
             ollama_runtime: Arc::new(Mutex::new(OllamaRuntimeState::new())),
             schema_features: Arc::new(Mutex::new(Vec::new())),
             operation_queue: Arc::new(OperationQueue::default()),
+            library_maintenance: Arc::new(LibraryMaintenanceGate::new()),
+            library_migration_cancel: Arc::new(Mutex::new(HashMap::new())),
+            mcp_bridge: Arc::new(crate::services::mcp_bridge::McpBridge::new()),
         }
     }
 

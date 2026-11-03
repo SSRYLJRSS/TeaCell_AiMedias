@@ -466,6 +466,92 @@ pub fn normalize_appearance(s: &mut Settings) {
     }
 }
 
+/// A3-05：底栏内置快捷项的唯一受控目录（PRD 第 8 节）。
+///
+/// 只允许这些稳定 id；不接受任意 URL、命令、路径或可执行文件标识。
+/// 前端 `src/types/navigation.ts` 只提供 id → 文案/图标的展示映射，
+/// 「哪些 id 合法」这一事实以本常量为准。
+pub const NAVIGATION_SHORTCUT_IDS: [&str; 4] = ["import", "library", "ai", "treasure"];
+
+/// A3-05：单个内置快捷项的显示配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationShortcut {
+    /// 内置功能 id，必须属于 NAVIGATION_SHORTCUT_IDS
+    #[serde(default)]
+    pub id: String,
+    /// 是否在底栏显示；隐藏不删除功能，入口仍可从设置页与标题栏到达
+    #[serde(default = "default_true")]
+    pub visible: bool,
+}
+
+/// A3-05：底栏导航配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Navigation {
+    /// 用户排序后的内置快捷项；空数组表示用户主动隐藏了全部入口
+    #[serde(default = "default_navigation_shortcuts")]
+    pub shortcuts: Vec<NavigationShortcut>,
+    /// 把「设置」固定到底栏（PRD 第 8 节）
+    #[serde(default)]
+    pub settings_pinned: bool,
+}
+
+pub fn default_navigation_shortcuts() -> Vec<NavigationShortcut> {
+    NAVIGATION_SHORTCUT_IDS
+        .iter()
+        .map(|id| NavigationShortcut {
+            id: (*id).to_string(),
+            visible: true,
+        })
+        .collect()
+}
+
+impl Default for Navigation {
+    fn default() -> Self {
+        Self {
+            shortcuts: default_navigation_shortcuts(),
+            settings_pinned: false,
+        }
+    }
+}
+
+/// 读取侧：剔除未知旧 id、去重、限制数量；全部为未知 id 时回退默认目录。
+///
+/// 显式保存的空列表表示「用户主动隐藏了全部入口」，保持为空，不擅自恢复默认，
+/// 否则用户的隐藏意图会在下次启动时被静默撤销。
+pub fn normalize_navigation(s: &mut Settings) {
+    let original = std::mem::take(&mut s.navigation.shortcuts);
+    let had_entries = !original.is_empty();
+    let mut seen: Vec<&'static str> = Vec::with_capacity(NAVIGATION_SHORTCUT_IDS.len());
+    let mut normalized = Vec::with_capacity(original.len().min(NAVIGATION_SHORTCUT_IDS.len()));
+    for shortcut in original {
+        let Some(known) = NAVIGATION_SHORTCUT_IDS
+            .iter()
+            .find(|id| **id == shortcut.id.as_str())
+        else {
+            continue; // 未知旧 id：无法映射到受控功能，安全丢弃
+        };
+        if seen.contains(known) {
+            continue; // 重复 id：保留首次出现的位置
+        }
+        seen.push(known);
+        normalized.push(NavigationShortcut {
+            id: (*known).to_string(),
+            visible: shortcut.visible,
+        });
+        if normalized.len() == NAVIGATION_SHORTCUT_IDS.len() {
+            break;
+        }
+    }
+    s.navigation.shortcuts = if had_entries && normalized.is_empty() {
+        // 全部条目都无法映射：回落默认目录，避免底栏凭空消失
+        default_navigation_shortcuts()
+    } else {
+        normalized
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -505,6 +591,27 @@ pub struct Settings {
     /// 首次启动教程提示是否已处理。新配置及旧设置文件缺字段时均默认未处理。
     #[serde(default = "default_tutorial_prompt_handled")]
     pub tutorial_prompt_handled: bool,
+    /// A3-05：底栏内置快捷项与设置固定项
+    #[serde(default)]
+    pub navigation: Navigation,
+    /// A3-09：是否显示应用内悬浮助手入口。
+    ///
+    /// 默认开启。关掉只隐藏浮层入口，不取消任何已在执行的任务，
+    /// 也不影响完整助手页；重新打开时继续原来最近的对话。
+    #[serde(default = "default_true")]
+    pub floating_assistant: bool,
+    /// A5-01：是否开放本机 MCP 接入端点。
+    ///
+    /// 默认关闭（协议 §8）。关闭时不创建端点文件、不监听管道，
+    /// 也不影响已经完成的计划和任务；外部客户端只会得到 `HOST_UNAVAILABLE`。
+    #[serde(default)]
+    pub mcp_bridge_enabled: bool,
+    /// Agent 外发使用的显式代理；空串表示直连。
+    ///
+    /// 只接受 `http(s)://host:port`，不接受用户名密码、query、fragment，
+    /// 也不读取系统/环境变量代理（见 `validate_agent_proxy_url`）。
+    #[serde(default)]
+    pub agent_model_proxy: String,
 }
 
 fn default_tutorial_prompt_handled() -> bool {
@@ -539,6 +646,10 @@ impl Default for Settings {
             model_download_proxy: String::new(),
             appearance: Appearance::default(),
             tutorial_prompt_handled: false,
+            navigation: Navigation::default(),
+            floating_assistant: true,
+            mcp_bridge_enabled: false,
+            agent_model_proxy: String::new(),
         }
     }
 }
@@ -649,6 +760,16 @@ pub fn ensure_color_facet_config(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// 读取侧：代理地址只做保守清洗（去掉首尾空白、结尾斜杠）。
+///
+/// 严格校验（scheme 必须是 http(s)、不得含用户名密码/query/fragment）留在
+/// `services::agent_runtime` 一侧：`db` 不依赖 `services`，而启动装配与
+/// `set_agent_model_network` 都能拒绝非法值并安全退回“直连/关闭”。
+pub fn normalize_agent_model_proxy(s: &mut Settings) {
+    let trimmed = s.agent_model_proxy.trim().trim_end_matches('/').to_string();
+    s.agent_model_proxy = trimmed;
+}
+
 pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
     let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
     let mut rows = stmt.query([KEY])?;
@@ -660,7 +781,9 @@ pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
         normalize_ai_facet_defaults(&mut s);
         s.ai.normalize();
         normalize_appearance(&mut s);
+        normalize_navigation(&mut s);
         normalize_log_level(&mut s);
+        normalize_agent_model_proxy(&mut s);
         if let Ok(Some(library)) = super::libraries::current(conn) {
             if !library.root_path.trim().is_empty() {
                 s.library_root = library.root_path;
@@ -969,6 +1092,19 @@ mod tests {
     }
 
     #[test]
+    fn floating_assistant_defaults_on_and_survives_round_trip() {
+        // A3-09：悬浮助手默认开启，旧设置文件缺字段时也按开启处理；
+        // 关掉只影响入口显示，不能顺带清空任何任务状态。
+        assert!(Settings::default().floating_assistant);
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(legacy.floating_assistant);
+        let disabled: Settings = serde_json::from_str(r#"{"floatingAssistant":false}"#).unwrap();
+        assert!(!disabled.floating_assistant);
+        let encoded = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(encoded.contains("\"floatingAssistant\":true"));
+    }
+
+    #[test]
     fn reinstall_invites_tutorial_once_and_preserves_existing_settings() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -1073,6 +1209,78 @@ mod tests {
             back.appearance.hover_preview.enabled,
             s.appearance.hover_preview.enabled
         );
+    }
+
+    #[test]
+    fn navigation_defaults_to_controlled_builtin_catalog() {
+        let s = Settings::default();
+        let ids: Vec<&str> = s
+            .navigation
+            .shortcuts
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["import", "library", "ai", "treasure"]);
+        assert!(s.navigation.shortcuts.iter().all(|c| c.visible));
+        assert!(!s.navigation.settings_pinned);
+    }
+
+    #[test]
+    fn navigation_drops_unknown_ids_and_duplicates_but_keeps_order() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"navigation":{"shortcuts":[
+                {"id":"treasure","visible":false},
+                {"id":"https://evil.example/x","visible":true},
+                {"id":"import","visible":true},
+                {"id":"import","visible":false},
+                {"id":"library","visible":true}
+            ],"settingsPinned":true}}"#,
+        )
+        .unwrap();
+        normalize_navigation(&mut s);
+        let pairs: Vec<(&str, bool)> = s
+            .navigation
+            .shortcuts
+            .iter()
+            .map(|c| (c.id.as_str(), c.visible))
+            .collect();
+        // 未知 id（含 URL）被丢弃；重复 import 保留首次出现的 visible=true
+        assert_eq!(
+            pairs,
+            vec![("treasure", false), ("import", true), ("library", true)]
+        );
+        assert!(s.navigation.settings_pinned);
+    }
+
+    #[test]
+    fn navigation_preserves_deliberately_empty_catalog() {
+        // 用户隐藏全部入口：保持为空，不在读取侧擅自恢复默认
+        let mut s: Settings = serde_json::from_str(r#"{"navigation":{"shortcuts":[]}}"#).unwrap();
+        normalize_navigation(&mut s);
+        assert!(s.navigation.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn navigation_falls_back_to_defaults_when_every_id_is_unknown() {
+        // 全部条目都无法映射（如来自未来版本或损坏配置）：回落默认目录，底栏不会凭空消失
+        let mut s: Settings = serde_json::from_str(
+            r#"{"navigation":{"shortcuts":[{"id":"plugin:future","visible":true}]}}"#,
+        )
+        .unwrap();
+        normalize_navigation(&mut s);
+        assert_eq!(s.navigation.shortcuts.len(), 4);
+    }
+
+    #[test]
+    fn navigation_roundtrips_through_json() {
+        let mut s = Settings::default();
+        s.navigation.settings_pinned = true;
+        s.navigation.shortcuts[0].visible = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(back.navigation.settings_pinned);
+        assert!(!back.navigation.shortcuts[0].visible);
+        assert_eq!(back.navigation.shortcuts.len(), 4);
     }
 
     #[test]

@@ -29,6 +29,12 @@ pub struct AiConnection {
     pub max_concurrency: i64,
     pub requests_per_minute: i64,
     pub requests_per_hour: i64,
+    /// 模型真实上下文窗口（tokens）；Agent 会话据此声明 Pi `contextWindow`。
+    pub context_window: i64,
+    /// 每轮自适应输出预算（默认 4096；Rust 硬上限 MAX_OUTPUT_TOKENS=8192）。
+    pub max_output_tokens: i64,
+    /// 该模型/provider 是否声明支持 reasoning（思考档位透传的前提）。
+    pub reasoning_supported: bool,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -39,6 +45,7 @@ pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, config_revision,
                 max_concurrency, requests_per_minute, requests_per_hour,
+                context_window, max_output_tokens, reasoning_supported,
                 enabled, created_at, updated_at
          FROM ai_connections WHERE id = ?1",
     )?;
@@ -53,6 +60,7 @@ pub fn list(conn: &Connection) -> AppResult<Vec<AiConnection>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, config_revision,
                 max_concurrency, requests_per_minute, requests_per_hour,
+                context_window, max_output_tokens, reasoning_supported,
                 enabled, created_at, updated_at
          FROM ai_connections ORDER BY created_at",
     )?;
@@ -77,9 +85,12 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
         max_concurrency: row.get(8)?,
         requests_per_minute: row.get(9)?,
         requests_per_hour: row.get(10)?,
-        enabled: row.get::<_, i64>(11)? != 0,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        context_window: row.get(11)?,
+        max_output_tokens: row.get(12)?,
+        reasoning_supported: row.get::<_, i64>(13)? != 0,
+        enabled: row.get::<_, i64>(14)? != 0,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -88,6 +99,7 @@ pub fn binding_for(conn: &Connection, usage: &str) -> AppResult<Option<AiConnect
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, c.deployment, c.protocol, c.base_url, c.model, c.api_key_ref,
                 c.config_revision, c.max_concurrency, c.requests_per_minute, c.requests_per_hour,
+                c.context_window, c.max_output_tokens, c.reasoning_supported,
                 c.enabled, c.created_at, c.updated_at
          FROM ai_usage_bindings b JOIN ai_connections c ON c.id = b.connection_id
          WHERE b.usage = ?1 AND c.enabled = 1",

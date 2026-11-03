@@ -125,6 +125,8 @@ pub async fn delete_assets(
     if strategy != "remove_from_library" && strategy != "delete_file" {
         return Err(AppError::invalid_arg("非法删除策略"));
     }
+    // A4-05：维护期间停止写入（删除会改动总仓内的文件与定位证据）。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "删除素材")?;
 
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
@@ -241,11 +243,13 @@ pub fn delete_all_asset_files_for_reset(
     delete_assets_blocking(db, data_dir, ids, "delete_file".to_owned())
 }
 
-/// R-22 回收站恢复：deleted_at 置空，素材回到在库状态（缩略图未删，无需重建）
+/// W2-8（② T17）：批量收藏/取消收藏。
+/// M-14b 恢复：`de1fdb9` 重构时本命令与前端入口一起被删，但列/索引/迁移测试仍在
+/// （PRD R-16「1-5 星评分、清空评分和收藏状态」），此处补回。
 #[tauri::command]
-pub fn trash_restore(state: State<AppState>, ids: Vec<i64>) -> AppResult<u64> {
+pub fn set_favorite(state: State<AppState>, ids: Vec<i64>, favorite: bool) -> AppResult<u64> {
     let conn = lock_db(&state)?;
-    assets::restore(&conn, &ids)
+    assets::set_favorite(&conn, &ids, favorite)
 }
 
 /// W2-8（② T17）：批量评级（0 = 清除）
@@ -262,41 +266,57 @@ pub fn set_user_rotation(state: State<AppState>, ids: Vec<i64>, rotation: i64) -
     assets::set_user_rotation(&conn, &ids, rotation)
 }
 
-/// R-22 超期回收站自动清理（启动时调用，不常驻定时器）：
-/// 短锁取清单 → 锁外删文件（失败保留记录，沿用 B03 语义）→ 短锁硬删 DB + 清缩略图
+/// R-22 超期回收站自动清理（启动时调用，不常驻定时器）。
+///
+/// A4-04：这里不再自己 `remove_file`。裸删有两个 A4-04 明确禁止的后果：
+/// 一是无法证明「我删的就是计划冻结的那个文件」（同名替换会被误删），
+/// 二是失败时没有任何持久记录可对账。现在统一走
+/// `services::trash::purge_expired`——它与界面「永久清空」共用同一套身份
+/// 复核与 `deletion_journal` 日志，只是没有调用者身份、不写 operations 收据。
+///
+/// 归属判定不了、文件缺失或权限拒绝的项一律保留数据库记录并逐项留痕，
+/// 绝不因为「清不掉」就把记录删掉假装完成。
 pub fn purge_expired_trash(
     db: &std::sync::Arc<Database>,
     data_dir: &std::path::Path,
     retention_days: i64,
 ) -> AppResult<()> {
-    let cutoff = chrono::Utc::now().timestamp_millis() - retention_days * 86_400_000;
-    let expired = {
+    let library = {
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        assets::list_expired_trash(&conn, cutoff)?
-    };
-    if expired.is_empty() {
-        return Ok(());
-    }
-    let mut ok_ids: Vec<i64> = Vec::new();
-    for (id, path) in &expired {
-        if std::fs::remove_file(path).is_ok() {
-            ok_ids.push(*id);
-        } else {
-            tracing::warn!("回收站清理：文件删除失败保留记录 id={id} path={path}");
+        match crate::db::libraries::current(&conn)? {
+            Some(library) if library.health == crate::db::libraries::LibraryHealth::Ready => {
+                library
+            }
+            // 总仓不在线时证明不了归属，整轮跳过并把原因留在日志里。
+            _ => {
+                tracing::warn!("回收站自动清理跳过：当前总仓不可用，无法核验归属");
+                return Ok(());
+            }
         }
-    }
-    if ok_ids.is_empty() {
-        return Ok(());
-    }
-    {
-        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        assets::delete(&conn, &ok_ids)?;
-    }
+    };
     let thumbs = ThumbnailService::new(data_dir)?;
-    for &id in &ok_ids {
+    let mut removed_ids: Vec<i64> = Vec::new();
+    let summary = crate::services::trash::purge_expired(db, &library, retention_days, &mut |id| {
+        removed_ids.push(id)
+    })?;
+    for &id in &removed_ids {
         thumbs.delete_for_asset(id);
     }
-    tracing::info!("回收站自动清理完成：{} 项", ok_ids.len());
+    if summary.removed > 0
+        || summary.failed > 0
+        || summary.missing > 0
+        || summary.unknown > 0
+        || summary.skipped > 0
+    {
+        tracing::info!(
+            removed = summary.removed,
+            failed = summary.failed,
+            missing = summary.missing,
+            unknown = summary.unknown,
+            skipped = summary.skipped,
+            "回收站自动清理完成"
+        );
+    }
     Ok(())
 }
 

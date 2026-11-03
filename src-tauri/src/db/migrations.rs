@@ -1844,6 +1844,8 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     migrate_agent_usage_binding(conn)?;
     // A3-02：每次保存连接都更换不可预测的配置修订，覆盖端点/模型/凭据轮换。
     migrate_agent_connection_revision(conn)?;
+    // WF-2：为 Agent 模型补充真实窗口/自适应输出预算/推理能力列（幂等追加，不改旧行默认行为）。
+    migrate_agent_model_budget_columns(conn)?;
     // V27: append-only protection records; paths remain unverified until service checks.
     super::libraries::migrate_structure(conn)?;
     // A1-03: append-only authorization state. Handles are opaque and never
@@ -1865,6 +1867,37 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     super::legacy_assets::migrate_structure(conn)?;
     // A2-04: approved tagging batch identity, provenance and persistent budget.
     super::tagging::migrate_structure(conn)?;
+    // A3-03: agent selection snapshots referenced by Pi/MCP tools. References are
+    // opaque and re-checked against principal, library epoch and expiry on use.
+    super::selections::migrate_structure(conn)?;
+    // A4-01: per-file export outcomes. A single task counter cannot say which
+    // files failed and why, so retry guidance and the completion summary read
+    // this table instead of inferring from export_tasks.done.
+    super::export_items::migrate_structure(conn)?;
+    // A4-02: per-file relocation intents. A move touches the file system before
+    // the row can be updated, so intent and post-move evidence must survive a
+    // crash for the reconciliation pass to find a unique true location.
+    super::move_journal::migrate_structure(conn)?;
+    // A4-02: collections are directories inside the managed root. The reference
+    // is derived from (library, epoch, relative path) so an old-root reference
+    // goes stale instead of resolving to a different folder.
+    super::collections::migrate_structure(conn)?;
+    // A4-04: per-file permanent deletion evidence. Deleting bytes cannot be
+    // rolled back by a SQL transaction, so both the trusted-GUI trash empty and
+    // the scheduled expiry sweep record intent before the file goes away and
+    // the outcome after, which is what lets a crash be told apart from a lie.
+    super::deletion_journal::migrate_structure(conn)?;
+    // A4-05: whole-library migration journal. A move crosses the file system and
+    // the locator row, which one transaction cannot cover, so each persistent
+    // phase is recorded and a crash at any point resumes instead of half-moving.
+    super::library_migration::migrate_structure(conn)?;
+    // A4-07: personal workflow templates. Versions are append-only so editing can
+    // never rewrite the snapshot a running task already instantiated.
+    super::workflows::migrate_structure(conn)?;
+    // A5-01: external MCP pairing records. A pairing carries scope and
+    // revocation only; the handshake token is derived from a key that lives in
+    // the running host's memory, so there is no secret to store here.
+    super::mcp_pairings::migrate_structure(conn)?;
     // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
@@ -1954,6 +1987,31 @@ fn migrate_v25(conn: &Connection) -> AppResult<()> {
         (
             "requests_per_hour",
             "ALTER TABLE ai_connections ADD COLUMN requests_per_hour INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !has_column(conn, "ai_connections", column)? {
+            conn.execute(sql, [])?;
+        }
+    }
+    Ok(())
+}
+
+/// WF-2：Agent 模型的真实窗口/自适应输出预算/推理能力列。
+/// 无版本幂等段：只追加列，旧连接沿用保守默认（32768 窗口、4096 输出、不推理），
+/// 不改变既有行为；与 V25 同理，存量库每次启动自愈补齐。
+fn migrate_agent_model_budget_columns(conn: &Connection) -> AppResult<()> {
+    for (column, sql) in [
+        (
+            "context_window",
+            "ALTER TABLE ai_connections ADD COLUMN context_window INTEGER NOT NULL DEFAULT 32768",
+        ),
+        (
+            "max_output_tokens",
+            "ALTER TABLE ai_connections ADD COLUMN max_output_tokens INTEGER NOT NULL DEFAULT 4096",
+        ),
+        (
+            "reasoning_supported",
+            "ALTER TABLE ai_connections ADD COLUMN reasoning_supported INTEGER NOT NULL DEFAULT 0",
         ),
     ] {
         if !has_column(conn, "ai_connections", column)? {
@@ -2264,6 +2322,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(limits, (0, 0, 0));
+    }
+
+    /// WF-2：新增的 Agent 模型预算列必须幂等追加，且旧连接沿用保守默认（32768/4096/0）。
+    #[test]
+    fn agent_model_budget_columns_are_idempotent_and_default_conservatively() {
+        let c = mem();
+        c.execute_batch(
+            "CREATE TABLE ai_connections (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL,
+               deployment TEXT NOT NULL, protocol TEXT NOT NULL,
+               base_url TEXT NOT NULL, model TEXT NOT NULL,
+               api_key_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        migrate_agent_model_budget_columns(&c).unwrap();
+        // 重复执行应无副作用（列已存在则跳过）。
+        migrate_agent_model_budget_columns(&c).unwrap();
+        for column in ["context_window", "max_output_tokens", "reasoning_supported"] {
+            assert!(has_column(&c, "ai_connections", column).unwrap());
+        }
+        c.execute(
+            "INSERT INTO ai_connections
+             (id, name, deployment, protocol, base_url, model, created_at, updated_at)
+             VALUES ('c', 'C', 'cloud', 'openai_chat', 'u', 'm', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let defaults: (i64, i64, i64) = c
+            .query_row(
+                "SELECT context_window, max_output_tokens, reasoning_supported
+                 FROM ai_connections WHERE id='c'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (32768, 4096, 0));
     }
 
     #[test]

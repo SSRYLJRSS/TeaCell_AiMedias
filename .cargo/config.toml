@@ -2,3 +2,17 @@
 # Cargo 从仓库根或 src-tauri 启动都能读取本设置；CI/desktop 入口或调用者必须显式提供已验证目录。
 [env]
 HEIF_BINARIES_DIR = { value = "native/heif/__bagertea_prepare_first__", force = false }
+
+[build]
+# 16 逻辑核 Windows 上 cargo 默认 16 路并行，Rust 编译与 MSVC 链接器共用该额度；
+# debug 链接每个 link.exe 峰值约 0.5-1.4 GB。13 个集成测试二进制 + lib 测试同时链接
+# 曾出现 15 个 link.exe 合计约 13.5 GB，把 32 GB 机器压到 99% 并卡死。
+# 限制为 4 路后最坏约 4-6 GB；不要用 -j 放宽。详见 docs/DEVELOPMENT.md 2.1。
+jobs = 4
+
+# 编译产物的固定保存位置。相对路径由 Cargo 相对本文件所在目录（仓库根）解析，
+# 因此从仓库根或 src-tauri 启动都落到同一目录，不再随 cwd 漂移。
+# 该目录已被 .gitignore 忽略；清理入口见 `npm run build:cache:clean`，
+# 规则与预算见 docs/DEVELOPMENT.md 2.2。
+# 需要临时验证其他缓存时可显式设置 CARGO_TARGET_DIR，它会覆盖本项。
+target-dir = "build-cache/target"

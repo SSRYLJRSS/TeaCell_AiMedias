@@ -463,6 +463,12 @@ function EditFields({
         <label className="w-20 shrink-0 text-xs text-[var(--color-text-secondary)]">服务地址</label>
         <input className={clsx(inputCls, "flex-1")} value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />
       </div>
+      {/* WP5-5：地址里的路径前缀现在会**原样**拼上接口路径（不再自动补 /v1）。
+          不写清楚，智谱 /api/paas/v4、火山 /api/v3 这类服务会被用户填成 404。 */}
+      <p className="pl-[5.5rem] text-[11px] leading-5 text-[var(--color-text-tertiary)]">
+        填到「接口路径前缀」为止，程序会原样拼接接口路径。例如 OpenAI 兼容填 https://api.example.com/v1，
+        智谱填 https://open.bigmodel.cn/api/paas/v4，本机 Ollama 填 http://localhost:11434/v1。
+      </p>
       <div className="flex items-center gap-2">
         <label className="w-20 shrink-0 text-xs text-[var(--color-text-secondary)]">API 密钥</label>
         <input

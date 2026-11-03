@@ -96,8 +96,20 @@ struct Candidate {
     identity: String,
 }
 
-/// The trusted GUI adapter build is the only entry allowed to prepare imports
-/// from a selected directory; Pi/MCP adapters use drag/drop or their own grants.
+/// Prepare an import checklist for the trusted GUI workbench.
+///
+/// This returns [`ImportPlanView`], the GUI checklist — **not** the `PlanPreview`
+/// that `imports.prepare` declares. The reviewable preview is the
+/// `imports.submit` draft built by
+/// `src-tauri/src/services/import_submission.rs::submit_draft`; see
+/// `docs/contracts/agent-v1.md` §「导入入口的设计结论」.
+///
+/// Do not call this from a Pi/MCP adapter. Two reasons, both contractual:
+/// a bare `paths` request is not a directory grant (a model-supplied path string
+/// must never become authorization, `tests/agent-evals` case E32), and a Pi/MCP
+/// caller cannot hold an `import_source` handle because handles are bound to the
+/// issuing session (`authorization::validate_handle_mask`). The remaining open
+/// item is that handle handoff design, tracked with A5-03.
 pub fn prepare_import(
     db: &Database,
     caller: &CallerContext,

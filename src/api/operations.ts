@@ -26,3 +26,16 @@ export function resumeOperation(
 export function listOperationRecovery(): Promise<RecoverySummary[]> {
   return invoke<RecoverySummary[]>("list_operation_recovery");
 }
+
+/**
+ * 明确「开始执行」一个已批准并已提交、还停在待执行状态的操作。
+ *
+ * 批准与提交只登记计划与操作，不产生任何文件效果；真正的复制/移动/恢复/清空/
+ * 流程执行必须由用户在这里点一次。后端会自己还原创建者身份并校验队列队首，
+ * 前端不做任何权限猜测——被拒绝就直接把错误给用户看。
+ */
+export function startOperation(
+  operationRef: string,
+): Promise<OperationSnapshot> {
+  return invoke<OperationSnapshot>("start_operation", { operationRef });
+}

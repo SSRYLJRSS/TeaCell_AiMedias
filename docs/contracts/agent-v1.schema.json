@@ -496,6 +496,19 @@
         "reviewKind": {
           "$ref": "#/$defs/ReviewKind"
         },
+        "originKind": {
+          "$ref": "#/$defs/CallerKind"
+        },
+        "originLabel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShortText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "itemCount": {
           "$ref": "#/$defs/u32"
         },
@@ -522,6 +535,7 @@
         "library",
         "reviewStatus",
         "reviewKind",
+        "originKind",
         "itemCount",
         "summary",
         "reviewRef",

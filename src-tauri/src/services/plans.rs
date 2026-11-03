@@ -11,10 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::contracts::agent::{
-    AgentErrorCode, AgentOutput, ApprovalResult, BudgetSummary, CapabilityId, Instructions,
-    LibraryScope, MoneyLimit, OperationPhase, OperationSnapshot, OperationState, PlanPreview,
-    PlanReviewStatus, PlanScopeSummary, ProtocolVersion, ResourceRef, ReviewKind, ShortText,
-    SubmissionResult, CAPABILITY_DESCRIPTORS,
+    AgentErrorCode, AgentOutput, ApprovalResult, BudgetSummary, CallerKind, CapabilityId,
+    Instructions, LibraryScope, MoneyLimit, OperationPhase, OperationSnapshot, OperationState,
+    PlanPreview, PlanReviewStatus, PlanScopeSummary, ProtocolVersion, ResourceRef, ReviewKind,
+    ShortText, SubmissionResult, CAPABILITY_DESCRIPTORS,
 };
 use crate::contracts::caller::{check_capability_entry, CallerContext};
 use crate::db::authorization;
@@ -69,6 +69,13 @@ pub fn prepare_plan(
         &draft.budget,
         &draft,
     )?;
+    let conn = db.lock()?;
+    validate_caller(&conn, caller)?;
+    // Resolve the caller's own display name right away so the adapter that prepared
+    // the plan sees the same provenance the reviewer will see. The persisted row only
+    // stores the kind; the label is always resolved from the live pairing record, so a
+    // renamed pairing shows its current name on every surface.
+    let origin_label = origin_label_for(&conn, caller.kind, caller.principal_id.as_str())?;
 
     let preview = PlanPreview {
         schema_version: ProtocolVersion::V1,
@@ -77,6 +84,10 @@ pub fn prepare_plan(
         library: caller.library.clone(),
         review_status: PlanReviewStatus::Pending,
         review_kind,
+        origin_kind: caller.kind,
+        // Only the kind is persisted; the label is always resolved from the live pairing
+        // record so a renamed pairing shows its current name on every surface.
+        origin_label,
         item_count: draft.item_count,
         summary: draft.summary.clone(),
         review_ref: review_ref.clone(),
@@ -151,9 +162,8 @@ pub fn prepare_plan(
         grant_epoch: caller.grant_epoch.as_str().to_string(),
         created_at: now,
         expires_at,
+        origin_kind: Some(caller_kind_to_string(caller.kind).to_string()),
     };
-    let conn = db.lock()?;
-    validate_caller(&conn, caller)?;
     plans::insert_plan(&conn, &new_plan)?;
     Ok(preview)
 }
@@ -230,6 +240,50 @@ pub fn approve_plan(
         schema_version: ProtocolVersion::V1,
         plan_id: plan_ref.clone(),
         review_status: PlanReviewStatus::Approved,
+    })
+}
+
+/// Trusted-GUI rejection. Rejecting only marks the plan unusable; it never
+/// touches operations, so a rejected request cannot leave a partial write behind.
+/// A plan that was already approved is refused rather than silently un-approved:
+/// revoking a live approval is a different decision (the user cancels the
+/// operation), and doing it here would race with a submit already in flight.
+pub fn reject_plan(
+    db: &Database,
+    caller: &CallerContext,
+    plan_ref: &ResourceRef,
+    review_ref: &ResourceRef,
+) -> AppResult<ApprovalResult> {
+    check_capability_entry(CapabilityId::PlansApprove, caller).map_err(AppError::from)?;
+    let conn = db.lock()?;
+    validate_caller(&conn, caller)?;
+    let record = load_plan_for_review(&conn, caller, plan_ref)?;
+    if record.review_ref != review_ref.as_str() {
+        return Err(AppError::from(AgentErrorCode::Unauthorized));
+    }
+    let now = now_unix_seconds()?;
+    if record.expires_at <= now {
+        plans_db::invalidate_plan(&conn, &record.plan_id, "expired")?;
+        return Err(AppError::from(AgentErrorCode::PlanExpired));
+    }
+    match record.review_status.as_str() {
+        "pending" => {
+            if !plans_db::reject_plan(&conn, &record.plan_id)? {
+                // Lost the race to a concurrent approval or rejection.
+                return Err(AppError::from(AgentErrorCode::PlanChanged));
+            }
+        }
+        // Rejecting an already rejected plan is a no-op so a retry after a lost
+        // response does not report a spurious failure.
+        "invalidated" => {}
+        "expired" => return Err(AppError::from(AgentErrorCode::PlanExpired)),
+        "approved" | "consumed" => return Err(AppError::from(AgentErrorCode::PlanChanged)),
+        _ => return Err(AppError::from(AgentErrorCode::Internal)),
+    }
+    Ok(ApprovalResult {
+        schema_version: ProtocolVersion::V1,
+        plan_id: plan_ref.clone(),
+        review_status: PlanReviewStatus::Invalidated,
     })
 }
 
@@ -466,7 +520,7 @@ fn validate_caller_subject(conn: &rusqlite::Connection, caller: &CallerContext) 
     Ok(())
 }
 
-fn review_kind_for_capability(capability: CapabilityId) -> AppResult<ReviewKind> {
+pub(crate) fn review_kind_for_capability(capability: CapabilityId) -> AppResult<ReviewKind> {
     let descriptor = CAPABILITY_DESCRIPTORS
         .iter()
         .find(|descriptor| descriptor.capability == capability)
@@ -480,8 +534,36 @@ fn review_kind_for_capability(capability: CapabilityId) -> AppResult<ReviewKind>
     }
 }
 
-fn plan_preview(conn: &rusqlite::Connection, record: &PlanRecord) -> AppResult<PlanPreview> {
-    let _ = conn;
+/// Resolve the human name shown next to a plan's origin.
+///
+/// Only the adapter kind is persisted on the plan row; the name always comes from the
+/// live pairing record, so a renamed pairing shows its current name and a plan prepared
+/// by a client that was later removed simply has no label (never a stale one).
+fn origin_label_for(
+    conn: &rusqlite::Connection,
+    kind: CallerKind,
+    principal_id: &str,
+) -> AppResult<Option<ShortText>> {
+    match kind {
+        CallerKind::Mcp => crate::db::mcp_pairings::find_by_principal(conn, principal_id)?
+            .map(|pairing| to_bounded(pairing.label))
+            .transpose(),
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn plan_preview(
+    conn: &rusqlite::Connection,
+    record: &PlanRecord,
+) -> AppResult<PlanPreview> {
+    let origin_kind = match record.origin_kind.as_deref() {
+        Some(value) => parse_caller_kind(value)?,
+        // Rows written before A5-02 recorded the adapter identity. Guessing here
+        // would present a fabricated provenance to the reviewer, so an old plan is
+        // reported as the trusted local interface and the label stays absent.
+        None => CallerKind::Gui,
+    };
+    let origin_label = origin_label_for(conn, origin_kind, &record.principal_id)?;
     let budget = BudgetSummary {
         max_requests: u32_of(record.max_requests)?,
         max_tokens: u32_of(record.max_tokens)?,
@@ -505,6 +587,8 @@ fn plan_preview(conn: &rusqlite::Connection, record: &PlanRecord) -> AppResult<P
         },
         review_status: parse_review_status(&record.review_status)?,
         review_kind: parse_review_kind(&record.review_kind)?,
+        origin_kind,
+        origin_label,
         item_count: u32_of(record.item_count)?,
         summary: to_bounded(record.summary.clone())?,
         review_ref: to_ref(record.review_ref.clone())?,
@@ -619,6 +703,19 @@ fn capability_to_string(capability: CapabilityId) -> AppResult<String> {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .ok_or_else(|| AppError::internal("能力序列化失败"))
+}
+
+fn caller_kind_to_string(kind: CallerKind) -> &'static str {
+    match kind {
+        CallerKind::Gui => "gui",
+        CallerKind::Pi => "pi",
+        CallerKind::Mcp => "mcp",
+    }
+}
+
+fn parse_caller_kind(value: &str) -> AppResult<CallerKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| AppError::internal("持久计划来源损坏"))
 }
 
 fn parse_capability(value: &str) -> AppResult<CapabilityId> {
@@ -753,6 +850,22 @@ mod tests {
         .unwrap()
     }
 
+    /// The MCP adapter has no session, which is exactly why an external plan can
+    /// never resolve a GUI-owned directory handle.
+    fn mcp_caller(db: &Database, principal: &str, instance: &str) -> CallerContext {
+        let conn = db.lock().unwrap();
+        authorization::build_caller_context(
+            &conn,
+            TrustedAdapterIdentity::Mcp {
+                principal_id: principal.to_string(),
+                instance_id: instance.to_string(),
+            },
+            ResourceRef::generated("request"),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn scope() -> PlanScopeSummary {
         PlanScopeSummary {
             scope_ref: ResourceRef::generated("scope"),
@@ -839,6 +952,126 @@ mod tests {
         assert!(!result.replayed);
         assert_eq!(result.operation.state, OperationState::Queued);
         assert_eq!(result.operation.phase, OperationPhase::Ready);
+    }
+
+    #[test]
+    fn external_plan_shows_its_paired_client_name_and_rejecting_writes_nothing() {
+        let managed = tempfile::tempdir().unwrap();
+        let db = ready_db(managed.path());
+        let mcp = mcp_caller(&db, "principal_mcp_a502", "instance_mcp_a502");
+        {
+            let conn = db.lock().unwrap();
+            crate::db::mcp_pairings::insert(
+                &conn,
+                "mcpconn_00112233aabbccdd",
+                "本地编辑器",
+                "principal_mcp_a502",
+                &[
+                    "assets.search".to_string(),
+                    "assets.trash.prepare".to_string(),
+                ],
+                1_700_000_000,
+            )
+            .unwrap();
+        }
+        let current = draft(CapabilityId::AssetsTrashSubmit, 3, 0);
+        let preview = prepare_plan(&db, &mcp, current.clone()).unwrap();
+        assert_eq!(preview.origin_kind, CallerKind::Mcp);
+        {
+            let conn = db.lock().unwrap();
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT origin_kind FROM plans WHERE plan_id=?1",
+                    [preview.plan_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                Some("mcp"),
+                "计划必须记住是哪个适配器发起的"
+            );
+        }
+
+        let gui = gui_caller(&db);
+        let pending = pending_plans(&db, &gui).unwrap();
+        let listed = pending
+            .iter()
+            .find(|candidate| candidate.plan_id.as_str() == preview.plan_id.as_str())
+            .expect("外部计划必须出现在可信界面的待审列表里");
+        assert_eq!(
+            listed.origin_kind,
+            CallerKind::Mcp,
+            "审核界面必须能区分外部请求和本机操作"
+        );
+        assert_eq!(
+            listed.origin_label.as_ref().map(|label| label.as_str()),
+            Some("本地编辑器"),
+            "审核界面必须能指名是哪个外部客户端发起的，而不是让用户自己猜"
+        );
+
+        let rejected = reject_plan(&db, &gui, &preview.plan_id, &preview.review_ref).unwrap();
+        assert_eq!(rejected.review_status, PlanReviewStatus::Invalidated);
+        {
+            let conn = db.lock().unwrap();
+            let operations: i64 = conn
+                .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(operations, 0, "拒绝不得产生任何执行记录");
+            let status: String = conn
+                .query_row(
+                    "SELECT review_status FROM plans WHERE plan_id=?1",
+                    [preview.plan_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "invalidated");
+        }
+        // 拒绝之后外部再提交必须失败，而且不能变成可执行任务。
+        assert_eq!(
+            error_code(submit_plan(&db, &mcp, &preview.plan_id, &token(), &current).unwrap_err()),
+            "PLAN_CHANGED"
+        );
+        // 重复拒绝幂等，方便界面重试。
+        reject_plan(&db, &gui, &preview.plan_id, &preview.review_ref).unwrap();
+        // 拒绝权限只在可信界面：外部客户端自己不能拒绝。
+        let other = mcp_caller(&db, "principal_mcp_a502b", "instance_mcp_a502b");
+        assert_eq!(
+            error_code(
+                reject_plan(&db, &other, &preview.plan_id, &preview.review_ref).unwrap_err()
+            ),
+            "UNAUTHORIZED"
+        );
+    }
+
+    #[test]
+    fn an_approved_plan_cannot_be_rejected_and_a_wrong_review_reference_is_refused() {
+        let managed = tempfile::tempdir().unwrap();
+        let db = ready_db(managed.path());
+        let mcp = mcp_caller(&db, "principal_mcp_a502c", "instance_mcp_a502c");
+        let preview =
+            prepare_plan(&db, &mcp, draft(CapabilityId::AssetsTrashSubmit, 1, 0)).unwrap();
+        let gui = gui_caller(&db);
+
+        assert_eq!(
+            error_code(
+                reject_plan(
+                    &db,
+                    &gui,
+                    &preview.plan_id,
+                    &ResourceRef::generated("review")
+                )
+                .unwrap_err()
+            ),
+            "UNAUTHORIZED"
+        );
+
+        approve_plan(&db, &gui, &preview.plan_id, &preview.review_ref).unwrap();
+        assert_eq!(
+            error_code(reject_plan(&db, &gui, &preview.plan_id, &preview.review_ref).unwrap_err()),
+            "PLAN_CHANGED",
+            "已批准的计划不能被静默撤销批准，撤销执行要走取消任务"
+        );
     }
 
     #[test]

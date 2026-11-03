@@ -28,6 +28,10 @@ pub struct PlatformCapabilities {
     pub primary_modifier: &'static str,
     /// 当前版本不支持跨系统素材库搬迁，保留 DTO 字段并始终返回 None。
     pub library_transfer_version: Option<u32>,
+    /// 本平台是否提供 Agent Host（1.0 只支持 Windows x64）。纯增量字段：
+    /// 为保持 R0 冻结的 schemaVersion=1 契约不变，它不参与版本号升级，
+    /// 前端按可选字段消费；为 false 时界面必须禁用 Agent 入口并给出原因。
+    pub agent_host: bool,
 }
 
 /// 编译期确定的操作系统名。
@@ -86,6 +90,8 @@ pub fn capabilities() -> PlatformCapabilities {
         },
         // 首阶段不承诺跨系统素材库搬迁。
         library_transfer_version: None,
+        // 与 agent_runtime 的平台门保持一致，避免两处各写一份判断。
+        agent_host: cfg!(all(target_os = "windows", target_arch = "x86_64")),
     }
 }
 
@@ -110,6 +116,11 @@ mod tests {
         );
         // 所有首发目标都使用 decorations=false + 自绘标题栏，不能声称有系统原生按钮。
         assert!(!c.native_window_controls);
+        // Agent Host 只在 Windows x64 提供；其他平台必须报 false，供界面禁用入口。
+        assert_eq!(
+            c.agent_host,
+            cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        );
         // 主修饰键与平台一致
         if cfg!(target_os = "macos") {
             assert_eq!(c.primary_modifier, "meta");

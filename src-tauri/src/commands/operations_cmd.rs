@@ -1,6 +1,6 @@
 //! GUI entry points for cancel/resume and startup recovery summaries.
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::contracts::agent::{OperationPhase, OperationSnapshot, OperationState, ResourceRef};
 use crate::contracts::caller::CallerContext;
@@ -54,6 +54,9 @@ pub async fn resume_operation(
     state: State<'_, AppState>,
     operation_ref: ResourceRef,
 ) -> AppResult<OperationSnapshot> {
+    // A4-05/A3-03：维护门必须在执行前判，而不是只在排队时判。
+    // 排队时未维护、点「继续」时总仓已在搬家的情形，排队那一刻的检查挡不住。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "继续任务")?;
     let caller = gui_caller(&state)?;
     let is_import = operations::is_import_operation(&state.db, &caller, &operation_ref)?;
     if is_import {
@@ -118,4 +121,39 @@ pub async fn resume_operation(
 #[tauri::command]
 pub fn list_operation_recovery(state: State<AppState>) -> AppResult<Vec<RecoverySummaryView>> {
     operations::recovery_summaries(&state.db)
+}
+
+/// 用户明确点击「开始执行」时，真正把已批准并已提交的操作跑掉。
+///
+/// 为什么需要这一层：提交（`submit_*`）只写库不碰文件系统，而 GUI 的五个命令
+/// 各自在自己内部完成文件效果。Agent 提交的操作没有任何调用方替它继续，于是
+/// 永远停在 `queued`。这里补上同一件事，且保持「批准 → 提交 → 显式启动」三段式：
+/// 模型提交后必须有人点这个按钮才会有文件效果。
+#[tauri::command]
+pub async fn start_operation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    operation_ref: ResourceRef,
+) -> AppResult<OperationSnapshot> {
+    // A4-05/A3-03：入口处统一判维护门。这个命令会对总仓产生真实文件效果，
+    // 排队与批准都发生在更早的时刻，不能代表此刻允许写入。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "开始任务")?;
+    let db = std::sync::Arc::clone(&state.db);
+    let queue = std::sync::Arc::clone(&state.operation_queue);
+    let export_cancel = std::sync::Arc::clone(&state.export_cancel);
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit_app = app.clone();
+        let on_progress = move |progress: crate::services::export_local::ExportProgress| {
+            let _ = emit_app.emit("export://progress", progress);
+        };
+        crate::services::operation_dispatch::start(
+            &db,
+            &operation_ref,
+            &queue,
+            &export_cancel,
+            &on_progress,
+        )
+    })
+    .await
+    .map_err(|error| AppError::msg(format!("执行线程异常: {error}")))?
 }

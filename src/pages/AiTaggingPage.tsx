@@ -6,16 +6,8 @@ import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import Button from "@/components/common/Button";
 import AiTaggingProgress, { assetFileLabel } from "@/components/ai/AiTaggingProgress";
-import Filmstrip from "@/components/ai/Filmstrip";
-import Workbench from "@/components/ai/Workbench";
-import {
-  aiApplyTags,
-  aiDecideSuggestionItem,
-  aiListSuggestionItems,
-  aiPrepareBatch,
-  aiSubmitTaggingPlan,
-  onAiProgress,
-} from "@/api/ai";
+import SuggestionReview from "@/components/ai/SuggestionReview";
+import { aiPrepareBatch, aiSubmitTaggingPlan, onAiProgress } from "@/api/ai";
 import { approvePlan } from "@/api/plans";
 import type { PlanPreview } from "@/types/plans";
 import type { TaggingOperation } from "@/types/ai";
@@ -30,11 +22,9 @@ import { useTauriEvent } from "@/hooks/hooks";
 import { useAiStore } from "@/stores/aiStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { useTagStore, buildWorkbenchFacets, normalizeTagKeys } from "@/stores/tagStore";
+import { useTagStore } from "@/stores/tagStore";
 import { computeAiStats, estimateRequests } from "@/utils/aiStats";
-import { pickReviewDescription } from "@/utils/reviewDescription";
-import type { AiSuggestion, AiTaggingUiState, CategorizedTags } from "@/types/ai";
-import type { WorkbenchNumberItem } from "@/components/ai/Workbench";
+import type { AiTaggingUiState } from "@/types/ai";
 import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
@@ -54,7 +44,7 @@ export default function AiTaggingPage() {
     })),
   );
   const {
-    refreshBatches, openBatch, createBatch, startTagging, setError, cancel, confirm, reject, restore, confirmAll, patchProgress,
+    refreshBatches, openBatch, createBatch, startTagging, setError, cancel, confirmAll, patchProgress,
   } = useAiStore(
     useShallow((s) => ({
       refreshBatches: s.refreshBatches,
@@ -63,9 +53,6 @@ export default function AiTaggingPage() {
       startTagging: s.startTagging,
       setError: s.setError,
       cancel: s.cancel,
-      confirm: s.confirm,
-      reject: s.reject,
-      restore: s.restore,
       confirmAll: s.confirmAll,
       patchProgress: s.patchProgress,
     })),
@@ -77,12 +64,6 @@ export default function AiTaggingPage() {
     useShallow((s) => ({ settings: s.settings, loaded: s.loaded, load: s.load })),
   );
 
-  // 阶段 6 §9.2/§9.3：工作台分面 = tag_facets（唯一事实源）+ aiFacetConfigs 覆盖；系统分面恒显
-  // W3-2：分面语义全部来自 tag_facets（inputMode 分组），不再读 settings.aiFacetConfigs
-  const workbenchFacets = useMemo(
-    () => buildWorkbenchFacets(tagFacets),
-    [tagFacets],
-  );
   useEffect(() => {
     if (tagFacets.length === 0) void refreshTags();
   }, [tagFacets.length, refreshTags]);
@@ -253,125 +234,11 @@ export default function AiTaggingPage() {
       setPreparingTaggingPlan(false);
     }
   }, [currentBatchId, preparingTaggingPlan, running, setError, startTagging]);
-
-  // 过片走全量建议（胶片条含已确认/已拒绝，状态角标区分）
-  const idx = Math.min(reviewIdx, Math.max(0, suggestions.length - 1));
-  const currentSuggestion: AiSuggestion | null = suggestions[idx] ?? null;
-
+  // 过片走全量建议（胶片条含已确认/已拒绝，状态角标区分）。
+  // 审核交互（标签编辑、批量确认、数值项）已抽到 SuggestionReview，与助手右栏共用。
   const goto = useCallback(
     (next: number) => setReviewIdx(Math.max(0, Math.min(next, suggestions.length - 1))),
     [suggestions.length],
-  );
-
-  // 当前张编辑中的标签（切张即重置：已确认张展示 confirmed，其余展示 suggested）
-  const [draftTags, setDraftTags] = useState<CategorizedTags>({});
-  const draftEdited = useRef(false);
-  const draftSuggestionId = useRef<number | null>(null);
-  // V24（Phase 7-4）：当前建议的数值建议项（itemKind='number'）—— 确认/拒绝后重拉
-  const [numberItems, setNumberItems] = useState<WorkbenchNumberItem[]>([]);
-  const currentSuggestionId = currentSuggestion?.id;
-  useEffect(() => {
-    let alive = true;
-    if (currentSuggestionId == null) {
-      setNumberItems([]);
-      return;
-    }
-    void aiListSuggestionItems(currentSuggestionId)
-      .then((items) => {
-        if (!alive) return;
-        const nums = items.filter((i) => i.itemKind === "number");
-        setNumberItems(
-          nums.map((n) => ({
-            id: n.id,
-            facetKey: n.facetKey,
-            displayName: tagFacets.find((f) => f.key === n.facetKey)?.displayName ?? n.facetKey,
-            numValue: n.numValue ?? null,
-            decision: n.decision,
-            decisionReason: n.decisionReason,
-          })),
-        );
-      })
-      .catch(() => {
-        if (alive) setNumberItems([]);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [currentSuggestionId, tagFacets]);
-  const decideNumberItem = useCallback(
-    async (itemId: number, decision: "accepted" | "rejected") => {
-      await aiDecideSuggestionItem(itemId, decision);
-      if (currentSuggestionId == null) return;
-      try {
-        const items = await aiListSuggestionItems(currentSuggestionId);
-        const nums = items.filter((i) => i.itemKind === "number");
-        setNumberItems(
-          nums.map((n) => ({
-            id: n.id,
-            facetKey: n.facetKey,
-            displayName: tagFacets.find((f) => f.key === n.facetKey)?.displayName ?? n.facetKey,
-            numValue: n.numValue ?? null,
-            decision: n.decision,
-            decisionReason: n.decisionReason,
-          })),
-        );
-      } catch {
-        /* 刷新失败静默：下次切换建议时重拉 */
-      }
-    },
-    [currentSuggestionId, tagFacets],
- );
-  useEffect(() => {
-    const suggestionId = currentSuggestion?.id ?? null;
-    const suggestionFinalized = currentSuggestion?.status === "confirmed" || currentSuggestion?.status === "rejected";
-    if (draftSuggestionId.current !== suggestionId || suggestionFinalized) {
-      draftSuggestionId.current = suggestionId;
-      draftEdited.current = false;
-    }
-  }, [currentSuggestion?.id, currentSuggestion?.status]);
-
-  useEffect(() => {
-    if (!currentSuggestion) return;
-    if (draftEdited.current) return;
-    const src =
-      currentSuggestion.status === "confirmed" && Object.keys(currentSuggestion.confirmedTags).length > 0
-        ? currentSuggestion.confirmedTags
-        : currentSuggestion.suggestedTags;
-    // 阶段 6 §9.4：把 AI 返回的分类显示名 key 归一化为稳定 facetKey（未知 → custom）
-    // W3-2：knownFacetKeys 来自后端 facets —— 自建分面的 key 原样保留（未知才归 custom）
-    setDraftTags(normalizeTagKeys(src, tagFacets.map((f) => f.key)));
-    // 依赖含 suggestedTags 内容：批次跑完回载后 id/status 不变但标签已写入，
-    // 若只依赖 [id, status] 当前张会停在旧的空 draft，此时点确认会写入空标签
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSuggestion?.id, currentSuggestion?.status, JSON.stringify(currentSuggestion?.suggestedTags)]);
-
-  // FB5-05（§7.6）：当前张审核中的一句话描述（切张重置：确认值 → 素材当前值 → 建议值）
-  const [draftDescription, setDraftDescription] = useState("");
-  const reviewDescription = currentSuggestion ? pickReviewDescription(currentSuggestion) : null;
-  const currentSuggestionStatus = currentSuggestion?.status;
-  useEffect(() => {
-    if (reviewDescription === null) return;
-    if (draftEdited.current) return;
-    setDraftDescription(reviewDescription);
-  }, [currentSuggestionId, currentSuggestionStatus, reviewDescription]);
-
-  // 胶片条多选（批量套用用，按 assetId）
-  const [selectedAssets, setSelectedAssets] = useState<Set<number>>(new Set());
-  const onFilmPick = useCallback(
-    (s: AiSuggestion, ctrl: boolean) => {
-      if (ctrl) {
-        setSelectedAssets((prev) => {
-          const next = new Set(prev);
-          if (next.has(s.assetId)) next.delete(s.assetId);
-          else next.add(s.assetId);
-          return next;
-        });
-      } else {
-        const i = suggestions.findIndex((x) => x.id === s.id);
-        if (i >= 0) setReviewIdx(i);
-      }
-    },
-    [suggestions],
   );
 
   const onConfirmAll = async () => {
@@ -383,11 +250,6 @@ export default function AiTaggingPage() {
   const openSettings = useCallback(() => {
     window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }));
   }, []);
-
-  const afterWrite = async () => {
-    await Promise.all([refreshLibrary(), refreshTags()]);
-    void loadRecent(); // R-25：确认后刷新最近打标流水
-  };
 
   // R-25 最近打标流水 + 批次撤销（两击确认防误触）
   const [recentOps, setRecentOps] = useState<TagOp[]>([]);
@@ -402,6 +264,12 @@ export default function AiTaggingPage() {
   useEffect(() => {
     void loadRecent();
   }, [loadRecent]);
+
+  const afterWrite = async () => {
+    await Promise.all([refreshLibrary(), refreshTags()]);
+    void loadRecent(); // R-25：确认后刷新最近打标流水
+  };
+
   const undoBatch = async (batchId: number) => {
     if (undoArmed !== batchId) {
       setUndoArmed(batchId);
@@ -413,24 +281,23 @@ export default function AiTaggingPage() {
     await loadRecent();
   };
 
-  // 批量套用：把当前张标签写到胶片条选中素材（连拍/同场景提速）
-  const [applying, setApplying] = useState(false);
-  const applyToSelected = async () => {
-    if (selectedAssets.size === 0 || Object.keys(draftTags).length === 0) return;
-    setApplying(true);
-    try {
-      await aiApplyTags(Array.from(selectedAssets), draftTags);
-      setSelectedAssets(new Set());
-      await afterWrite();
-    } finally {
-      setApplying(false);
-    }
-  };
+
 
   return (
     <div className="flex h-full bg-[var(--color-bg)]">
       {/* 左侧数据栏 */}
-      <aside className="flex w-[252px] shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)]">
+      {/* 左侧数据栏。pb-32 = 底部安全区（M-11 第五次真机补证：占位高度 = 底栏 56 + 入口 48 + 间距 8 = 112，原 pb-32=96 在 1200×800/DPI 下仍差 20px，打标页最后一行实测被压 108×28px²，故抬到 pb-32=128）：收起态悬浮助手入口固定在左下，
+          会盖住历史批次列表最底部约 65px 的可点行。安全区放在 aside 上而不是滚动内容里，
+          这样任何滚动位置（含默认位置）都不会有行落到入口底下。 */}
+      <aside
+        className="flex w-[252px] shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)] pb-32"
+        data-testid="tagging-side-panel"
+      >
+        {/* M-11 真机补证（960×640 打开批次）：aside 的 pb-32 只在内容不溢出时才等于「安全区」。
+            打开批次后这一整块（服务信息 + 当前批次 + 统计 + 提示）高达约 690px，超过
+            「左栏高度 − 安全区」的可用高度，flex 子项会直接顶穿 padding 落到悬浮入口底下。
+            所以非滚动的顶部区块本身必须可收缩、可滚动，才能保证不越过安全区。 */}
+        <div className="min-h-0 shrink overflow-y-auto" data-testid="tagging-side-header">
         <div className="border-b border-[var(--color-border)] px-4 py-3.5">
           <div className="flex min-w-0 items-center gap-2" aria-live="polite">
             <span
@@ -455,9 +322,22 @@ export default function AiTaggingPage() {
               </span>
             )}
           </div>
+          {/* R-44：打标工作台不区分 AI/手动模式。没有打标服务不是错误状态
+              （ARCHITECTURE §663/§677），手工填写这条路必须照常可用，所以文案不能只说"去设置"。 */}
           {connectionsLoaded && !activeConnection && (
-            <p className="mt-1 pl-3.5 text-[10px] leading-4 text-[var(--color-text-secondary)]">
-              请到设置中选择打标服务
+            <p
+              className="mt-1 pl-3.5 text-[10px] leading-4 text-[var(--color-text-secondary)]"
+              data-testid="tagging-no-service-hint"
+            >
+              还没选打标服务，可以先直接手工填写标签；要生成 AI 建议再
+              <button
+                type="button"
+                onClick={openSettings}
+                className="mx-0.5 text-[var(--color-accent)] underline decoration-dotted"
+              >
+                去设置选择
+              </button>
+              。
             </p>
           )}
           {/* AI 批次启动区：不在运行中就常显「开始打标」（打完也保留，可续跑剩余 pending；v2.12） */}
@@ -503,14 +383,32 @@ export default function AiTaggingPage() {
                 disabled={
                   preparingTaggingPlan || running || (!scopeAll && (!scopeN || parseInt(scopeN, 10) < 1)) || (batchHasVideo && !videoTaggingOn)
                 }
-                onClick={() => void startBatch(scopeAll ? undefined : parseInt(scopeN, 10))}
+                onClick={() => {
+                  // M-07/PRD R-44：没有打标服务时 AI 入口要「先去设置」，而不是点下去报一个红字错误。
+                  if (connectionsLoaded && !activeConnection) {
+                    openSettings();
+                    return;
+                  }
+                  void startBatch(scopeAll ? undefined : parseInt(scopeN, 10));
+                }}
               >
                 {preparingTaggingPlan
                   ? "正在准备打标计划…"
                   : batchHasVideo && !videoTaggingOn
                     ? "先开启视频 AI 打标"
-                    : "开始打标"}
+                    : connectionsLoaded && !activeConnection
+                      ? "先去设置选择打标服务"
+                      : "开始打标"}
               </Button>
+              {/* R35：批准前就要说清楚发的是什么画质。默认只发压缩预览，
+                  想要更高清必须另行确认——不能等用户花完钱才发现发的是缩略图，
+                  也不能偷偷按原始尺寸发出去。 */}
+              <p
+                className="mt-1 text-[10px] leading-4 text-[var(--color-text-tertiary)]"
+                data-testid="tagging-egress-clarity"
+              >
+                外发画质：图片统一转成 JPEG 预览，最长边 1024；需要更高清的画面会另行提示并单独确认，不会自动改尺寸发送。
+              </p>
             </div>
           )}
           {running && (
@@ -635,16 +533,33 @@ export default function AiTaggingPage() {
                 全部确认（{stats.awaitingConfirmation}）
               </Button>
             )}
-            {!running && stats.awaitingConfirmation === 0 && stats.awaitingGeneration === 0 && stats.failed === 0 && stats.total > 0 && (
+            {/* M-04 真机补证：二次启动一定确认不了任何东西（后端只确认 pending），
+                此时按「已确认 N」如实说清楚，而不是让用户对着一个点了没反应的「开始打标」猜。 */}
+            {!running
+              && !preparingTaggingPlan
+              && stats.awaitingGeneration === 0
+              && stats.awaitingConfirmation === 0
+              && stats.failed === 0
+              && stats.confirmed === stats.total
+              && stats.total > 0
+              && (
+                <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-tertiary)]" data-testid="tagging-all-reviewed">
+                  本批次 {stats.total} 张都已确认写入，再点「开始打标」不会改动任何素材；要重新打标请先在素材库重新挑图。
+                </p>
+              )}
+            {!running && stats.awaitingConfirmation === 0 && stats.awaitingGeneration === 0 && stats.failed === 0 && stats.total > 0 && stats.confirmed !== stats.total && (
               <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-tertiary)]">
                 当前没有待确认的建议；可逐张编辑标签后「确认写入」。
               </p>
             )}
           </div>
         )}
+        </div>
 
         {(batches.length > 0 || recentOps.length > 0) && (
-          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2.5">
+          // 底部安全区由 aside（tagging-side-panel）的 pb-32 承担：放在这里只会让
+          // 「滚到最底」时多出一段空白，默认滚动位置的行仍会被入口压住（M-11 真机复验）。
+          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2.5" data-testid="tagging-batch-scroll">
             {batches.length > 0 && (
               <>
                 <h3 className="ui-section-title mb-2 px-2">
@@ -734,83 +649,34 @@ export default function AiTaggingPage() {
         )}
       </aside>
 
-      {/* 右侧工作流：大图 → 胶片条 → EXIF → 标签 → 操作 */}
+      {/* 右侧工作流：大图 → 胶片条 → EXIF → 标签 → 操作。
+          与助手右侧工作台共用 SuggestionReview，避免两处行为漂移（A3-07 第 3 条）。 */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {error && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">{error}</p>}
-        {connectionError && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">服务切换失败：{connectionError}</p>}
+        {/* M-14：错误必须能被辅助技术立刻感知（role="alert"），否则键盘/读屏用户只看到界面没反应。 */}
+        {error && (
+          <p role="alert" className="px-4 pt-2 text-xs text-[var(--color-danger)]">
+            {error}
+          </p>
+        )}
+        {connectionError && (
+          <p role="alert" className="px-4 pt-2 text-xs text-[var(--color-danger)]">
+            服务切换失败：{connectionError}
+          </p>
+        )}
 
-        {currentSuggestion ? (
-          <>
-            <Workbench
-              suggestion={currentSuggestion}
-              aiGroup={workbenchFacets.aiGroup}
-              manualGroup={workbenchFacets.manualGroup}
-              tags={draftTags}
-              onTagsChange={(next) => {
-                draftEdited.current = true;
-                setDraftTags(next);
-              }}
-              description={draftDescription}
-              onDescriptionChange={(next) => {
-                draftEdited.current = true;
-                setDraftDescription(next);
-              }}
-              numberItems={numberItems}
-              onDecideNumberItem={decideNumberItem}
-              index={idx}
-              total={suggestions.length}
-              filmstrip={
-                <div className="relative shrink-0">
-                  {selectedAssets.size > 0 && (
-                    <div className="flex items-center justify-end gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-2">
-                      <span className="text-xs text-[var(--color-text-secondary)]">已选 {selectedAssets.size} 张</span>
-                      <button
-                        onClick={() => void applyToSelected()}
-                        disabled={applying || Object.keys(draftTags).length === 0}
-                        className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-xs font-medium text-[var(--color-accent-text)] disabled:opacity-50"
-                      >
-                        {applying ? "套用中…" : "套用当前标签"}
-                      </button>
-                      <button
-                        onClick={() => setSelectedAssets(new Set())}
-                        className="rounded-md px-2 py-1 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-                      >
-                        取消
-                      </button>
-                    </div>
-                  )}
-                  <Filmstrip
-                    suggestions={suggestions}
-                    currentId={currentSuggestion.id}
-                    selectedIds={selectedAssets}
-                    onPick={onFilmPick}
-                  />
-                </div>
-              }
-              onGoto={goto}
-              onConfirm={async () => {
-                // FB5-05（§7.6）：确认时携带审核后的描述（同一事务写入素材）
-                await confirm(currentSuggestion.id, draftTags, draftDescription);
-                await afterWrite();
-              }}
-              onReject={async () => {
-                await reject(currentSuggestion.id);
-              }}
-              onRestore={async () => {
-                await restore(currentSuggestion.id);
-              }}
-            />
-
-          </>
-        ) : (
-          <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]">
-            {running
-                ? "正在生成标签建议…"
+        <SuggestionReview
+          suggestions={suggestions}
+          index={reviewIdx}
+          onGoto={goto}
+          emptyHint={
+            running
+              ? "正在生成标签建议…"
               : suggestions.length > 0
                 ? "本批次已全部处理完毕"
-                : "还没有打标批次——去素材库选中素材，点顶部「打标」"}
-          </div>
-        )}
+                : "还没有打标批次——去素材库选中素材，点顶部「打标」"
+          }
+          onAfterWrite={afterWrite}
+        />
       </div>
     </div>
   );

@@ -84,6 +84,61 @@ pub fn encode_native_path(path: &Path) -> AppResult<String> {
         .ok_or_else(|| AppError::unsupported("文件名不是有效 UTF-8，首版暂不支持无损入库"))
 }
 
+/// 给**人看**的路径文本：去掉 Windows 扩展长度前缀，其他平台原样。
+///
+/// `canonicalize` 在 Windows 上必然产生 `\\?\C:\a` 这种形式。它是合法路径，
+/// 但用户资源管理器里看到的是 `C:\a`；把它原样写进计划摘要或界面，
+/// 用户会以为选错了目录。这里只处理显示，**不用于打开文件**——执行阶段
+/// 仍必须使用原生路径（见 library_move::unique_target 的注释）。
+pub fn display_native_path(path: &Path) -> String {
+    let text = path.to_string_lossy().to_string();
+    strip_verbatim_prefix(&text)
+}
+
+pub(crate) fn strip_verbatim_prefix(text: &str) -> String {
+    // `\\?\UNC\server\share` → `\\server\share`
+    if let Some(rest) = text
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| text.strip_prefix("//?/UNC/"))
+    {
+        return format!("\\\\{rest}");
+    }
+    // `\\?\C:\a` → `C:\a`
+    if let Some(rest) = text
+        .strip_prefix("\\\\?\\")
+        .or_else(|| text.strip_prefix("//?/"))
+    {
+        return rest.to_string();
+    }
+    // `\\.\C:\a`（设备命名空间）不在这里收缩，交由 ensure_native_absolute 拒绝
+    text.to_string()
+}
+
+/// 判断两段原生路径是否指向同一位置，用于「用户是否真的换了目录」的判断。
+///
+/// `canonicalize` 在 Windows 上必然产生 `\\?\C:\a`；用户用选择器重选同一目录拿到的是
+/// `C:\a`。字符串不同但语义相同，不归一就会把「重选同一目录」误判成换根，进而撞上
+/// 「已配置总仓不可直接更换」的冲突。
+pub fn same_native_path(a: &str, b: &str) -> bool {
+    let left = normalize_native_path_for_compare(a);
+    let right = normalize_native_path_for_compare(b);
+    !left.is_empty() && left == right
+}
+
+fn normalize_native_path_for_compare(raw: &str) -> String {
+    let mut text = display_native_path(Path::new(raw.trim()));
+    text = text.replace('/', std::path::MAIN_SEPARATOR_STR);
+    // 只去尾部分隔符：`C:\` 的根不能退化成 `C:`（后者是相对盘符路径）。
+    while text.len() > 3 && text.ends_with(std::path::MAIN_SEPARATOR) {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
+}
+
 /// True for symbolic links and Windows reparse points/junctions.
 pub fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -147,6 +202,23 @@ mod tests {
         assert!(ensure_native_absolute(Path::new("\\\\.\\PhysicalDrive0")).is_err());
     }
 
+    /// 同一目录的不同写法必须判等：总仓根是 canonicalize 结果（带 `\\?\`），
+    /// 而选择器给的是普通路径；大小写与分隔符差异同样不算换根。
+    #[test]
+    fn same_native_path_ignores_prefix_separator_and_case() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let plain = format!("F:{sep}all");
+        let canonical = format!("\\\\?\\F:{sep}all");
+        assert!(same_native_path(&plain, &canonical));
+        assert!(same_native_path(&canonical, &format!("{plain}{sep}")));
+        assert!(same_native_path("F:/all", &plain));
+        assert!(same_native_path("f:\\ALL", &plain));
+        // 不同目录、空值与「未配置」都必须判不等
+        assert!(!same_native_path("F:/all", "F:/other"));
+        assert!(!same_native_path("", ""));
+        assert!(!same_native_path("", &plain));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn native_absolute_unix() {
@@ -172,9 +244,33 @@ mod tests {
         );
     }
 
+    /// 展示形式去掉 `\\?\` 前缀：`canonicalize` 在 Windows 上必然加上它，
+    /// 但用户资源管理器里看到的是 `C:\a`。这只是显示转换，打开文件仍用原生路径。
+    #[test]
+    fn display_path_strips_the_verbatim_prefix_only_for_display() {
+        assert_eq!(strip_verbatim_prefix("\\\\?\\C:\\a\\b"), "C:\\a\\b");
+        assert_eq!(strip_verbatim_prefix("//?/C:/a/b"), "C:/a/b");
+        // UNC 保留双反斜杠形态，否则 \\server\share 会变成 server\share
+        assert_eq!(
+            strip_verbatim_prefix("\\\\?\\UNC\\server\\share\\a"),
+            "\\\\server\\share\\a"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/server/share/a"),
+            "\\\\server/share/a"
+        );
+        // 普通路径原样返回
+        assert_eq!(strip_verbatim_prefix("D:\\素材\\导出"), "D:\\素材\\导出");
+        assert_eq!(strip_verbatim_prefix("/home/u/a.jpg"), "/home/u/a.jpg");
+        // 设备命名空间不在这里收缩，交给 ensure_native_absolute 拒绝
+        assert_eq!(
+            strip_verbatim_prefix("\\\\.\\PhysicalDrive0"),
+            "\\\\.\\PhysicalDrive0"
+        );
+    }
+
     #[test]
     fn ensure_absolute_bool_wrapper() {
-        // 布尔封装行为与新实现一致
         assert!(!ensure_absolute(""));
         assert!(!ensure_absolute("a/b.jpg"));
     }

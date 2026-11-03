@@ -56,6 +56,14 @@ $env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-
 
 `desktop:dev` / `desktop:build` 会自动准备 HEIF 库；裸 Cargo 命令不进行下载，未设置已校验目录时会立即失败。
 
+在 Windows 的 Git Bash 等 POSIX shell 中执行同一门禁时，从仓库根设置同一个 Windows 路径（保持反斜杠形式，才能复用 PowerShell 下生成的 Cargo 构建缓存）；Cargo 命令在 `src-tauri` 下执行，或在仓库根加 `--manifest-path src-tauri/Cargo.toml`：
+
+```bash
+export HEIF_BINARIES_DIR="$(cygpath -w "$PWD/src-tauri/native/heif/x86_64-pc-windows-msvc")"
+```
+
+`scripts/smoke.ps1` 及其嵌套的后台进程回归依赖 PowerShell 7（`pwsh`，使用 `$IsWindows`），Windows PowerShell 5.1 无法运行。缺少 `pwsh` 时 smoke 记为未执行，不得写成通过。
+
 桌面入口在准备资源前运行 `scripts/product-identity.mjs`，核对 npm/Cargo 包名、Rust library crate 名、产品名、主窗口名和仓库地址；回归由 `test:tooling` 覆盖。品牌以 [项目计划的品牌迁移说明](PROJECT_PLAN.md#20-v102-品牌迁移与发布状态) 为准。应用数据标识、系统凭据 service 和 MSI 升级标识是持久兼容身份，不能按显示名称批量替换；Rust library crate 是源码/build 身份，应与当前产品名一致。临时运行须使用当前 Cargo 主程序的确切路径并检查 Windows 产品元数据；不能从 `target` 中通配选取旧 EXE，旧生成物可移至隔离临时目录保留摘要，不混入新包或验收。
 
 完整冒烟：
@@ -90,6 +98,50 @@ Host 命令等待不占运行时状态锁，关停可打断挂起请求并在 1 
 cd src-tauri
 cargo test --test perf_probe -- --ignored --nocapture
 ```
+
+### 2.1 验证并发与内存预算
+
+cargo 的默认并发数等于逻辑核数，且 Rust 编译与 MSVC 链接器共用同一并发额度；Windows debug 链接每个 `link.exe` 峰值约 0.5–1.4 GB。本仓库有 13 个 Rust 集成测试目标，`cargo test --all-features` 会在一次调用内同时链接 lib 测试与全部集成测试二进制。2026-10-18 在 16 逻辑核机器上实测 15 个 `link.exe` 并行、合计约 13.5 GB，把 32 GB 机器压到 99% 内存并卡死。
+
+因此：
+
+- 仓库 `.cargo/config.toml` 固定 `[build] jobs = 4`，同时约束 rustc 与链接器；不要用 `-j` 放宽。
+- 全量验证在最终差异冻结后只跑一次，顺序为 `cargo fmt --check` → `cargo clippy` → `cargo test --all-features`；不要 clippy 与 test 交替反复跑（两者会互相触发重编重链）。
+- 日常改动用定向测试（`cargo test --lib <filter>`、`cargo test --test <name>`），全量留给最终验收。
+- 长命令用受管后台任务执行；工具中断不保证结束 Windows 进程树。开始前确认没有残留 `cargo`/`rustc`/`link` 进程，结束后再次确认它们为空。
+- 不得与 Agent Host 测试或 NSIS 打包并发；可用内存低于约 8 GB 时不启动全量链接。
+- 跑 `scripts/smoke.ps1` 或全量 Cargo 测试前**先退出已安装的桌面实例**。它的 Agent Host 子进程与 WebView 会和测试争用同一份运行时资源：2026-10-28 实测在实例运行期间 smoke 的 `[1/5]` lib 组阻塞 20 分钟以上无进展（测试进程 CPU 冻结在 265s、日志停止增长），关闭实例后同一组 980 项在 99.62s 内全部通过。`scripts/smoke.ps1` 的 `[1/5]` 组因此显式带 `-- --test-threads=2`。
+- Rust 测试二进制默认按逻辑核并行；2026-10-18 在 16 核机器上全并发跑 `cargo test --all-features` 时，两个 Agent Host 端到端用例因 5 秒 ready 预算超时失败（`Coded(Timeout, "Agent Host响应超时…")`），`--test-threads=1` 重跑 6/6 通过，`-- --test-threads=2` 全量 1110 通过/0 失败。作为门禁的全量测试固定 `cargo test --all-features -- --test-threads=2`，Host 相关定向测试用 `--test-threads=1`。
+
+### 2.2 构建缓存位置与清理
+
+编译产物只保存到一个固定位置，由 `.cargo/config.toml` 的 `[build] target-dir = "build-cache/target"` 决定。该相对路径由 Cargo 相对 `.cargo/config.toml` 所在目录（仓库根）解析，与启动 `cargo` 的当前目录无关，因此从仓库根执行 `cargo ... --manifest-path src-tauri/Cargo.toml` 与在 `src-tauri` 内执行都落到同一目录。`CARGO_TARGET_DIR` 若被显式设置则覆盖该值，这是唯一的临时例外，且必须在验证记录中写明。
+
+该目录已被 `.gitignore` 忽略，不得提交。其他脚本不得硬编码构建输出位置：需要安装包或产物路径时，从 `cargo metadata` 的 `target_directory` 读取（`scripts/collect-candidate.mjs` 即按此实现），否则固定位置或覆盖设置一变就会读到空目录。
+
+清理规则：
+
+- 定期审计：`npm run build:cache:status` 打印各顶层条目占用与总预算（50 GiB）；超出预算以非零退出，提示先清理再跑全量构建。
+- 定期清理：`npm run build:cache:clean` 删除 `incremental/` 和最近修改超过 7 天的顶层条目；`--retention-days N` 改保留期，`--dry-run` 只预演。
+- 完全复位：`npm run build:cache:clean -- --all` 删除整个缓存目录，用于怀疑缓存损坏或需要腾空磁盘时；下次构建会重新填充。
+- 清理脚本以 `cargo metadata` 为唯一事实源，并拒绝把范围指向仓库之外或仓库根，避免误删。
+- 全量验收（§2.1）前若缓存已超预算，先清理再构建；不要用删除单个 `*.rlib` 之类的方式手工修剪，Cargo 不保证一致性。
+
+
+
+### 2.3 需求证据矩阵
+
+`tests/acceptance/requirements.json` 记录 R01–R60 每条需求对应的真实用例，`scripts/acceptance-evidence.mjs` 负责校验：
+
+```powershell
+npm run test:acceptance             # 结构 + 引用必须命中真实用例
+npm run test:acceptance -- --strict # 交付门禁：2.0 条目不允许留 gap
+```
+
+- **不要手改引用去凑通过**。改测试名后校验器会失败并给出相近候选，正确做法是同步矩阵；把校验器放宽成「文件存在即通过」等于让门禁失效。
+- 校验器每次从源码重建索引（`src-tauri/src`、`src-tauri/tests` 的 `#[test]`，`src/**/*.test.tsx?` 的 `it(`/`test(`，`docs/QA_PLAYBOOK.md` 的条目 ID），**不读 `build-cache/`**——那里会被 `build:cache:clean` 定期清掉。
+- 真机条目（QA 手册 §14.3 的 M-01~M-14）只能标 `manual: { id, status: "pending" }`，真跑过后才改 `executed`。自动化通过不替代 L6。
+- 新增需求或新卡时先补矩阵条目，再补实现；`status=covered` 必须带至少一条自动化证据，`gap`/`deferred` 必须写 `reason` 说明由哪张卡关闭。
 
 ## 3. 分层规范
 
@@ -216,6 +268,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
+以上命令继承 `.cargo/config.toml` 的 `[build] jobs = 4`，不要用 `-j` 覆盖；并发与内存约束见 [§2.1](#21-验证并发与内存预算)。
+
 ### 5.3 交付改动
 
 额外执行：
@@ -244,6 +298,20 @@ pwsh ./scripts/smoke.ps1
 - 不得把 flaky 失败直接归因于环境而不记录证据。
 
 `fmt`、`clippy`、测试失败应分类处理。只有确认是外部环境前置条件时，才能列为未执行，并写明复现命令和原因。
+
+### 5.5 环境缺项与跳过门
+
+测试依赖本机不具备的前置（真实模型外发、真实 MCP 客户端、目录链接权限）时，**本机默认跳过并打印原因，交付门禁必须把缺前置当失败**：
+
+```powershell
+$env:TEACELL_GATE_STRICT = "1"
+cd src-tauri
+cargo test --all-features
+```
+
+- 跳过分支只允许出现在用例**显式声明**的前置检查里，并且必须 `eprintln!` 写出缺什么；`#[ignore]` 只用于真机/破坏性/性能探针，不能用来让需求证据静默通过。
+- 需要真实外发的用例额外用 `#[ignore]` + `TEACELL_A302_E2E_*` 环境变量显式触发，默认不进入任何门禁。
+- 一门跳过门的用例自身要有反向用例（如 `strict_mode_turns_a_missing_interop_prerequisite_into_a_failure`），证明严格模式确实会失败，而不是只测了宽松分支。
 
 ## 6. 数据库迁移
 
@@ -276,8 +344,8 @@ pwsh ./scripts/smoke.ps1
 ## 8. Git 与提交
 
 - 默认分支为 `main`。
-- 新功能分支使用 `codex/` 前缀，除非用户另有要求。
-- 不提交 `dist/`、`node_modules/`、`src-tauri/target*/`、日志、缓存和临时测试产物。
+- 新分支按目的使用 `feat/`、`fix/`、`docs/`、`chore/` 等前缀，不使用执行工具名，除非用户另有要求；已有 `codex/` 历史分支保持原名。
+- 不提交 `dist/`、`node_modules/`、`build-cache/`、`src-tauri/target*/`、日志、缓存和临时测试产物。
 - 提交前检查 `git diff --check`。
 - 功能、测试和对应文档在同一逻辑提交中。
 - 纯格式化与行为变化分开提交。

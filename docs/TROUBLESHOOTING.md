@@ -1,6 +1,6 @@
 # 排障手册
 
-> 更新日期：2026-09-16
+> 更新日期：2026-11-03
 >
 > 本文档记录高价值故障模式。先取证，再修改；不要根据症状直接删除数据库或缓存。
 
@@ -175,7 +175,7 @@ CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 
 
 - 鉴权、连接、超时：检查连接配置。
 - 非 JSON、未知字段、空组：应剔除或降级关键词，不应整次失败。
-- 若没有降级，检查 `is_config_error` 和 sanitize 路径。
+- 若没有降级，检查 `sanitize_all`（`src-tauri/src/services/super_search_ai.rs`）的三层降级链路，以及鉴权/连接错误是否被误当成可降级输入。代码里没有专门的「配置错误」判定函数，判断配置类错误要看具体调用点的错误码分支。
 
 ## 5. 标签与分面
 
@@ -237,15 +237,41 @@ done/cancelled/interrupted 可以续跑 pending，processing 拒绝重复启动�
 
 显存探测优先使用 NVIDIA 工具。Win32 AdapterRAM 存在 32 位上限问题，不能作为唯一依据。探测不到时必须诚实显示未知，不猜测。
 
+### 6.6 Agent 对话发不出去 / 云模型不回答
+
+按固定错误码定位，不要靠猜。界面提示与码一一对应：
+
+| 提示出现 | 含义 | 处理 |
+|---|---|---|
+| `AGENT_MODEL_NETWORK_DISABLED` | 网关准入未满足（历史错误码名沿用，语义已由「开关未开」改为「配置未就绪」） | 按提示的缺项补：未绑定服务、连接已停用或缺密钥；补齐后即可直接对话，无需另找开关。口径见[实现契约 §6.1](../plans/v2/12-implementation-contracts.md#61-a3-02-agent-模型网关接线) |
+| `AGENT_SERVICE_UNBOUND` | `agent` 用途没绑定服务，或原绑定已被删除 | 在同一面板给 Agent 绑定云模型或本机 Ollama |
+| `AGENT_CREDENTIAL_MISSING` | 绑定的云服务没有可用密钥 | 到「服务管理」补密钥；本机服务不需要密钥，出现此提示说明绑定错了服务 |
+| `AGENT_HOST_INTERRUPTED` | 上次 Host 被强制结束，锁文件还在 | 确认没有进行中的对话后点「恢复 Agent 服务」（`recover=true`） |
+| `AGENT_HOST_STARTING` | 另一个调用者正在启动 | 界面会自动重试约 6 秒；长时间不变说明启动卡住，查日志 |
+| `AGENT_HOST_UNAVAILABLE` | 平台不支持或运行资源缺失 | 非 Windows x64 属预期；Windows 上重装完整安装包（缺 Node/Host 资源会记 `resources_missing` 警告日志） |
+| `AGENT_CONVERSATION_NOT_OPEN` | Host 上会话没打开（常见于 Host 刚重启） | 前端会自动重新打开并重发一次；仍失败请新建对话 |
+| `AGENT_SESSION_NOT_FOUND` | Host 上确实没有该会话文件 | 界面按新会话继续；历史计划与任务卡仍在 |
+
+其它检查：
+
+- 代理只认面板里显式填写的 `http(s)://主机:端口`，**不读系统/环境代理**；公司网络需要代理时必须在这里填，且不支持 socks。
+- 服务地址填到接口路径前缀为止，程序原样拼接 `/chat/completions` 或 `/messages`；智谱写 `https://open.bigmodel.cn/api/paas/v4`，火山写 `https://ark.cn-beijing.volces.com/api/v3`，Ollama 写 `http://localhost:11434/v1`。多写或少写路径段会得到 404。
+- Host 起来但模型无响应时，先看是不是 `TIMEOUT` 或 `UPSTREAM_HTTP`：后者多半是密钥、模型名或服务端限流，不是本机故障。
+- 发送后草稿没有被清空、输入框内容还在，说明这一轮**没有发出**（前端只有确认受理后才清草稿），按上面的提示修正后重试即可。
+
 ## 7. 删除、导出和恢复
 
 ### 7.1 删除文件失败但列表消失
 
 这是严重数据一致性问题。必须检查文件删除是否成功、数据库是否只在成功后更新。失败时保留数据库记录和可重试状态。
 
-### 7.2 move 导出后查看器死链
+### 7.2 导出后查看器死链
 
-移动文件成功后必须同步素材路径。检查部分成功、取消、同名冲突和数据库更新顺序。
+自 A4-01 起库外导出只做复制，库内原文件与原记录都保留，正常路径不会产生死链。若仍出现打不开的素材，按以下顺序排查：
+
+- 后端是否被旧调用方以 `mode="move"` 请求：现在会直接返回 `UNSUPPORTED`（"导出已统一为复制…"），不会执行移动；应改用「复制导出」。
+- 库内移动应走 A4-02 的 `assets.move.prepare/submit`，那里的路径同步在事务与收据内完成。
+- 复制导出的完成摘要若列出失败项，按 `src/components/dialogs/ExportDialog.tsx` 的 `exportErrorLabel` 对照 `TARGET_EXISTS`/`PERMISSION_DENIED`/`DISK_FULL`/`SOURCE_MISSING`/`CANCELLED`/`IO_ERROR`；失败项不会改写库内记录。
 
 ### 7.3 恢复备份后任务状态异常
 
@@ -278,6 +304,8 @@ React `onWheel` 可能是 passive，无法 `preventDefault`。需要原生监听
 
 检查页面边界是否捕获错误、settings normalize 是否失败、组件是否访问不存在字段。错误页必须提供返回素材库或重试路径。
 
+> 若是**整块主区**白屏且日志有 `WebView2 error … 0x8007139F`，见 §8.7（多为 RTSS/Afterburner OSD 注入崩溃，非页面代码错误）。
+
 ### 8.5 前端错误没有进入日志
 
 检查：
@@ -292,6 +320,22 @@ React `onWheel` 可能是 passive，无法 `preventDefault`。需要原生监听
 ### 8.6 暗色模式下状态不可见
 
 检查是否硬编码颜色。修复应回到 `theme.css` 语义变量，不在组件里增加主题分支。
+
+### 8.7 主区整块白屏，日志出现 `WebView2 error … 0x8007139F`
+
+现象：应用启动后主区一片白，前端无 JS 报错，`%APPDATA%\bagertea_ai_media_v2\logs\app.log.*` 出现 `tauri_runtime_wry: WebView2 error: ... HRESULT(0x8007139F)`（"组或资源的状态不是执行请求操作的正确状态"）。
+
+根因（2026-11-03 实证）：第三方 OSD 软件 **RivaTuner Statistics Server（RTSS / MSI Afterburner）** 向 WebView2 渲染子进程（`msedgewebview2.exe`）注入 `RTSSHooks64.dll`，在渲染进程内访问违例（异常码 `0xC0000005`）。渲染子进程崩溃后，wry 对已失效的 webview 报 `0x8007139F`（次生错误，崩溃后约 11s 才记录），窗口只剩空白 surface → 整块白屏。**不是产品代码缺陷**，dev 与打包版同源（同一 `msedgewebview2.exe` 运行时被同一 RTSS 注入）。
+
+取证：查看 `%LOCALAPPDATA%\com.bagertea.aimdeias\EBWebView\Crashpad\reports\*.dmp` 的崩溃转储，`ExceptionStream` 的 `faulting module` 指向 `RTSSHooks64.dll`（同偏移可重复出现即确诊）。
+
+处理：
+1. 退出 RTSS 与 `RTSSHooksLoader64`（任务栏 RTSS/Afterburner 图标 → 退出）；或
+2. RTSS 设置 `Application detection level = None`，或对 `msedgewebview2.exe` 单独建 profile 关闭 OSD；或
+3. 升级/回退 RTSS（7.3.5.28314 对 WebView2 156.x 有确定性崩溃）。
+4. 重启应用验证：`app.log` 不再出现 `0x8007139F`、`reports\` 无新增 `.dmp`、主区正常渲染。
+
+> 完整诊断（minidump 原文、时间线、假设对照、取证）见 `artifacts/assistant-redesign/05-webview-diag.md`。
 
 ## 9. 工具链
 
@@ -320,7 +364,7 @@ Windows 上优先在 PowerShell 运行 cargo。若 GNU `link` 抢占 MSVC linker
 
 ### 9.5 测试/构建产物污染 Git 状态
 
-确认 `.gitignore` 覆盖 `src-tauri/target*/`、`dist/`、日志和缓存。不要把这些目录加入提交。
+确认 `.gitignore` 覆盖 `build-cache/`、`src-tauri/target*/`、`dist/`、日志和缓存。不要把这些目录加入提交。编译产物固定落在仓库根 `build-cache/target`；位置异常时先用 `npm run build:cache:status` 查看 Cargo 实际解析到的目录，再按[开发规范 §2.2](DEVELOPMENT.md#22-构建缓存位置与清理)清理。
 
 ## 10. 修改代码后的最低回归
 

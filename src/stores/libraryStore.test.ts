@@ -371,6 +371,15 @@ describe("W5h-d kinship 合并显示", () => {
           colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
           kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
         },
+        navigation: {
+          shortcuts: [
+            { id: "import", visible: true },
+            { id: "library", visible: true },
+            { id: "ai", visible: true },
+            { id: "treasure", visible: true },
+          ],
+          settingsPinned: false,
+        },
       } as never,
       previewAppearance: null,
     });

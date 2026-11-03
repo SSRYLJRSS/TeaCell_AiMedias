@@ -4,7 +4,7 @@
  *  - 排序 chip 独立 setSort；清除全部走 clearConditions；
  *  - 无 plan（纯手动链路）退回扁平 query 渲染。 */
 import { afterEach, describe, expect, it } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import FilterChips from "@/components/supersearch/FilterChips";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
@@ -53,6 +53,9 @@ function setExprState(expr: QueryExpr | undefined, resolvedTags: { facetKey: str
 }
 
 afterEach(() => {
+  // 先卸载再重置 store：RTL 的自动 cleanup 在本文件的 afterEach 之后才执行，若在这里直接
+  // 写 store，更新会落在仍挂载的 FilterChips 上并报「not wrapped in act」。
+  cleanup();
   useTagStore.setState({ tree: [], facets: [] });
 });
 

@@ -116,6 +116,8 @@ pub fn run() {
                 app.handle(),
                 &scope_dir,
                 std::sync::Arc::clone(&agent_state.db),
+                // A4-05：Host 的写能力与 GUI、MCP 共用同一道维护门。
+                std::sync::Arc::clone(&agent_state.library_maintenance),
                 std::sync::Arc::new(move |frame| {
                     if agent_app.emit("agent-host-event", frame).is_err() {
                         tracing::debug!(operation = "agent_host_event", error_code = "emit_failed");
@@ -236,10 +238,45 @@ pub fn run() {
                 }
             });
 
-            // R-22：启动时清理超期回收站（不常驻定时器；文件 IO 后台线程不堵启动）
+            // 阶段 5 §8.2：应用重启时把遗留 processing 批次标记为 interrupted（可一键续跑）
+            // §5.2：历史任务状态修复属可延迟维护，移入后台线程。
+            let ai_db = std::sync::Arc::clone(&state.db);
+            spawn_maintenance("batch-interrupt-mark", move || {
+                let conn = ai_db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
+                if let Ok(c) = conn {
+                    if let Err(e) = db::ai::mark_interrupted_batches(&c) {
+                        tracing::warn!("标记中断批次失败: {e}");
+                    }
+                }
+            });
+
+            // A1-05：启动只对账并生成恢复摘要，不自动推进任何副作用。
+            //
+            // A4-04：超期回收站清理**排在恢复对账之后、且用同一个线程**执行。
+            // 两件事分开起线程无法保证先后（A4-04 停下条件明确禁止在迁移/恢复
+            // 之前就跑自动清理）；排在同一个线程里是唯一不引入额外同步原语就
+            // 能保证顺序的写法。清理本身是文件 IO，仍在后台线程，不堵启动。
+            let operation_db = std::sync::Arc::clone(&state.db);
             let trash_db = std::sync::Arc::clone(&state.db);
             let trash_dir = scope_dir.clone();
-            spawn_maintenance("trash-purge", move || {
+            // A4-05：迁仓期间禁止自动清理。维护门是应用层标志，这里显式读它——
+            // 光靠「同一个线程」不够，用户可能在应用运行中启动迁仓。
+            let expiry_gate = std::sync::Arc::clone(&state.library_maintenance);
+            spawn_maintenance("operation-recovery", move || {
+                if let Err(error) = services::operations::reconcile_startup(&operation_db) {
+                    tracing::warn!("操作恢复对账失败: {error}");
+                }
+                // A4-05：对账刚把半迁移收到稳定态，此刻若仍有未结束的迁仓，
+                // 说明它没被对账收掉（例如 copying 阶段被中断后等待用户重试），
+                // 这时碰回收站可能删掉新根还没核验到的文件。
+                if expiry_gate.is_active() {
+                    tracing::warn!(
+                        "回收站自动清理跳过：总仓维护进行中（{}）",
+                        expiry_gate.reason().unwrap_or_else(|| "未知原因".to_string())
+                    );
+                    return;
+                }
+                // R-22：恢复对账完成后才清理超期回收站。
                 let days = {
                     let conn = trash_db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
                     match conn {
@@ -258,25 +295,10 @@ pub fn run() {
                 }
             });
 
-            // 阶段 5 §8.2：应用重启时把遗留 processing 批次标记为 interrupted（可一键续跑）
-            // §5.2：历史任务状态修复属可延迟维护，移入后台线程。
-            let ai_db = std::sync::Arc::clone(&state.db);
-            spawn_maintenance("batch-interrupt-mark", move || {
-                let conn = ai_db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
-                if let Ok(c) = conn {
-                    if let Err(e) = db::ai::mark_interrupted_batches(&c) {
-                        tracing::warn!("标记中断批次失败: {e}");
-                    }
-                }
-            });
-
-            // A1-05：启动只对账并生成恢复摘要，不自动推进任何副作用。
-            let operation_db = std::sync::Arc::clone(&state.db);
-            spawn_maintenance("operation-recovery", move || {
-                if let Err(error) = services::operations::reconcile_startup(&operation_db) {
-                    tracing::warn!("操作恢复对账失败: {error}");
-                }
-            });
+            // A5-01：本机外部接入（MCP）。设置里默认关闭；只有用户显式开启过
+            // 才建端点文件并监听。这里不阻塞启动——监听线程自己会回报就绪或失败，
+            // 失败原因会如实出现在设置界面（不假装已启用）。
+            commands::mcp_cmd::start_from_settings(&app.state::<AppState>());
 
             Ok(())
         })
@@ -289,6 +311,10 @@ pub fn run() {
             // 素材
             commands::list_assets,
             commands::list_asset_ids,
+            // A3-08：把当前选择做成不可变快照，供交接与「本次结果视图」复用
+            commands::snapshot_selection,
+            commands::summary_selection,
+            commands::page_selection,
             // A1-03：目录授权和受控资源句柄
             commands::pick_directory_grant,
             commands::list_directory_grants,
@@ -299,10 +325,13 @@ pub fn run() {
             // A1-04：计划审核与操作查询
             commands::list_pending_plans,
             commands::approve_plan,
+            commands::reject_plan,
             commands::get_operation,
             commands::cancel_operation,
             commands::resume_operation,
             commands::list_operation_recovery,
+            // A4-02：已批准操作的显式执行入口
+            commands::start_operation,
             // A1-06：会话索引与持久工作台草稿
             commands::create_conversation,
             commands::list_conversations,
@@ -313,12 +342,16 @@ pub fn run() {
             commands::save_conversation_draft,
             commands::attach_conversation_asset,
             commands::link_conversation,
+            commands::get_conversation_work,
             // A3-01：Rust-owned, offline-only Pi Host lifecycle/protocol.
             commands::agent_host_start,
             commands::agent_host_open_conversation,
             commands::agent_host_send,
+            commands::agent_host_conversation_history,
             commands::agent_host_cancel_run,
             commands::agent_host_close_conversation,
+            commands::get_agent_model_proxy,
+            commands::set_agent_model_proxy,
             // A2-01：导入准备计划（扫描/检查与正式入库分离）
             commands::prepare_import,
             commands::cancel_prepare_import,
@@ -333,8 +366,9 @@ pub fn run() {
             commands::get_numeric_domains,
             commands::get_asset,
             commands::delete_assets,
-            commands::trash_restore,
-            // W2-8：评级/手动旋转（② T17）
+            // A4-03：回收站恢复迁到 commands::restore_assets（逐项核验）
+            // W2-8：收藏/评级/手动旋转（② T17）
+            commands::set_favorite,
             commands::set_rating,
             commands::set_user_rotation,
             commands::dedup_scan,
@@ -380,6 +414,10 @@ pub fn run() {
             commands::list_unlinked_legacy_assets,
             commands::prepare_legacy_unlink,
             commands::prepare_legacy_copy_back,
+            // A4-06：批量处置（逐条仍走同一收据协议）
+            commands::prepare_legacy_unlink_batch,
+            commands::prepare_legacy_copy_back_batch,
+            commands::confirm_legacy_resolutions_batch,
             commands::cancel_legacy_asset_resolution,
             commands::confirm_legacy_asset_resolution,
             commands::reopen_unlinked_legacy_asset,
@@ -433,7 +471,39 @@ pub fn run() {
             commands::export_local_files,
             commands::export_csv_manifest,
             commands::list_export_tasks,
+            commands::export_report,
             commands::cancel_export,
+            // 库内分库移动（A4-02）
+            commands::list_move_targets,
+            commands::move_assets,
+            // 回收站与恢复（A4-03 / A4-04）
+            commands::list_trash,
+            commands::trash_retention,
+            commands::restore_assets,
+            commands::empty_trash,
+            // 总仓维护（A4-05）：软件迁移 / 重新定位 / 维护态 / 收尾
+            commands::preflight_library_migration,
+            commands::library_task_impact,
+            commands::start_library_migration,
+            commands::cancel_library_migration,
+            commands::library_maintenance_status,
+            commands::library_migration_report,
+            commands::resume_library_migration,
+            // 个人常用流程（A4-07）：草稿提取 / 建版本 / 重命名 / 停用 / 管理列表
+            commands::draft_workflow_from_operation,
+            commands::workflow_step_catalog,
+            // 个人常用流程（A4-08）：每次实例化为新计划 + 统一审批
+            commands::prepare_workflow_instance,
+            commands::run_workflow_instance,
+            commands::workflow_run_instance_report,
+            commands::cancel_workflow_instance,
+            commands::create_workflow,
+            commands::update_workflow,
+            commands::rename_workflow,
+            commands::set_workflow_archived,
+            commands::list_workflows,
+            commands::get_workflow,
+            commands::workflow_for_plan,
             // AI 打标
             commands::ai_create_batch,
             commands::ai_prepare_batch,
@@ -478,6 +548,13 @@ pub fn run() {
             // 设置
             commands::get_settings,
             commands::save_settings,
+            // A5-01：本机外部接入（MCP）。只由可信设置界面调用，
+            // 外部客户端无法创建、扩权或撤销自己的配对。
+            commands::mcp_bridge_status,
+            commands::set_mcp_bridge_enabled,
+            commands::create_mcp_pairing,
+            commands::update_mcp_pairing,
+            commands::revoke_mcp_pairing,
             commands::get_data_dir,
             commands::open_data_dir,
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）

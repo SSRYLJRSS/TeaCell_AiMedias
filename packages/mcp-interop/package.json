@@ -1,0 +1,17 @@
+{
+  "name": "teacell-mcp-interop",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": "24.19.0"
+  },
+  "//": "A5-03 的真实 MCP 客户端。刻意与 packages/mcp-bridge 分开：桥接必须保持零依赖（server.test.mjs 会断言 dependencies 与 devDependencies 都为空），而这里要装官方 SDK 才能证明兼容性。",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node --check client-node.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}

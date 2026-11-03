@@ -450,7 +450,8 @@ export default function VideoPlayer({
       {status === "error" && !proxying && !proxyError && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/70 px-4 text-center">
           <p className="text-sm text-[var(--color-danger)]">⚠ 播放失败</p>
-          <p className="max-w-full truncate text-xs text-[var(--color-text-secondary)]">{fileName}</p>
+          {/* M-13：失败态也要能 hover 看到完整文件名，否则长中文名截断后无法确认是哪个文件 */}
+          <p className="max-w-full truncate text-xs text-[var(--color-text-secondary)]" title={fileName}>{fileName}</p>
           <p className="text-xs text-[var(--color-text-secondary)]">{errorText(lastErrorCode.current)}</p>
           <p className="text-[10px] text-[var(--color-text-tertiary)]">错误码 {lastErrorCode.current ?? "--"}</p>
         </div>

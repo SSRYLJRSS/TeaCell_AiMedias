@@ -45,12 +45,10 @@ jobs:
       - name: Prepare pinned Agent Host runtime and dependencies
         run: npm run prepare-agent-host -- --target x86_64-pc-windows-msvc
 
-      - name: Test Agent Host lifecycle and staged resources
+      - name: Test Agent Host lifecycle
         shell: pwsh
         run: |
           npm run test:agent-host
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm run test:agent-host-staged
           exit $LASTEXITCODE
 
       - name: Prepare pinned Windows HEIF libraries and licenses

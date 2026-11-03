@@ -152,9 +152,13 @@ describe("Thumbnail 高清缓存与异步清理", () => {
     const { container } = render(<Thumbnail assetId={1} placeholderPath="d:/t/broken.jpg" alt="a" size={512} fit="cover" />);
     const ph = container.querySelector('img[alt="a"]') as HTMLImageElement;
     expect(ph).not.toBeNull();
-    // 触发占位图 onError
-    ph.dispatchEvent(new Event("error"));
+    // 触发占位图 onError（原生 dispatchEvent 不经 RTL 事件包装，必须显式 act）
+    act(() => {
+      ph.dispatchEvent(new Event("error"));
+    });
     await waitFor(() => expect(vi.mocked(getThumbnailUrl)).toHaveBeenCalled());
+    // 高清请求落地会 setHdUrl/setHdReady；等它渲染出来，否则回写落在测试之外（act 警告）。
+    await waitFor(() => expect(container.querySelector('img[src="asset://hd/1"]')).not.toBeNull());
   });
 
   it("同一素材并发请求合并为一个（single-flight）", async () => {
@@ -163,9 +167,14 @@ describe("Thumbnail 高清缓存与异步清理", () => {
     // 两个组件请求同一 assetId+size
     render(<Thumbnail assetId={7} placeholderPath={null} alt="a" size={512} fit="cover" />);
     render(<Thumbnail assetId={7} placeholderPath={null} alt="b" size={512} fit="cover" />);
-    fireVisible();
+    // IntersectionObserver 回调是同步的，直接调用会立刻 setState，包进 act。
+    act(() => fireVisible());
     // 只发一次底层 IPC
     expect(vi.mocked(getThumbnailUrl)).toHaveBeenCalledTimes(1);
-    resolveFn("asset://hd/7");
+    // 两个组件共享同一 Promise，resolve 后都会回写状态，同样要留在 act 内。
+    await act(async () => {
+      resolveFn("asset://hd/7");
+      await Promise.resolve();
+    });
   });
 });

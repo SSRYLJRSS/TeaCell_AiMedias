@@ -4,7 +4,7 @@
  *  不再读 tagCategories；系统分面永远显示；标签 key 为稳定 facetKey。
  *  按钮规范：主 CTA 黑色实心（确认写入），其余幽灵文字按钮。
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Button from "@/components/common/Button";
 import TagChip from "@/components/library/TagChip";
 import FacetTagInput from "@/components/ai/FacetTagInput";
@@ -86,6 +86,8 @@ export default function Workbench({
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [jump, setJump] = useState("");
+  /** 快捷键只在工作台范围内生效，避免在别处（例如弹窗里）抢键。 */
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   const isRejected = s.status === "rejected";
   const readOnly = s.status === "confirmed" || isRejected;
@@ -187,17 +189,30 @@ export default function Workbench({
     setJump("");
   };
 
-  // 快捷键：←/→ 过片，Enter 确认
+  // 快捷键：←/→ 过片，Enter 确认。只在工作台内、且焦点不在可交互控件上时生效：
+  // 焦点在「拒绝 / 上一张 / 缩略图」等按钮时按 Enter 应该只触发那个按钮，不能顺手把结果写库；
+  // 只读或写入中也不该再发写请求。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+      const target = e.target as HTMLElement | null;
+      const inWorkbench = target ? (rootRef.current?.contains(target) ?? false) : false;
+      // 焦点在别的面板/弹窗里时不要抢键（弹窗自带焦点闭环，这里再兜一层）。
+      if (target && target !== document.body && !inWorkbench) return;
+      // 焦点在工作台内的输入框或按钮上时，这个键属于那个控件：Enter 只该触发它。
+      if (inWorkbench && target?.closest("input, textarea, select, button, a[href], [contenteditable='true']")) {
+        return;
+      }
       if (e.key === "ArrowLeft") onGoto(index - 1);
       else if (e.key === "ArrowRight") onGoto(index + 1);
-      else if (e.key === "Enter") void handleConfirm();
+      else if (e.key === "Enter") {
+        if (readOnly || busy) return;
+        e.preventDefault();
+        void handleConfirm();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, onGoto, handleConfirm]); // B33：补依赖数组，避免每次渲染重绑
+  }, [index, onGoto, handleConfirm, readOnly, busy]); // B33：补依赖数组，避免每次渲染重绑
 
   // W3-4：单行分面渲染（两组共用；maxItems 为 null = 不限，不回退硬编码 3）
   const renderFacetRow = (f: WorkbenchFacet) => {
@@ -245,7 +260,7 @@ export default function Workbench({
   };
 
   return (
-    <>
+    <div ref={rootRef} className="contents">
       {/* ① 大图区 + 底部居中悬浮导航条 */}
       <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-surface)] p-6">
         {imgUrl ? (
@@ -420,6 +435,6 @@ export default function Workbench({
           </div>
         </div>
       </div>
-    </>
+    </div>
   );
 }

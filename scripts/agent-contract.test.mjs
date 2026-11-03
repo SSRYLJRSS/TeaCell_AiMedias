@@ -37,12 +37,14 @@ test('policy mutations cannot expose approval, bypass trash review, or change re
   }
 });
 
-test('formal evaluation mapping preserves all eight original cases and forbidden effects', () => {
+test('formal evaluation mapping preserves every original case and forbidden effect', () => {
   const source = JSON.parse(readFileSync(new URL('../docs/contracts/agent-v1.json', import.meta.url), 'utf8'));
   const fixture = JSON.parse(readFileSync(new URL('../tests/agent-evals/cases.json', import.meta.url), 'utf8'));
   assert.equal(fixture.schemaVersion, 1);
   assert.equal(source.evaluationAdapterVersion, 1);
   assert.deepEqual(Object.keys(source.evaluationCases), fixture.cases.map(value => value.caseId));
+  // E01–E08 are the A0 baseline: their expected counts and forbidden effects are
+  // frozen here so an edit to the fixture cannot silently relax them.
   const expected = { E01: [0, 0, 0], E02: [1, 2, 1], E03: [0, 0, 0], E04: [0, 0, 0], E05: [1, 2, 1], E06: [1, 2, 1], E07: [0, 0, 0], E08: [0, 0, 0] };
   const forbidden = {
     E01: ['source-change', 'asset-write', 'batch-create'],
@@ -54,16 +56,37 @@ test('formal evaluation mapping preserves all eight original cases and forbidden
     E07: ['content-grants-permission', 'shell-execution', 'trash-empty'],
     E08: ['ordinary-approval-clears-trash', 'permanent-delete'],
   };
+  // Cases added by A4-08 (E09 onwards) are checked structurally instead of being
+  // duplicated here: every one must be registered in the contract, declare a real
+  // capability, only reference known error codes, and keep a machine-readable
+  // forbidden token in its first two side-effect entries.
+  const added = new Set(fixture.cases.filter(value => Number(value.caseId.slice(1)) >= 9).map(value => value.caseId));
+  assert.equal(added.size, fixture.cases.length - 8, 'A4-08 cases must use E09 and above');
   for (const value of fixture.cases) {
     const mapping = source.evaluationCases[value.caseId];
+    assert.ok(mapping, `missing evaluation mapping for ${value.caseId}`);
     assert.equal(value.caseVersion, mapping.caseVersion);
     assert.equal(value.capability, mapping.prototypeCapability);
     assert.ok(source.enums.CapabilityId.includes(mapping.capability));
     assert.ok(mapping.expectedErrors.every(code => source.enums.AgentErrorCode.includes(code)));
-    assert.deepEqual(value.allowedResults, expected[value.caseId]);
-    assert.deepEqual([value.assertions.operations, value.assertions.assets, value.assertions.batches], expected[value.caseId]);
+    assert.equal(value.allowedResults.length, 3);
+    assert.deepEqual([value.assertions.operations, value.assertions.assets, value.assertions.batches], value.allowedResults);
     assert.equal(value.assertions.sourcePreserved, true);
-    assert.deepEqual(value.prohibitedSideEffects, forbidden[value.caseId]);
+    assert.ok(Array.isArray(value.prohibitedSideEffects) && value.prohibitedSideEffects.length >= 2);
+    assert.ok(value.prohibitedSideEffects.every(effect => typeof effect === 'string' && effect.length > 0));
+    if (added.has(value.caseId)) {
+      // The first entry is always a machine-readable token so a future adapter can
+      // assert on it; at least one later entry must carry the Chinese policy reason
+      // (the fixture documents its own rationale inside this existing field).
+      assert.match(value.prohibitedSideEffects[0], /^[a-z][a-z-]*$/);
+      assert.ok(value.prohibitedSideEffects.some(effect => /[\u4e00-\u9fff]/.test(effect)), `${value.caseId} needs a Chinese policy reason`);
+      assert.ok(Array.isArray(value.requiredConfirmations));
+      assert.ok(Array.isArray(value.fakeModelResponses) && value.fakeModelResponses.length > 0);
+      assert.equal(typeof value.userUtterance, 'string');
+    } else {
+      assert.deepEqual(value.allowedResults, expected[value.caseId]);
+      assert.deepEqual(value.prohibitedSideEffects, forbidden[value.caseId]);
+    }
   }
 });
 

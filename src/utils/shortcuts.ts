@@ -25,7 +25,13 @@ export function isEditableTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null;
   if (!el) return false;
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
-  return el.isContentEditable === true;
+  if (el.isContentEditable === true) return true;
+  // WP2：打开的菜单/选择器（及其菜单行）与选择器触发器不接收页面快捷键，
+  // 否则方向键会被页面切片/轮播等全局绑定劫持，无法在弹层里上下选。
+  if (el.closest?.('[role="menu"], [role="listbox"], [role="menuitem"], [role="menuitemradio"], [role="option"], button[aria-haspopup]')) {
+    return true;
+  }
+  return false;
 }
 
 /** 焦点是否在播放器根节点或其子节点（player 作用域优先于 viewer/page） */

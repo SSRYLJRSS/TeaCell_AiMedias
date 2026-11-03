@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { Check, ChevronDown, RefreshCw } from "lucide-react";
+import PickerPopover from "@/components/common/PickerPopover";
 
 interface ModelComboboxProps {
   value: string;
@@ -173,11 +174,11 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
 
       {error && <span className="mt-1 text-xs text-[var(--color-danger)]">{error}</span>}
 
-      {open && !loading && items.length > 0 && (
+      <PickerPopover open={open && !loading && items.length > 0} triggerRef={inputRef} width={320} maxHeight={280}>
         <div
           role="listbox"
           aria-label={`${label}列表`}
-          className="absolute top-full right-0 left-0 z-20 mt-1 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] py-1 shadow-lg"
+          className="overflow-y-auto py-1"
           style={{ maxHeight: 240 }}
         >
           {items.map((m, i) => {
@@ -203,7 +204,7 @@ export default function ModelCombobox({ value, onChange, onDiscover, placeholder
             );
           })}
         </div>
-      )}
+      </PickerPopover>
     </div>
   );
 }

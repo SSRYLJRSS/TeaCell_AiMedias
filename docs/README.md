@@ -74,7 +74,7 @@
 | 颜色、布局、控件、交互范式 | `UI_DESIGN_SYSTEM.md` |
 | 搜索计划、分面、AI 查询结构 | 对应 `contracts/*.md` |
 | Node/Pi Host 内部协议 | `contracts/agent-host-protocol-v1.md` |
-| 测试分层、准入准出 | `TEST_STRATEGY.md` |
+| 测试分层、准入准出 | `TEST_STRATEGY.md`；需求→用例的机器可校验映射在 `tests/acceptance/requirements.json`，只记关系不记进度 |
 | 真机验收步骤 | `QA_PLAYBOOK.md` |
 | 性能红线 | `PERFORMANCE.md` |
 | 部署、备份、恢复、本地模型 | `OPERATIONS.md` |

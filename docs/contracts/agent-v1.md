@@ -73,6 +73,18 @@ load和prepare必须指定workflowRef与version，版本为1–4294967295，缺�
 
 操作计数的单位由该操作的固定收据清单定义，不能将不同子域的processed值拼成另一份事实源；total未知时缺省，禁止假百分比。事件revision只用于排序/去重，不能替代持久收据。数据库事务不能回滚文件和网络效果，不承诺跨资源exactly-once。
 
+## 导入入口的设计结论
+
+`imports.prepare` 的协议输出是 `PlanPreview`，其待审对象是**该次导入的 `imports.submit` 计划**——与 `exports.prepare` 同构：prepare 入口返回的是目标 submit 能力的待审计划，而不是一个无需批准的准备结果。这条结论解决了「声明输出 `PlanPreview`、实现返回 `ImportPlanView`」的冲突：
+
+- `ImportPlanView`（`importplan_*` 行，字段为逐项检查清单）是可信 GUI 入库工作台自用的检查视图，**不是协议输出**，也不冒充 `PlanPreview`。它没有 `reviewRef`，因为没有人被要求批准一份清单。
+- 可审核的预览只能由 `imports.submit` 的计划草稿产生。该草稿的唯一构造点是 `src-tauri/src/services/import_submission.rs::submit_draft`：`plans::submit_plan_with_effect` 会用调用方传入的草稿重算 `planHash` 并在不等时作废已存计划，两处各自拼装必然漂移成 `PLAN_CHANGED`，因此协议层适配器必须复用它，不能另建第二份。
+- `imports.submit` 的受理验收与执行排空已解耦：受理由 GUI 确认并落库，排空由 `import_dispatch::drain` 用 `operation_dispatch::execution_caller` 按持久计划的 `originKind` 还原主体。因此「导入操作只由 GUI 主体被消费」不再是限制，不再是拒绝 Pi/MCP 来源导入的理由。
+
+仍未闭合的一条是**来源目录句柄的交接**：本契约[授权](authorization-v1.md)只允许 GUI 通过原生选择器创建目录授权，句柄又绑定 principal+instance+session，模型无法自行取得 `import_source` 目录。**这条已在 A5-03 裁决为 2.0 的发布范围结论，而不是待补缺口**：2.0 不向 Pi/MCP 注册 `imports.*`，两侧工具表都不出现这两个工具（派生面 18 项、实际注册 16 项，差的正是 `imports.prepare`/`imports.submit`）。重新打开它需要先冻结一份新的目录句柄交接设计并重新裁决，届时也只能接受用户为本会话显式交出的 `import_source` 句柄引用，不接受裸路径（裸路径不得变成目录授权），多目录已授权时必须由用户指定来源而不是任选一个；不做这件事的理由与「不注册一个只会失败的工具」相同。
+
+**MCP 侧的结论已冻结为「不发布」**，见 [MCP 桥接契约 §4.1.1](mcp-bridge-v1.md#411-为什么-20-不发布-imports设计结论不是待办)：MCP 调用方的 `session_id` 恒为 `None`，任何为 GUI 会话签发的句柄在 MCP 侧必然解析失败；而「让 GUI 替某个外部连接签发 remembered 授权」虽然机制可行，却要求用户手工把目录句柄抄进客户端配置，等于用「用户别抄错」替换会话隔离。2.0 不接受这个交换，导入与导出继续只由本机可信界面驱动。
+
 ## 错误与恢复条件
 
 | 条件 | 可观察错误及恢复规则 |

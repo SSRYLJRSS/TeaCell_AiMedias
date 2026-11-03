@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "check": "node --check src/bootstrap.mjs && node --check src/host.mjs && node --check src/lease.mjs && node --check src/protocol.mjs && node --check src/sdk-session.mjs && node --check src/gateway-fetch.mjs && node --check src/gateway-rpc.mjs && node --check src/write-queue.mjs"
+    "check": "node --check src/bootstrap.mjs && node --check src/host.mjs && node --check src/lease.mjs && node --check src/protocol.mjs && node --check src/sdk-session.mjs && node --check src/gateway-fetch.mjs && node --check src/gateway-rpc.mjs && node --check src/write-queue.mjs && node --check src/capability-rpc.mjs && node --check src/tools.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.0.4",

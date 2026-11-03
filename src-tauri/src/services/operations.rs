@@ -130,6 +130,20 @@ pub fn reconcile_startup(db: &Database) -> AppResult<Vec<RecoverySummaryView>> {
     // artifacts are inspected off-lock, then their durable result is folded
     // back into each operation's receipts and recovery summary.
     crate::services::import_execute::reconcile_interrupted_imports(db)?;
+    // A move leaves per-file intents in `move_journal`. A rename that already
+    // happened cannot be rolled back by a database transaction, so the journal is
+    // what decides whether each item still needs its path evidence written.
+    crate::services::library_move::reconcile_interrupted_moves(db)?;
+    crate::services::trash::reconcile_interrupted_restores(db)?;
+    // A permanent deletion may have removed bytes without committing its row.
+    // `deletion_journal` is the only evidence of which half completed, so the
+    // sweep runs here before the expiry job is allowed to touch the trash.
+    crate::services::trash::reconcile_interrupted_deletions(db)?;
+    // A library migration that reached `switched` has already moved the locator
+    // to the new root; its evidence rows are the only way back to a consistent
+    // state. This runs before the expiry job for the same reason as above: the
+    // trash sweep must never be the first thing to touch a half-migrated library.
+    crate::services::library_migration::reconcile_interrupted_migration(db)?;
 
     let current_recovery = {
         let conn = db.lock()?;
@@ -496,10 +510,46 @@ pub fn record_item_state(
     let conn = db.lock()?;
     validate_caller(&conn, caller)?;
     require_owner(&conn, caller, operation_ref.as_str())?;
-    let now = now_unix_seconds()?;
     let transaction = conn.unchecked_transaction()?;
-    let updated = operations::update_item(
+    record_item_state_in(
         &transaction,
+        operation_ref,
+        step_ref,
+        item_ref,
+        state,
+        effect_state,
+        error_code,
+        receipt_id,
+        event,
+        db_ref,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 在调用方已开启的事务里落「操作项终态 + 收据 + 进度」。
+///
+/// 领域服务需要把「业务效果」和「收据」写成同一个原子提交时用这个变体。典型
+/// 例子是回收站恢复：清 `deleted_at` 与写成功收据必须同生共死，否则中间失败
+/// 会让对账把「已恢复」误报成失败。授权与归属校验由调用方在更外层完成
+/// （`execute` 的 caller 来自已校验的 plan/operation 上下文），所以这里不
+/// 重复校验，只保证三张表的写入落在同一个事务里。
+#[allow(clippy::too_many_arguments)]
+pub fn record_item_state_in(
+    conn: &rusqlite::Connection,
+    operation_ref: &ResourceRef,
+    step_ref: &ResourceRef,
+    item_ref: &ResourceRef,
+    state: &str,
+    effect_state: &str,
+    error_code: Option<&str>,
+    receipt_id: &ResourceRef,
+    event: &str,
+    db_ref: Option<&str>,
+) -> AppResult<()> {
+    let now = now_unix_seconds()?;
+    let updated = operations::update_item(
+        conn,
         operation_ref.as_str(),
         step_ref.as_str(),
         item_ref.as_str(),
@@ -509,7 +559,7 @@ pub fn record_item_state(
         now,
     )?;
     operations::insert_receipt(
-        &transaction,
+        conn,
         &NewOperationReceipt {
             receipt_id: receipt_id.as_str().to_string(),
             operation_id: operation_ref.as_str().to_string(),
@@ -527,8 +577,7 @@ pub fn record_item_state(
             recorded_at: now,
         },
     )?;
-    operations::refresh_progress(&transaction, operation_ref.as_str(), now)?;
-    transaction.commit()?;
+    operations::refresh_progress(conn, operation_ref.as_str(), now)?;
     Ok(())
 }
 

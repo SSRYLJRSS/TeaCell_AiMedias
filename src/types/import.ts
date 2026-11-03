@@ -88,10 +88,20 @@ export interface ImportPlanVerification {
 }
 
 export interface ImportResultView {
+  /** 产生这些收据的 `imports.submit` 步骤；准备打标范围必须按 (operationId, stepId) 指认。 */
+  sourceStepRef: string;
   imported: number;
+  /** `duplicate_mapped` 的逐项明细；纳入打标必须由用户在这些项上明确勾选。 */
+  duplicateItems: ImportDuplicateView[];
   duplicates: number;
   failed: number;
   failures: ImportFailureView[];
+}
+
+/** 重复映射项：只是「已存在同内容素材」的收据投影，不包含路径。 */
+export interface ImportDuplicateView {
+  itemRef: string;
+  displayName: string;
 }
 
 /** Path-free exception projection for the owning import workbench. */

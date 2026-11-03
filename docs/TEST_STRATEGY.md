@@ -22,12 +22,38 @@
 | L1 Rust 单元 | 纯函数、解析、状态转换、边界 | `src-tauri/src/**` | `cargo test` |
 | L2 Rust 集成 | DB、迁移、搜索、导入导出、格式、AI/Ollama mock | `src-tauri/tests/` | `cargo test --all-features` |
 | L3 前端单元/组件 | store、工具函数、组件交互 | `src/**/*.test.ts(x)` | `npm run test:unit` |
-| L4 构建与静态门禁 | 类型、lint、格式化、clippy、打包与候选工具元数据契约 | 全仓、`scripts/*.mjs` | `npm run test:tooling` 及第 4 节 |
+| L4 构建与静态门禁 | 类型、lint、格式化、clippy、打包与候选工具元数据契约、需求证据矩阵引用校验 | 全仓、`scripts/*.mjs` | `npm run test:tooling` 及第 4 节 |
 | L5 冒烟 | 稳定组 + 网络 mock + 前端全链路 | `scripts/smoke.ps1` | 交付前 |
 | L6 真机 UAT | 桌面窗口、真实素材、跨模块旅程 | [QA_PLAYBOOK.md](QA_PLAYBOOK.md) | 发布前 |
 | L7 性能探针 | 真实文件解码、数据规模、响应时间 | `perf_probe` | 图像/搜索/大数据改动 |
 
 自动化通过不代表产品可发布，L6 是独立发布门禁。
+
+### 2.1 需求证据矩阵（`tests/acceptance/requirements.json`）
+
+`plans/v2/13-requirements-traceability.md` 维护 R01–R60 与任务卡的关系，但它明确「不是完成状态表」，也不承载用例名。真正可校验的映射在 `tests/acceptance/requirements.json`（契约 `acceptance-evidence-v1`），由 `scripts/acceptance-evidence.mjs` 校验：
+
+```powershell
+npm run test:acceptance            # check：结构 + 引用真实存在
+npm run test:acceptance -- --strict # 交付门禁：2.0 条目不允许留 gap
+```
+
+- 每条需求写 `status`（`covered` / `gap` / `deferred`）、`automated.rust`（Rust 用例名）、`automated.frontend`（`file` + `contains`/`minCases`）、`manual`（QA 手册条目 ID + `executed`/`pending`）。
+- **校验器每次从源码重建索引**，不读 `build-cache/`——那目录会被 `npm run build:cache:clean` 定期清理，依赖它等于给门禁装一个静默失效开关。
+- 引用必须精确：名字不存在直接失败并给相近候选；子串匹配到多个也失败，不允许猜。前端证据只写文件路径不算证据（必须 `contains` 或 `minCases`），否则「文件存在」会被当成「行为被覆盖」。
+- `status=covered` 必须有自动化证据；非 `covered` 必须写 `reason` 说明缺什么、由哪张卡补。**真机条目一律 `pending`**，自动化通过不能替 L6 补勾。
+
+改测试名会让引用立刻失效——这是刻意的：矩阵只能跟着真实用例走，不能靠人记。
+
+### 2.2 升级、备份恢复与中断注入证据（`src-tauri/tests/a6_upgrade_restore.rs`）
+
+这一层（L2 Rust 集成）用来证明「文件效果、数据库、用户可见结果」三者一致，而不是只证明函数返回 `Ok`：
+
+- **旧库升级**：`PRAGMA user_version` 在 2.0 全量迁移后仍为 22，A 阶段表由不推进 user_version 的幂等段创建。因此「受支持旧库」用「建全量库 → `PRAGMA foreign_keys=OFF` DROP 26 张 A 阶段表与两个建在 `assets` 上的触发器 → 重开」忠实构造；注意 `video_proxies` 自 v14 起就存在，**不能**回退。断言数据保全 + 第二次启动零写入。
+- **断点注入**：收据回调中途失败时目标文件已落盘但任务不得标成功；`library_move::reconcile_interrupted_moves` 与 `trash::reconcile_interrupted_deletions` 的每个分支（已移动/未移动/不明、已删除/文件仍在/不明）都按磁盘真实状态结算。跨进程丢响应由 `import_submission`/`import_dispatch` 的既有显式重启测试作为证据引用，不重复实现。
+- **备份恢复**：恢复必然轮换 `library_epoch`、清 `root_identity`、降级 health（`db::libraries::invalidate_restored_locator`）；断言备份里的「已批准未提交」计划恢复后仍是历史记录但**提交必须 fail closed**、`operations` 计数为 0、`ai_connections` 只有 `api_key_ref` 无明文列。
+
+`src-tauri/tests/` 下每个 A6 阶段的集成文件都是独立套件，跑法：`cargo test --all-features --test a6_upgrade_restore -- --test-threads=1`。
 
 Windows 后台控制台回归使用 `pwsh ./scripts/test-background-process.ps1`：GUI subsystem 测试父进程经真实 helper 启动控制台 fixture，验证未分配控制台，并验证卡住的探针按期限终止/回收。该检查进入本地完整冒烟与 Windows CI；它证明进程构造策略，不能代替安装包中维护页、媒体与 GPU 操作的真机验收。
 
@@ -73,7 +99,37 @@ cargo test --all-features
 - 不得通过删除测试、skip、only 或放宽契约消除失败。
 - 环境前置导致的 ignored 测试必须列出原因。
 
-### 4.2 交付门禁
+### 4.2 被忽略用例登记
+
+`cargo test --all-features` 下共有 12 个 `#[ignore]`。它们全是**环境前置或破坏性闸门**，不是被静音的必要断言：
+每一条都必须由人工在具备条件时显式执行（`cargo test -- --ignored`）并另行记录，普通门禁不因它们通过而视为已验证。
+
+| 位置 | 用例 | 忽略原因 |
+|---|---|---|
+| `src-tauri/src/services/agent_runtime/gateway.rs:3819` | A3-02 real egress | 需 `TEACELL_A302_E2E_BASE_URL`/`_KEY`/`_MODEL` 与真实网络，且会真实外发 |
+| `src-tauri/src/services/agent_runtime/gateway.rs:4073` | A3-02 real egress | 同上 |
+| `src-tauri/src/services/agent_runtime/gateway.rs:4106` | A3-02 real egress | 同上 |
+| `src-tauri/src/services/agent_runtime/gateway.rs:4164` | A3-02 real egress | 同上 |
+| `src-tauri/tests/dev_maintenance.rs:65` | 破坏性维护 | 需显式路径 + 确认令牌，会先自动备份再改真实库；同文件 `:37` 的安全版随普通门禁执行 |
+| `src-tauri/tests/perf_probe.rs:17` | `probe_real_files` | 手动性能探针，需真实媒体样本目录 |
+| `src-tauri/tests/perf_probe.rs:67` | `probe_exif_error` | 手动诊断 |
+| `src-tauri/tests/perf_probe.rs:97` | `probe_raw_benchmark` | 手动性能探针，需真实 RAW 样本目录 |
+| `src-tauri/tests/perf_probe.rs:182` | `probe_mixed_decode_throughput` | 手动性能探针 |
+| `src-tauri/tests/perf_probe.rs:218` | `probe_raw_library_walk` | 手动性能探针，需真实样本 |
+| `src-tauri/tests/perf_probe.rs:378` | `probe_raw_dimension_walk` | 手动性能探针，需真实样本 |
+| `src-tauri/tests/qa_edge_tests.rs:1370` | 真机验收 | 写真实库，仅手动跑 |
+
+前端不得存在 `skip`/`only`，现存 `skip` 已全部清除。此前 `src/pages/SettingsPage.test.tsx` 曾用 `describe.skip`
+挂两个「无配置条目分面的 AI 行为」用例，但它们断言的控件（`参与 AI 打标与搜索`、`给 AI 的识别规则`）
+在 `aiFacetConfigs` 于 W3/V20 合表移除后已不存在，属于**永远不会执行的死测试**；
+同一行为由 `src/components/settings/FacetManagePanel.test.tsx` 覆盖，因此按测试纪律删除而不是继续 skip。
+
+React 异步等待噪声（`An update to ... was not wrapped in act(...)`）只允许用「把渲染与其引发的微任务放进
+act 边界」消除，不得 mock console、不得降低等待强度。实测约束：`await act(async () => { render(...) })`
+与「渲染后立即同步断言」的用例链不相容（提交时机后移会让同步读到的还是旧树），所以这类清理必须**逐文件
+实跑比对通过数与噪声数**，任一指标劣化即回滚。共享 helper 见 `src/test/render.tsx` 的 `actRender`。
+
+### 4.3 交付门禁
 
 ```powershell
 npm run build

@@ -4,12 +4,12 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { listAssetIds, listAssets } from "@/api/assets";
+import { listAssetIds, listAssets, setFavorite, setRating } from "@/api/assets";
 import AssetGrid from "@/components/library/AssetGrid";
 import GridToolbar from "@/components/library/GridToolbar";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
-import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import { useSettingsStore, DEFAULT_APPEARANCE, DEFAULT_NAVIGATION } from "@/stores/settingsStore";
 import type { Settings } from "@/types/settings";
 import type { Asset } from "@/types/asset";
 
@@ -19,6 +19,8 @@ vi.mock("@/api/assets", () => ({
   listAssetIds: vi.fn(),
   getAssetUrls: vi.fn().mockResolvedValue([]),
   revealInFolder: vi.fn().mockResolvedValue(undefined),
+  setRating: vi.fn().mockResolvedValue(1),
+  setFavorite: vi.fn().mockResolvedValue(1),
 }));
 vi.mock("@/api/thumbnail", () => ({
   getThumbnailUrl: vi.fn().mockResolvedValue("asset://thumb/hd.webp"),
@@ -221,7 +223,7 @@ describe("AssetGrid 单击选择语义", () => {
     // 右键行为：a2 加入选中，a1 保留（F19 追加语义）
     expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([1, 2]);
     // 菜单出现且包含对选中集有意义的条目
-    await waitFor(() => expect(screen.getByText("导出")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("复制导出")).toBeInTheDocument());
   });
 
   it("右键已选中卡片 → 选中集不变（允许多选右键操作）", async () => {
@@ -235,15 +237,73 @@ describe("AssetGrid 单击选择语义", () => {
     expect(sel).toEqual([1, 2]); // 多选保留，未被反选/清空
   });
 
-  it("右键素材菜单不再提供评级功能", async () => {
+  it("右键素材菜单提供评级与收藏入口，选中后可批量设星（M-14b / PRD R-16 / J-03）", async () => {
+    // 原用例断言「右键菜单不再提供评级功能」，那是 683628a 误删后的状态；
+    // PRD R-16 与 QA_PLAYBOOK J-01/J-03 都把评级列为 2.0 必备能力，这里改为钉住恢复后的入口。
     const assets = [mkAsset(1)];
     useLibraryStore.setState({ items: assets, viewItems: assets, total: 1 });
     renderGrid();
 
     fireEvent.contextMenu(cardByName("a1.jpg"));
-    await waitFor(() => expect(screen.getByText("导出")).toBeInTheDocument());
-    expect(screen.queryByText("评级")).not.toBeInTheDocument();
-    expect(screen.queryByText("清除评级")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("复制导出")).toBeInTheDocument());
+    expect(screen.getByText("评级")).toBeInTheDocument();
+    expect(screen.getByText("收藏 / 取消收藏")).toBeInTheDocument();
+  });
+
+  it("右键评级子菜单批量设星写库并同步星标，取消收藏也只改选中项（J-01 / J-03）", async () => {
+    const assets = [mkAsset(1), mkAsset(2), mkAsset(3)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 3 });
+    renderGrid();
+
+    // 选中 a1、a2 后右键打开菜单，走「评级」二级菜单
+    fireEvent.click(cardByName("a1.jpg"));
+    fireEvent.contextMenu(cardByName("a2.jpg"));
+    await waitFor(() => expect(screen.getByText("评级")).toBeInTheDocument());
+    fireEvent.mouseEnter(screen.getByText("评级"));
+    const fourStars = await screen.findByText("★★★★");
+    fireEvent.click(fourStars);
+
+    await waitFor(() => expect(setRating).toHaveBeenCalledWith([1, 2], 4));
+    // 本地回写：两张都变成 4 星，未选中的 a3 不受影响
+    const byId = () => Object.fromEntries(useLibraryStore.getState().items.map((a) => [a.id, a.rating ?? 0]));
+    await waitFor(() => expect(byId()).toEqual({ 1: 4, 2: 4, 3: 0 }));
+  });
+
+  it("右键「收藏 / 取消收藏」批量写入，全部已收藏时再次点击是取消（可预期取反）", async () => {
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
+    renderGrid();
+
+    fireEvent.click(cardByName("a1.jpg"));
+    fireEvent.contextMenu(cardByName("a2.jpg"));
+    await waitFor(() => expect(screen.getByText("收藏 / 取消收藏")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("收藏 / 取消收藏"));
+    await waitFor(() => expect(setFavorite).toHaveBeenCalledWith([1, 2], true));
+
+    // 再次打开菜单点同一项：两张都已收藏 → 整体取消
+    fireEvent.contextMenu(cardByName("a1.jpg"));
+    await waitFor(() => expect(screen.getByText("收藏 / 取消收藏")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("收藏 / 取消收藏"));
+    await waitFor(() => expect(setFavorite).toHaveBeenLastCalledWith([1, 2], false));
+  });
+
+  it("右键收藏写库失败时回滚星标并用 role=alert 提示，与查看器和批量操作栏口径一致（U-04）", async () => {
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
+    vi.mocked(setFavorite).mockRejectedValueOnce(new Error("数据库忙"));
+    renderGrid();
+
+    fireEvent.click(cardByName("a1.jpg"));
+    fireEvent.contextMenu(cardByName("a2.jpg"));
+    await waitFor(() => expect(screen.getByText("收藏 / 取消收藏")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("收藏 / 取消收藏"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("收藏没有保存");
+    expect(alert.textContent).toContain("数据库忙");
+    // 回滚：两张都回到未收藏，不假装已经保存
+    const byId = () => Object.fromEntries(useLibraryStore.getState().items.map((a) => [a.id, a.favorite ?? 0]));
+    await waitFor(() => expect(byId()).toEqual({ 1: 0, 2: 0 }));
   });
 
   it("右键菜单打开期间 Ctrl+A/Ctrl+I 不生效（防误触反选全选）", async () => {
@@ -260,7 +320,7 @@ describe("AssetGrid 单击选择语义", () => {
     expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([1, 2]);
     // 关闭菜单后快捷键恢复
     fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByText("导出")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("复制导出")).toBeNull());
     fireEvent.keyDown(window, { key: "a", ctrlKey: true });
     await waitFor(() =>
       expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([1, 2]),
@@ -309,11 +369,13 @@ describe("AssetGrid §13.1 列数变化稳定性", () => {
     // 选中 a2 后改窄屏（2 列）→ 列数变化，卡片重排
     fireEvent.click(cardByName("a2.jpg"));
     expect(useSelectionStore.getState().selected.has(2)).toBe(true);
-    resizeTo(340);
+    // ResizeObserver 回调是同步的：直接调用会立刻让网格重算列数并 setState，必须包进 act。
+    act(() => resizeTo(340));
     // 立即显式触发重排后（虚拟器按新列数渲染），文件名仍与 id 对应、选中不丢
-    await new Promise((r) => setTimeout(r, 100));
-    expect(screen.getByAltText("a1.jpg")).toBeInTheDocument();
-    expect(screen.getByAltText("a2.jpg")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByAltText("a1.jpg")).toBeInTheDocument();
+      expect(screen.getByAltText("a2.jpg")).toBeInTheDocument();
+    });
     expect(useSelectionStore.getState().selected.has(2)).toBe(true);
     // a2 的卡片 aria-selected 仍在（卡片未被整行 key 重置）
     expect(cardByName("a2.jpg").getAttribute("aria-selected")).toBe("true");
@@ -344,6 +406,7 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
       customDownloadSources: [],
       modelDownloadProxy: "",
       appearance: DEFAULT_APPEARANCE,
+      navigation: DEFAULT_NAVIGATION,
     };
   }
 
@@ -477,7 +540,7 @@ describe("AssetGrid §4.6 截断安全", () => {
     await waitFor(() => expect(useSelectionStore.getState().truncated).toBe(true));
 
     fireEvent.contextMenu(cardByName("a1.jpg"));
-    fireEvent.click(screen.getByText("导出"));
+    fireEvent.click(screen.getByText("复制导出"));
     await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
     expect(confirmSpy.mock.calls[0][0]).toContain("100010");
     expect(onExport).not.toHaveBeenCalled(); // 拒绝确认 → 不执行

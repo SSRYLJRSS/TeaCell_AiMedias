@@ -63,6 +63,11 @@ struct TaggingPlanSnapshot {
     source_fingerprint: String,
     existing_batch_id: Option<i64>,
     selected_limit: Option<u32>,
+    /// A3-03：按「用户选中的一批素材」准备的计划才有这一项。提交和开始打标时用
+    /// 它重新解析选择快照，复验素材集合与 MIME 没有被替换；为空表示来自导入操作
+    /// 或已有批次，那两条路径各自复验自己的源。老计划反序列化时缺省为空。
+    #[serde(default)]
+    selection_source_ref: Option<String>,
     selection: Vec<TaggingSelectionItem>,
     config_hash: String,
     config: FrozenTaggingConfig,
@@ -109,8 +114,13 @@ struct PrepareInput<'a> {
     included_duplicate_item_ids: Vec<String>,
     existing_batch_id: Option<i64>,
     selected_limit: Option<u32>,
+    /// 素材集合来自 agent 选择快照时的引用；提交/开始打标时用它复验源集合。
+    selection_source_ref: Option<&'a str>,
     selection: Vec<TaggingSelectionItem>,
     config: FrozenTaggingConfig,
+    /// 模型在自然语言里补充的打标要求，只进入审批摘要（让人看清它想做什么），
+    /// 不改变冻结的请求预算、分类或提示词版本。
+    operator_note: Option<String>,
 }
 
 pub fn prepare_existing_batch(
@@ -169,8 +179,10 @@ pub fn prepare_existing_batch(
             included_duplicate_item_ids: Vec::new(),
             existing_batch_id: Some(batch_id),
             selected_limit: limit,
+            selection_source_ref: None,
             selection,
             config,
+            operator_note: None,
         },
     )
 }
@@ -209,7 +221,7 @@ fn reuse_existing_batch_plan(
             .ok_or_else(|| AppError::from(AgentErrorCode::PlanChanged))?,
     )?;
     link_matches_snapshot(&link, &stored)?;
-    validate_source_unchanged(&conn, &stored)?;
+    validate_source_unchanged(&conn, caller, &stored)?;
     let operation_step = operations_db::operation_step(&conn, &link.operation_id, &link.step_id)?
         .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
     let deadline = link.deadline_at.or_else(|| {
@@ -272,8 +284,10 @@ fn reuse_existing_batch_plan(
                 included_duplicate_item_ids: Vec::new(),
                 existing_batch_id: Some(batch_id),
                 selected_limit,
+                selection_source_ref: None,
                 selection: remaining.to_vec(),
                 config: current_config.clone(),
+                operator_note: None,
             },
         );
     }
@@ -336,8 +350,78 @@ pub fn prepare_from_import(
             included_duplicate_item_ids: included,
             existing_batch_id: None,
             selected_limit: None,
+            selection_source_ref: None,
             selection,
             config,
+            operator_note: None,
+        },
+    )
+}
+
+/// A3-03：把「用户选中的一批素材 + 指定的打标服务」映射成待审打标计划。
+///
+/// 这是模型可调用的入口（`tea_tagging_prepare`）。安全边界：
+/// * 素材范围来自 `selection_ref`，只能解析调用方自己拥有的选择；模型无法凭空指定素材 ID。
+/// * `service_ref` 必须等于当前**已绑定**的打标连接。绑定点是用户在打标页做出的决定，
+///   直接用它冻结模型与预算；模型点另一家服务只会得到明确拒绝，而不是悄悄换一个
+///   更贵的模型去外发。
+/// * 真正的外发仍要 GUI 批准 + 单独「开始打标」，这里只产出 `pending` 计划。
+pub fn prepare_from_selection(
+    db: &Database,
+    caller: &CallerContext,
+    selection_ref: &ResourceRef,
+    service_ref: &ResourceRef,
+    instructions: &str,
+) -> AppResult<TaggingPreparation> {
+    check_capability_entry(CapabilityId::TaggingPrepare, caller).map_err(AppError::from)?;
+    let resolved = crate::services::selections::resolve(db, caller, selection_ref)?;
+    if resolved.asset_ids.is_empty() {
+        return Err(AppError::invalid_arg("没有可提交的打标素材"));
+    }
+    if resolved.truncated {
+        return Err(AppError::invalid_arg(
+            "这次选择的素材太多，请缩小范围后再试",
+        ));
+    }
+    let (selection, config) = {
+        let conn = db.lock()?;
+        libraries::ensure_managed_assets(&conn, &resolved.asset_ids)?;
+        let mut items = Vec::with_capacity(resolved.asset_ids.len());
+        for asset_id in &resolved.asset_ids {
+            let asset = crate::db::assets::get(&conn, *asset_id)?;
+            items.push(TaggingSelectionItem {
+                asset_id: *asset_id,
+                mime_type: asset.mime_type,
+                suggestion_id: None,
+                receipts: Vec::new(),
+            });
+        }
+        let config = frozen_config(&conn)?;
+        (items, config)
+    };
+    // 绑定的连接是用户的选择；模型只能确认它，不能替换它。
+    if config.connection.id != service_ref.as_str() {
+        return Err(AppError::invalid_arg(
+            "指定的打标服务不是当前已绑定的服务，请先在打标页切换或改选当前服务",
+        ));
+    }
+    // instructions 只进入审批摘要，让审批卡片如实反映模型想做什么；它不改变冻结参数。
+    let operator_note = {
+        let trimmed = instructions.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    prepare(
+        db,
+        caller,
+        PrepareInput {
+            source: None,
+            included_duplicate_item_ids: Vec::new(),
+            existing_batch_id: None,
+            selected_limit: None,
+            selection_source_ref: Some(selection_ref.as_str()),
+            selection,
+            config,
+            operator_note,
         },
     )
 }
@@ -352,8 +436,10 @@ fn prepare(
         included_duplicate_item_ids,
         existing_batch_id,
         selected_limit,
+        selection_source_ref,
         selection,
         config,
+        operator_note,
     } = input;
     if selection.is_empty() {
         return Err(AppError::invalid_arg("没有可提交的打标素材"));
@@ -368,6 +454,7 @@ fn prepare(
         &included_duplicate_item_ids,
         existing_batch_id,
         selected_limit,
+        selection_source_ref,
     )?;
     let config_json = serde_json::to_value(&config)?;
     let config_hash = full_hash(&config_json)?;
@@ -379,6 +466,17 @@ fn prepare(
         &config,
         request_limit,
     );
+    // 模型的补充要求只影响人读的摘要；预算、分类和提示词版本都已冻结，
+    // 所以它不能通过措辞扩大外发范围。
+    let summary = match operator_note.as_deref() {
+        Some(note) => {
+            let mut text = summary;
+            text.push_str("\n模型补充的打标要求：");
+            text.push_str(note);
+            text
+        }
+        None => summary,
+    };
     let snapshot = TaggingPlanSnapshot {
         schema_version: 1,
         source_operation_id: source.map(|value| value.0.to_string()),
@@ -387,6 +485,7 @@ fn prepare(
         source_fingerprint: source_fingerprint.clone(),
         existing_batch_id,
         selected_limit,
+        selection_source_ref: selection_source_ref.map(|value| value.to_string()),
         selection,
         config_hash: config_hash.clone(),
         config,
@@ -523,7 +622,7 @@ pub fn submit_plan(
         }
     }
 
-    let current_snapshot = capture_current_snapshot(db, &stored)?;
+    let current_snapshot = capture_current_snapshot(db, caller, &stored)?;
     let current_json = serde_json::to_string(&current_snapshot)?;
     let current_draft = draft_from_record(&record, current_json)?;
     let mut created_batch_id = None;
@@ -692,7 +791,7 @@ pub fn start(
         if current_hash != stored.config_hash {
             return Err(AppError::from(AgentErrorCode::PlanChanged));
         }
-        validate_source_unchanged(&conn, &stored)?;
+        validate_source_unchanged(&conn, caller, &stored)?;
         let suggestions = ai::list_suggestions(&conn, link.batch_id)?;
         let allowed = stored
             .selection
@@ -1290,6 +1389,7 @@ fn selection_fingerprint(
     included_duplicates: &[String],
     existing_batch_id: Option<i64>,
     selected_limit: Option<u32>,
+    selection_source_ref: Option<&str>,
 ) -> AppResult<String> {
     full_hash(&serde_json::json!({
         "sourceOperationId": source.map(|value| value.0),
@@ -1297,7 +1397,8 @@ fn selection_fingerprint(
         "selection": selection,
         "includedDuplicateItemIds": included_duplicates,
         "existingBatchId": existing_batch_id,
-        "selectedLimit": selected_limit
+        "selectedLimit": selected_limit,
+        "selectionSourceRef": selection_source_ref
     }))
 }
 
@@ -1441,23 +1542,25 @@ fn validate_start_snapshot_in_conn(
     {
         return Err(AppError::from(AgentErrorCode::PlanChanged));
     }
-    capture_current_snapshot_in_conn(conn, stored)?;
+    capture_current_snapshot_in_conn(conn, caller, stored)?;
     Ok(current_link)
 }
 
 fn capture_current_snapshot(
     db: &Database,
+    caller: &CallerContext,
     original: &TaggingPlanSnapshot,
 ) -> AppResult<TaggingPlanSnapshot> {
     let conn = db.lock()?;
-    capture_current_snapshot_in_conn(&conn, original)
+    capture_current_snapshot_in_conn(&conn, caller, original)
 }
 
 fn capture_current_snapshot_in_conn(
     conn: &Connection,
+    caller: &CallerContext,
     original: &TaggingPlanSnapshot,
 ) -> AppResult<TaggingPlanSnapshot> {
-    validate_source_unchanged(conn, original)?;
+    validate_source_unchanged(conn, caller, original)?;
     let selection = if let Some(batch_id) = original.existing_batch_id {
         let suggestions = ai::list_suggestions(conn, batch_id)?;
         let eligible = eligible_suggestions(&suggestions);
@@ -1476,6 +1579,8 @@ fn capture_current_snapshot_in_conn(
             return Err(AppError::from(AgentErrorCode::PlanChanged));
         }
         current
+    } else if let Some(selection_ref) = original.selection_source_ref.as_deref() {
+        selection_source_items(conn, caller, selection_ref)?
     } else {
         import_selection(
             conn,
@@ -1507,6 +1612,7 @@ fn capture_current_snapshot_in_conn(
         source_fingerprint: original.source_fingerprint.clone(),
         existing_batch_id: original.existing_batch_id,
         selected_limit: original.selected_limit,
+        selection_source_ref: original.selection_source_ref.clone(),
         selection,
         config_hash,
         config,
@@ -1517,8 +1623,59 @@ fn capture_current_snapshot_in_conn(
     })
 }
 
-fn validate_source_unchanged(conn: &Connection, snapshot: &TaggingPlanSnapshot) -> AppResult<()> {
+/// Re-read the frozen agent selection and rebuild its items exactly as
+/// `prepare_from_selection` did, so submit/start can prove the素材集合 wasn't swapped.
+///
+/// The selection row is insert-only and primary-keyed, so it cannot be rebound;
+/// its own TTL only governs handing off a *new* plan, while an already approved
+/// plan is governed by the plan's expiry. Here we therefore re-check authority
+/// (principal / library / epoch) and the media types, not the handoff window.
+fn selection_source_items(
+    conn: &Connection,
+    caller: &CallerContext,
+    selection_ref: &str,
+) -> AppResult<Vec<TaggingSelectionItem>> {
+    let stored = crate::db::selections::get(conn, selection_ref)?
+        .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
+    if stored.principal_id != caller.principal_id.as_str() {
+        return Err(AppError::from(AgentErrorCode::Unauthorized));
+    }
+    if stored.library_id != caller.library.library_id.as_str()
+        || stored.library_epoch != caller.library.library_epoch.as_str()
+    {
+        return Err(AppError::from(AgentErrorCode::LibraryChanged));
+    }
+    if stored.truncated {
+        return Err(AppError::invalid_arg(
+            "这次选择的素材太多，请缩小范围后再试",
+        ));
+    }
+    let mut items = Vec::with_capacity(stored.asset_ids.len());
+    for asset_id in &stored.asset_ids {
+        let asset = crate::db::assets::get(conn, *asset_id)?;
+        items.push(TaggingSelectionItem {
+            asset_id: *asset_id,
+            mime_type: asset.mime_type,
+            suggestion_id: None,
+            receipts: Vec::new(),
+        });
+    }
+    Ok(items)
+}
+
+fn validate_source_unchanged(
+    conn: &Connection,
+    caller: &CallerContext,
+    snapshot: &TaggingPlanSnapshot,
+) -> AppResult<()> {
     if snapshot.existing_batch_id.is_some() {
+        return Ok(());
+    }
+    if let Some(selection_ref) = snapshot.selection_source_ref.as_deref() {
+        let selection = selection_source_items(conn, caller, selection_ref)?;
+        if selection != snapshot.selection {
+            return Err(AppError::from(AgentErrorCode::PlanChanged));
+        }
         return Ok(());
     }
     let selection = import_selection(

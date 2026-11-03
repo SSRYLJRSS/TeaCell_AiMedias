@@ -653,10 +653,12 @@ fn tag_ops_record_and_undo() -> AppResult<()> {
     assert_eq!(ops.len(), 2);
     assert!(ops.iter().all(|o| o.batch_id.is_none()));
 
-    // AI 确认流写 add 流水带 batch_id
+    // AI 确认流写 add 流水带 batch_id（先让 AI 真的产出建议，这才是真实流程：
+    // 没有建议项时确认只会被判定为「审核期新增」，按 M-07 语义应记 manual）
     let batch = ai::create_batch(&conn, &[id], "cloud")?;
     let sugg = ai::list_suggestions(&conn, batch.id)?.remove(0);
     let tags_map = ai::CategorizedTags::from([("场景".to_string(), vec!["夜景".to_string()])]);
+    ai::set_suggestion_tags(&conn, sugg.id, &tags_map)?;
     ai::confirm_suggestion(&conn, sugg.id, &tags_map)?;
     let ai_ops = tag_ops::recent(&conn, 100)?;
     let add_op = ai_ops
@@ -736,6 +738,111 @@ fn undo_ai_batch_keeps_manually_readded_tag() -> AppResult<()> {
     Ok(())
 }
 
+// M-07（真机走查 2026-10-27 发现）：审核时**手工新增**的标签必须记人工来源。
+// 旧行为把确认后的最终标签全集一律按批次来源写（source=ai_local / ai_cloud +
+// source_batch_id=批次），导致：① 界面给手工标签挂「AI」角标；② 撤销该批次时
+// 连用户手填的标签一起删掉，违反 PRD R-37「撤销 AI 批次不得误删后续手工标签」。
+#[test]
+fn confirm_records_review_added_tag_as_manual_and_undo_keeps_it() -> AppResult<()> {
+    let conn = setup();
+    let id = add_asset(&conn, "d:/p/m07_1.jpg", "m07_1.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[id], "local")?;
+    let sug = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    // AI 原建议只有一个标签
+    let suggested = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    ai::set_suggestion_tags(&conn, sug.id, &suggested)?;
+    // 用户在审核时又手工加了一个
+    let reviewed = ai::CategorizedTags::from([(
+        "scene".to_string(),
+        vec!["海边".to_string(), "手工标签验证".to_string()],
+    )]);
+    ai::confirm_suggestion(&conn, sug.id, &reviewed)?;
+
+    let (ai_source, ai_batch): (String, Option<i64>) = conn.query_row(
+        "SELECT at.source, at.source_batch_id FROM asset_tags at
+           JOIN tags t ON t.id = at.tag_id
+          WHERE at.asset_id = ?1 AND t.name = '海边'",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(ai_source, "ai_local", "AI 原本建议的标签仍应记 AI 来源");
+    assert_eq!(ai_batch, Some(batch.id), "AI 标签仍归属本批次");
+
+    let (manual_source, manual_batch, manual_state, manual_by): (
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+    ) = conn.query_row(
+        "SELECT at.source, at.source_batch_id, at.review_state, at.confirmed_by
+           FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+          WHERE at.asset_id = ?1 AND t.name = '手工标签验证'",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    assert_eq!(
+        manual_source, "manual",
+        "审核时手工新增的标签不能被标成 AI 来源"
+    );
+    assert_eq!(
+        manual_batch, None,
+        "手工标签必须清空 source_batch_id，否则撤销批次会误删"
+    );
+    assert_eq!(manual_state, "manual");
+    assert_eq!(manual_by.as_deref(), Some("manual"));
+
+    // 撤销该批次：AI 标签被摘除，手工标签保留（R-37）
+    assert!(tag_ops::undo_batch(&conn, batch.id)? >= 1);
+    let names: Vec<String> = assets::get(&conn, id)?
+        .tags
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "海边"),
+        "AI 标签应随批次撤销被摘除"
+    );
+    assert!(
+        names.iter().any(|n| n == "手工标签验证"),
+        "撤销 AI 批次不得误删审核时手工新增的标签（PRD R-37）"
+    );
+    Ok(())
+}
+
+// M-07 同族：审核时把 AI 建议的标签全部替换成自建标签时，自建标签同样记 manual。
+#[test]
+fn confirm_records_fully_replaced_tags_as_manual() -> AppResult<()> {
+    let conn = setup();
+    let id = add_asset(&conn, "d:/p/m07_2.jpg", "m07_2.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[id], "cloud")?;
+    let sug = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    let suggested = ai::CategorizedTags::from([("scene".to_string(), vec!["夜景".to_string()])]);
+    ai::set_suggestion_tags(&conn, sug.id, &suggested)?;
+    let reviewed = ai::CategorizedTags::from([("scene".to_string(), vec!["晨雾".to_string()])]);
+    ai::confirm_suggestion(&conn, sug.id, &reviewed)?;
+
+    let (source, batch_id): (String, Option<i64>) = conn.query_row(
+        "SELECT at.source, at.source_batch_id FROM asset_tags at
+           JOIN tags t ON t.id = at.tag_id
+          WHERE at.asset_id = ?1 AND t.name = '晨雾'",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(source, "manual", "替换进的自建标签不是 AI 产出");
+    assert_eq!(batch_id, None);
+    let ops_batch: Option<i64> = conn
+        .query_row(
+            "SELECT o.batch_id FROM tag_ops o JOIN tags t ON t.id = o.tag_id
+              WHERE o.asset_id = ?1 AND t.name = '晨雾' ORDER BY o.id DESC",
+            [id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    assert_eq!(ops_batch, None, "手工标签的流水不应带批次，避免被撤销回滚");
+    Ok(())
+}
+
 // D-6：批次 A 添加、批次 B 对同一素材同一标签确认——当前单归属边界：A 撤销会删除该关联，
 // B 没有自己的关联可恢复（INSERT OR IGNORE 不产生新行）。测试名写明预期语义。
 #[test]
@@ -745,11 +852,13 @@ fn cross_batch_single_ownership_undo_a_removes_tag_shared_with_b() -> AppResult<
     let batch_a = ai::create_batch(&conn, &[id], "cloud")?;
     let sug_a = ai::list_suggestions(&conn, batch_a.id)?.remove(0);
     let tags = ai::CategorizedTags::from([("subject".to_string(), vec!["杯子".to_string()])]);
+    ai::set_suggestion_tags(&conn, sug_a.id, &tags)?;
     ai::confirm_suggestion(&conn, sug_a.id, &tags)?;
 
     // 批次 B 确认同一素材同一标签（INSERT OR IGNORE 不产生新的关联行）
     let batch_b = ai::create_batch(&conn, &[id], "cloud")?;
     let sug_b = ai::list_suggestions(&conn, batch_b.id)?.remove(0);
+    ai::set_suggestion_tags(&conn, sug_b.id, &tags)?;
     ai::confirm_suggestion(&conn, sug_b.id, &tags)?;
     let at_rows: i64 = conn.query_row("SELECT COUNT(*) FROM asset_tags", [], |r| r.get(0))?;
     assert_eq!(at_rows, 1, "单归属：同一关联只有一行");
@@ -2276,6 +2385,43 @@ fn rating_compiles_and_filters() -> AppResult<()> {
 }
 
 #[test]
+fn favorite_toggles_and_persists() -> AppResult<()> {
+    // M-14b（PRD R-16 / L-01）：`de1fdb9` 把 set_favorite 命令与前端入口一起删掉了，
+    // 但 assets.favorite 列与索引一直在。这里钉住恢复后的语义：能开、能关、
+    // 批量只影响传入的 id，且未托管素材被拒绝（与 set_rating 同一道校验）。
+    let conn = setup();
+    let a1 = add_asset(&conn, "d:/p/f1.jpg", "f1.jpg", "jpg", "image/jpeg");
+    let a2 = add_asset(&conn, "d:/p/f2.jpg", "f2.jpg", "jpg", "image/jpeg");
+    let a3 = add_asset(&conn, "d:/p/f3.jpg", "f3.jpg", "jpg", "image/jpeg");
+
+    assert_eq!(assets::get(&conn, a1)?.favorite, 0, "默认未收藏");
+
+    let changed = assets::set_favorite(&conn, &[a1, a2], true)?;
+    assert_eq!(changed, 2);
+    assert_eq!(assets::get(&conn, a1)?.favorite, 1);
+    assert_eq!(assets::get(&conn, a2)?.favorite, 1);
+    assert_eq!(
+        assets::get(&conn, a3)?.favorite,
+        0,
+        "未传入的素材不应被改动"
+    );
+
+    // 取消收藏只回落指定项
+    assets::set_favorite(&conn, &[a1], false)?;
+    assert_eq!(assets::get(&conn, a1)?.favorite, 0);
+    assert_eq!(assets::get(&conn, a2)?.favorite, 1, "另一个素材保持收藏");
+
+    // 空集合不报错（前端多选被清空时可能传空）
+    assert_eq!(assets::set_favorite(&conn, &[], true)?, 0);
+
+    // 收藏与评级互不影响
+    assets::set_rating(&conn, &[a2], 4)?;
+    let a2_row = assets::get(&conn, a2)?;
+    assert_eq!((a2_row.favorite, a2_row.rating), (1, 4));
+    Ok(())
+}
+
+#[test]
 fn rating_facet_appears() -> AppResult<()> {
     let conn = setup();
     let a1 = add_asset(&conn, "d:/p/g1.jpg", "g1.jpg", "jpg", "image/jpeg");
@@ -2423,6 +2569,8 @@ fn undo_reverts_both() -> AppResult<()> {
         .next()
         .unwrap();
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    // 先让 AI 真的产出建议项：没有建议项时确认会被判定为「审核期新增」→ manual（M-07 语义）
+    ai::set_suggestion_tags(&conn, sug.id, &tags_map)?;
     ai::confirm_suggestion(&conn, sug.id, &tags_map)?;
     // assign_inner 同源展开写了两条（jpg + raw）且都带本批次流水
     let ops: i64 = conn.query_row(
@@ -2451,6 +2599,8 @@ fn confirming_ai_tags_reviews_kinship_sibling_rows() -> AppResult<()> {
         .expect("JPG suggestion");
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
 
+    // 先让 AI 真的产出建议项：没有建议项时确认会被判定为「审核期新增」→ manual（M-07 语义）
+    ai::set_suggestion_tags(&conn, suggestion.id, &tags_map)?;
     ai::confirm_suggestion(&conn, suggestion.id, &tags_map)?;
 
     let states: Vec<(i64, String)> = {

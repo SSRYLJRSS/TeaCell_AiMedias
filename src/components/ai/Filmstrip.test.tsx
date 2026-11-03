@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import {  } from "@testing-library/react";
 import Filmstrip from "@/components/ai/Filmstrip";
 import type { AiSuggestion } from "@/types/ai";
 
+import { actRender } from "@/test/render";
 // ── jsdom 补齐：虚拟滚动需要尺寸 + ResizeObserver ──
 class MockResizeObserver {
   cb: ResizeObserverCallback;
@@ -43,9 +44,9 @@ function mk(i: number): AiSuggestion {
 }
 
 describe("Filmstrip（§8.4 虚拟化）", () => {
-  it("渲染胶片条；数千素材不创建常驻重型 DOM（按钮数远小于总数）", () => {
+  it("渲染胶片条；数千素材不创建常驻重型 DOM（按钮数远小于总数）", async () => {
     const suggestions = Array.from({ length: 1000 }, (_, i) => mk(i));
-    const { container } = render(
+    const { container } = await actRender(
       <Filmstrip suggestions={suggestions} currentId={1} selectedIds={new Set()} onPick={() => {}} />,
     );
     const buttons = container.querySelectorAll("button");
@@ -53,8 +54,8 @@ describe("Filmstrip（§8.4 虚拟化）", () => {
     expect(buttons.length).toBeLessThan(100);
   });
 
-  it("空批次返回空", () => {
-    const { container } = render(
+  it("空批次返回空", async () => {
+    const { container } = await actRender(
       <Filmstrip suggestions={[]} currentId={null} selectedIds={new Set()} onPick={() => {}} />,
     );
     expect(container.firstChild).toBeNull();

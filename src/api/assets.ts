@@ -45,10 +45,7 @@ export function scanDuplicates(): Promise<DupGroup[]> {
   return invoke<DupGroup[]>("dedup_scan");
 }
 
-/** R-22 回收站恢复：返回实际恢复条数 */
-export function trashRestore(ids: number[]): Promise<number> {
-  return invoke<number>("trash_restore", { ids });
-}
+/** A4-03：回收站恢复已迁到 `@/api/trash` 的 `restoreAssets`（逐项核验文件存在与归属）。 */
 
 /** 取原文件路径（用于系统打开/复制链接等） */
 export function getAssetUrls(ids: number[]): Promise<string[]> {
@@ -130,6 +127,11 @@ export function getPaletteStatus(): Promise<PaletteStatus> {
 /** 按 id 定向读取色板补丁（单次 ≤1000，前端负责分批；只返回存在的 id）。 */
 export function getAssetPalettePatches(ids: number[]): Promise<AssetPalettePatch[]> {
   return invoke<AssetPalettePatch[]>("get_asset_palette_patches", { ids });
+}
+
+/** W2-8：批量收藏/取消收藏（返回受影响行数）。M-14b 恢复：曾随重构被删。 */
+export function setFavorite(ids: number[], favorite: boolean): Promise<number> {
+  return invoke<number>("set_favorite", { ids, favorite });
 }
 
 /** W2-8：批量设评级（rating 0 = 清除；返回受影响行数） */

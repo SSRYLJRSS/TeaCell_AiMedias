@@ -44,3 +44,6 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
 export function on<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
   return listen<T>(event, (e: Event<T>) => handler(e.payload));
 }
+
+/** 供各 api 模块标注取消订阅函数类型，避免直接依赖 @tauri-apps/api。 */
+export type { UnlistenFn };

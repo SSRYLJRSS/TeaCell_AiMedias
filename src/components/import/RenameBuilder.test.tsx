@@ -45,6 +45,10 @@ describe("RenameBuilder 受控同步", () => {
     fireEvent.click(screen.getByTitle("{分库}"));
     expect(screen.getByText("{日期}_{序号:5}")).toBeInTheDocument();
     expect(screen.getByTitle("序号位数（1-9）")).toHaveValue("5");
+    // 最后一次改模板会再发一次预览请求；不等它在测试内落地，setPreview 就发生在测试之外（act 警告）。
+    await waitFor(() => {
+      expect(screen.getByText("预览：旅行_IMG_001_{日期}_{序号:5}.jpg")).toBeInTheDocument();
+    });
   });
 
   it("父级清空时立即移除选中模板、位数输入和预览", async () => {

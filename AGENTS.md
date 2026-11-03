@@ -89,8 +89,10 @@ npm run test:tooling
 cd src-tauri
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo test --all-features -- --test-threads=2
 ```
+
+并发上限、线程数与内存预算见[开发规范 §2.1](docs/DEVELOPMENT.md#21-验证并发与内存预算)。
 
 修改 `packages/agent-host/`、`src-tauri/src/services/agent_runtime/` 或其打包映射时，另外执行 `npm run test:agent-host`；
 该套件串行运行，且不与 Cargo build/test/clippy（全量或定向）和 NSIS 打包并发；全量 Cargo 与定向 Cargo 测试也要串行，避免资源争用误报 Host READY 超时。发送 ACK 未知时必须保留 runId、禁止重放并验证精确取消；挂起 Host 请求时还要验证应用关停预算。修改 Host 资源映射时，额外运行 `npm run test:agent-host-staged` 验证 Tauri overlay 中的 Node/Host 在空 PATH 环境下可握手、开会话、发送、关闭，并构建实际 NSIS 制品核对安装包预算。Windows x64 资源准备和安装包预算按[开发规范](docs/DEVELOPMENT.md)与[性能基线](docs/PERFORMANCE.md#9-20-agent-windows工程预算已独立复核)验证。

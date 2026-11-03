@@ -13,17 +13,26 @@ import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAppearance } from "@/hooks/useAppearance";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { trashRestore } from "@/api/assets";
+import {
+  failedRestores,
+  restoreAssets,
+  restoreErrorLabel,
+  unknownRestores,
+  type RestoreReport,
+} from "@/api/trash";
 
 interface GridToolbarProps {
   onTag: () => void;
   onExport: () => void;
-  onMove: () => void;
+  /** A4-01：库外移动已停用；库内分库移动属 A4-02，暂不渲染入口 */
+  onMove?: () => void;
   onDelete: () => void;
   /** W0-7：查找重复入口（hash 精确去重，扫描按钮在库非回收站区） */
   onDedup?: () => void;
   /** R-22：回收站模式下的「彻底删除」（弹窗由 LibraryPage 托管） */
   onPurge: () => void;
+  /** A3-08：把当前选择固定成快照交给助手 */
+  onHandoff?: () => void;
 }
 
 /** R-21 排序选项（与后端 AssetFilter.sortBy 对齐）；W2-8 补「评级」 */
@@ -44,7 +53,7 @@ const SIZE_STEPS = [
   { step: 5, label: "大", Icon: Square, title: "格子大" },
 ];
 
-export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup, onPurge }: GridToolbarProps) {
+export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup, onPurge, onHandoff }: GridToolbarProps) {
   const { setFilter, total, sortBy, sortDir, trashOnly, removeLocal } = useLibraryStore(
     useShallow((s) => ({
       setFilter: s.setFilter,
@@ -59,6 +68,10 @@ export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup
     useShallow((s) => ({ selected: s.selected, truncated: s.truncated, selectionTotal: s.selectionTotal, clear: s.clear })),
   );
   const [restoring, setRestoring] = useState(false);
+  // A4-03：恢复不是「清空 deleted_at 就算完」，所以必须把失败项原样显示出来。
+  const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const trashRetentionDays = useSettingsStore((s) => s.settings?.trashRetentionDays ?? 30);
   // FB2-01 可发现入口：素材库顶栏三态大小切换（小/中/大 = 档位 1/3/5）
   const { grid } = useAppearance();
 
@@ -66,10 +79,27 @@ export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup
     const ids = Array.from(selected);
     if (ids.length === 0 || restoring) return;
     setRestoring(true);
+    setRestoreError(null);
     try {
-      await trashRestore(ids);
-      removeLocal(ids);
-      clear();
+      const report = await restoreAssets(ids);
+      setRestoreReport(report);
+      // 只移除真的恢复成功的条目：失败项仍留在回收站，也仍应保持选中。
+      const restoredIds = report.items
+        .filter((item) => item.state === "succeeded")
+        .map((item) => item.assetId);
+      if (restoredIds.length > 0) removeLocal(restoredIds);
+      // 结果不确定的项也算「未落定」：它们可能仍在回收站，选中态必须保留，
+      // 否则用户核对时找不到这些素材。
+      const unsettled = report.failed > 0 || report.unknown > 0 || report.skipped > 0;
+      if (unsettled) {
+        useSelectionStore.getState().setAll(
+          report.items.filter((item) => item.state !== "succeeded").map((item) => item.assetId),
+        );
+      } else {
+        clear();
+      }
+    } catch (error) {
+      setRestoreError(error instanceof Error ? error.message : String(error));
     } finally {
       setRestoring(false);
     }
@@ -106,12 +136,45 @@ export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup
           </div>
         ) : (
           <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">
-            回收站 · 超期自动清理（见设置）
+            {`回收站 · 保留 ${trashRetentionDays} 天后自动清理（可在设置中调整）`}
           </span>
         )
       ) : (
-        <ContextActionBar onTag={onTag} onExport={onExport} onMove={onMove} onDelete={onDelete} />
+        <ContextActionBar onTag={onTag} onExport={onExport} onMove={onMove} onDelete={onDelete} onHandoff={onHandoff} />
       )}
+
+      {restoreError && (
+        <span role="alert" data-testid="restore-error" className="min-w-0 shrink truncate text-xs text-[var(--color-danger)]" title={restoreError}>
+          恢复失败：{restoreError}
+        </span>
+      )}
+      {restoreReport &&
+        (restoreReport.failed > 0 || restoreReport.unknown > 0 || restoreReport.skipped > 0) && (
+          <span data-testid="restore-summary" className="min-w-0 shrink truncate text-xs text-[var(--color-text-secondary)]">
+            已恢复 {restoreReport.restored} 项
+            {restoreReport.failed > 0 ? `，${restoreReport.failed} 项失败（仍留在回收站）：` : ""}
+            {failedRestores(restoreReport).map((item, index) => (
+              <span key={item.itemId}>
+                {index > 0 ? "；" : ""}
+                {item.fileName} · {restoreErrorLabel(item)}
+              </span>
+            ))}
+            {restoreReport.unknown > 0 ? (
+              <span className="text-[var(--color-status)]">
+                {restoreReport.failed > 0 ? "；" : ""}
+                {`${restoreReport.unknown} 项结果不明（可能已恢复，需核对）：`}
+                {unknownRestores(restoreReport).map((item, index) => (
+                  <span key={item.itemId}>
+                    {index > 0 ? "；" : ""}
+                    需核对：{item.fileName}
+                  </span>
+                ))}
+              </span>
+            ) : (
+              ""
+            )}
+          </span>
+        )}
 
       <div data-testid="toolbar-filters" className="min-w-0 flex-1 overflow-hidden">
         <SelectedFilterTags />

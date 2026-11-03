@@ -83,7 +83,8 @@ describe("VideoPlayer（指导书 §4.4 + FB5-02）", () => {
     );
     const root = container.querySelector("[data-player-root]") as HTMLElement;
     expect(root).not.toBeNull();
-    root.focus();
+    // 原生 focus() 会触发 onRootFocus 的 setFocusWithin/showControlsTemporarily，必须包进 act。
+    act(() => root.focus());
     fireEvent.keyDown(root, { key: "ArrowLeft" });
     expect(onStop).not.toHaveBeenCalled(); // stopPropagation 生效：外层收不到
   });
@@ -220,5 +221,16 @@ describe("VideoPlayer（指导书 §4.4 + FB5-02）", () => {
     expect(onToggle).toHaveBeenCalledTimes(2);
     // 从未直接请求浏览器全屏
     expect(reqSpy).not.toHaveBeenCalled();
+  });
+
+  // M-13：解码失败态的文件名被 truncate，必须能 hover 看到全量，否则用户无法确认是哪个文件坏了
+  it("解码失败态的文件名带 title 全量提示（长中文名截断后仍可读）", () => {
+    const longName = "旅行-2026-秋-第一天-上午-这是一个非常非常长的中文视频文件名用来验证截断后仍可读.mp4";
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName={longName} />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    fireEvent.error(video);
+    const nameNode = screen.getByTitle(longName);
+    expect(nameNode).toBeInTheDocument();
+    expect(nameNode.textContent).toBe(longName);
   });
 });

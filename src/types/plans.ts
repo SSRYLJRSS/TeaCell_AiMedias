@@ -8,6 +8,9 @@ export type PlanReviewStatus =
 
 export type ReviewKind = "ordinary" | "permanent_trash";
 
+/** 计划由哪一侧创建：可信界面、内置助手，或本机外部接入的客户端。 */
+export type PlanOriginKind = "gui" | "pi" | "mcp";
+
 export interface LibraryScope {
   libraryId: string;
   libraryEpoch: string;
@@ -38,6 +41,8 @@ export interface PlanPreview {
   library: LibraryScope;
   reviewStatus: PlanReviewStatus;
   reviewKind: ReviewKind;
+  originKind: PlanOriginKind;
+  originLabel?: string;
   itemCount: number;
   summary: string;
   reviewRef: string;

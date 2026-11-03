@@ -182,6 +182,50 @@ describe("normalizeSettings", () => {
     expect(s2.appearance.colorStrip.count).toBe(6);
     expect(s2.appearance.colorStrip.mode).toBe("ratio");
   });
+
+  it("A3-05：navigation 完全缺失 → 默认四个内置入口且全部可见", () => {
+    const s = normalizeSettings({});
+    expect(s.navigation.shortcuts).toEqual([
+      { id: "import", visible: true },
+      { id: "library", visible: true },
+      { id: "ai", visible: true },
+      { id: "treasure", visible: true },
+    ]);
+    expect(s.navigation.settingsPinned).toBe(false);
+  });
+
+  it("A3-05：未知 id（含任意 URL）与重复 id 被丢弃，顺序保留", () => {
+    const s = normalizeSettings({
+      navigation: {
+        shortcuts: [
+          { id: "treasure", visible: false },
+          { id: "https://evil.example/x", visible: true },
+          { id: "import", visible: true },
+          { id: "import", visible: false },
+          { id: "library", visible: true },
+        ],
+        settingsPinned: true,
+      },
+    });
+    expect(s.navigation.shortcuts).toEqual([
+      { id: "treasure", visible: false },
+      { id: "import", visible: true },
+      { id: "library", visible: true },
+    ]);
+    expect(s.navigation.settingsPinned).toBe(true);
+  });
+
+  it("A3-05：显式空目录保持为空（隐藏全部入口不是配置损坏）", () => {
+    const s = normalizeSettings({ navigation: { shortcuts: [] } });
+    expect(s.navigation.shortcuts).toEqual([]);
+  });
+
+  it("A3-05：条目全部无法映射时回落默认，底栏不会凭空消失", () => {
+    const s = normalizeSettings({
+      navigation: { shortcuts: [{ id: "plugin:future", visible: true }] },
+    });
+    expect(s.navigation.shortcuts).toHaveLength(4);
+  });
 });
 
 describe("W0-6 死配置清理", () => {

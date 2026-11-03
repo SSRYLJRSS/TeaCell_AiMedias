@@ -15,6 +15,7 @@ import {
   hasRequiredPackageExtensions,
 } from "./candidate-contract.mjs";
 import { heifCandidateProvenance, verifyHeifCache } from "./heif-contract.mjs";
+import { assertInsideRepository, resolveTargetDirectory } from "./build-cache.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const targets = {
@@ -57,7 +58,12 @@ const heifCache = join(root, "src-tauri", "native", "heif", target);
 const heifCheck = verifyHeifCache(heifCache, heifManifest, target);
 if (!heifCheck.ok) throw new Error(`候选包 HEIF 原生依赖未通过来源/许可证校验：${heifCheck.reason}`);
 const heifProvenance = heifCandidateProvenance(heifManifest, target);
-const bundleDir = join(root, "src-tauri", "target", target, "release", "bundle");
+// 构建目录由 Cargo 决定（config `target-dir`、CARGO_TARGET_DIR 或默认 target），
+// 这里只读取事实，不再假设 `src-tauri/target`。
+const resolvedTargetDirectory = resolveTargetDirectory();
+if (!resolvedTargetDirectory) throw new Error("无法通过 cargo metadata 确定构建目录");
+const targetDirectory = assertInsideRepository(resolvedTargetDirectory, root);
+const bundleDir = join(targetDirectory, target, "release", "bundle");
 const outDir = resolve(root, out);
 if (!outDir.startsWith(`${root}${sep}`)) throw new Error("候選輸出目錄必須位於 repository 子目錄內");
 if (!existsSync(bundleDir)) throw new Error(`Tauri bundle 目录不存在：${bundleDir}`);

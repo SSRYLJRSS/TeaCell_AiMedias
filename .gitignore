@@ -4,11 +4,12 @@ dist/
 *.local
 *.tsbuildinfo
 
-# Rust / Tauri 构建产物
+# Rust / Tauri 构建产物（固定落在仓库根 build-cache/，见 .cargo/config.toml）
 /target/
 **/target/
 src-tauri/target*/
 src-tauri/gen/
+/build-cache/
 
 # 平台原生构建依赖与候选 sidecar（只跟踪清单，不把 ABI 绑定二进制写入 Git）
 /heif-bin/

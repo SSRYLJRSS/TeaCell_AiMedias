@@ -807,6 +807,27 @@ pub fn page_authorized_directory(
     })
 }
 
+/// A4-01：解析一个「导出目标」授权目录的真实根路径。
+///
+/// 复制导出要在目录内按 `unique_dest` 语义自动改名（同名加 `(1)(2)…`），
+/// 而 `create_authorized_output` 只允许新建、重名直接 `CONFLICT`。因此这里
+/// 复用同一套 `resolve_directory_handle` 校验（主体、会话、用途、访问位、
+/// 授权代次、当前文件系统身份）把 canonical root 交给导出服务，写入仍由
+/// 导出服务以 `create_new(true)` 保证绝不覆盖。
+pub fn resolve_export_directory(
+    db: &Database,
+    caller: &CallerContext,
+    directory_ref: &ResourceRef,
+) -> AppResult<PathBuf> {
+    let resolved = resolve_directory_handle(db, caller, directory_ref, RequiredAccess::Export)?;
+    ensure_access(resolved.access_mask, RequiredAccess::Write)?;
+    ensure_access(resolved.access_mask, RequiredAccess::Export)?;
+    if resolved.grant.purpose != DirectoryPurpose::ExportDestination.as_str() {
+        return Err(AppError::from(AgentErrorCode::Unauthorized));
+    }
+    Ok(resolved.canonical_path)
+}
+
 pub fn create_authorized_output(
     db: &Database,
     caller: &CallerContext,

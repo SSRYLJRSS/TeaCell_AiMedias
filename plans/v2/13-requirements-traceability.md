@@ -1,6 +1,6 @@
 # 已确认要求与实施任务的覆盖索引
 
-本文件用于查缺补漏与验收定位，**不是第二份 PRD，也不是完成状态表**。R01–R47 是用户需求与其必要业务解释的定位；R48–R60 是实现这些需求的工程约束索引。完整行为以“来源”列所指文件为准；承接至权威文档后更新链接，不复制维护两套定义。当前各项均是待实施要求，表中有关联卡不代表已实现。
+本文件用于查缺补漏与验收定位，**不是第二份 PRD，也不是完成状态表**。R01–R47 是用户需求与其必要业务解释的定位；R48–R61 是实现这些需求的工程约束索引。完整行为以“来源”列所指文件为准；承接至权威文档后更新链接，不复制维护两套定义。当前各项均是待实施要求，表中有关联卡不代表已实现。
 
 ## 使用与版本解释
 
@@ -73,6 +73,7 @@
 | R58 | 统一API、搜索契约和精确选择集合 | [12](12-implementation-contracts.md) | [A1-01](execution/A1.md#a1-01)、[A3-03](execution/A3.md#a3-03)、[A3-08](execution/A3.md#a3-08)、[A5-02](execution/A5.md#a5-02) | 前端仅src/api，沿用搜索/分面协议；分页全选不误当当前页。 |
 | R59 | 真实测试证据与独立复核 | [14](14-review-and-handoff.md) | [A0-01](execution/A0.md#a0-01)、[A0-04](execution/A0.md#a0-04)、[A6-01](execution/A6.md#a6-01)、[A6-03](execution/A6.md#a6-03)、[A6-04](execution/A6.md#a6-04)、[B4-02](execution/B.md#b4-02) | 每卡区分通过/失败/未运行，必要检查失败不能解锁依赖。 |
 | R60 | 文档权威与唯一真实进度 | [11](11-execution-guide.md) | [A0-01](execution/A0.md#a0-01)、[A6-01](execution/A6.md#a6-01)、[A6-04](execution/A6.md#a6-04)、[B4-02](execution/B.md#b4-02) | 待实现规格与已交付事实分开；进度只在PROJECT_PLAN维护。 |
+| R61 | Agent 会话权限档位只收窄能力、不扩大审批：模型在各档位可用的工具集是该档能力集的稳定子集，档位由 Rust 在 dispatch 前独立判定，Host/前端回传档位字段不被采信；批准、恢复、永久清空与打标开始在任何档位均 GUI 专属 | [12](12-implementation-contracts.md) | [A3-10](execution/A3.md#a3-10)、[A3-11](execution/A3.md#a3-11) | Read 4 / Standard 12 / Full 16 三档裁剪只是体验门；越档调用由 `capabilities::execute` 独立能力门拒绝。 |
 
 ## 如何补充实际证据
 

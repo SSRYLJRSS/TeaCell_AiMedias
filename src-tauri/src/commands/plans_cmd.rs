@@ -44,6 +44,16 @@ pub fn approve_plan(
 }
 
 #[tauri::command]
+pub fn reject_plan(
+    state: State<AppState>,
+    plan_ref: ResourceRef,
+    review_ref: ResourceRef,
+) -> AppResult<ApprovalResult> {
+    let caller = gui_caller(&state)?;
+    plans::reject_plan(&state.db, &caller, &plan_ref, &review_ref)
+}
+
+#[tauri::command]
 pub fn get_operation(
     state: State<AppState>,
     operation_ref: ResourceRef,

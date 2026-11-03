@@ -100,6 +100,8 @@ export default function FacetManagePanel() {
   const [creatingGroup, setCreatingGroup] = useState<"ai" | "manual" | null>(null);
   const [deleting, setDeleting] = useState<TagFacet | null>(null);
   const [deleteImpact, setDeleteImpact] = useState<TagFacetImpact | null>(null);
+  /** M-14：影响面读不到时必须如实告知，不能让用户以为「没有影响」就直接删。 */
+  const [deleteImpactError, setDeleteImpactError] = useState<string | null>(null);
   const [deleteReport, setDeleteReport] = useState<FacetDeleteReport | null>(null);
   const [deleteConfirmName, setDeleteConfirmName] = useState("");
   const [termsFacet, setTermsFacet] = useState<TagFacet | null>(null);
@@ -212,10 +214,15 @@ export default function FacetManagePanel() {
     setDeleting(facet);
     setDeleteConfirmName("");
     setDeleteReport(null);
+    setDeleteImpact(null);
+    setDeleteImpactError(null);
     try {
       setDeleteImpact(await getTagFacetImpact(facet.key));
-    } catch {
+    } catch (e) {
+      // M-14：读不到影响面不等于没有影响。清空旧数字会让面板显示得像「无影响」，
+      // 所以必须留下可行动的提示，让用户在不知道影响面的情况下自己决定要不要继续。
       setDeleteImpact(null);
+      setDeleteImpactError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -403,6 +410,13 @@ export default function FacetManagePanel() {
       >
         <div className="flex flex-col gap-2 text-sm">
           <p className="text-[var(--color-danger)]">此操作不可恢复。素材文件本身不会被删除。</p>
+          {deleteImpactError && (
+            <p role="alert" className="rounded-md bg-[var(--color-status-soft)] p-2 text-xs text-[var(--color-status)]">
+              读不到这次删除的影响面：{deleteImpactError}
+              <br />
+              不知道会影响多少标签和素材时，请先关闭本窗口再重试；确实要删也必须手工输入分类名确认。
+            </p>
+          )}
           {deleteImpact && (
             <ul className="rounded-md bg-[var(--color-surface)] p-2 text-xs text-[var(--color-text-secondary)]">
               <li>将删除 {deleteImpact.tagCount} 个标签</li>

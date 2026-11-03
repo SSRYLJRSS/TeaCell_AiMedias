@@ -44,6 +44,17 @@ export function selectManagedOllama(s: PlatformState): boolean {
   return s.status === "ready" && s.capabilities?.managedOllama === true;
 }
 
+/** 当前平台是否带 Agent 运行资源：未就绪时按「支持」处理。
+ *
+ * 为什么反向保守：这个选择器只用于「此平台不提供 Agent」的提示。加载中或加载失败
+ * 时弹这条提示会误伤正常安装；真缺资源时 Rust 会返回 AGENT_HOST_UNAVAILABLE，
+ * 界面仍能给出正确说明。
+ */
+export function selectAgentHost(s: PlatformState): boolean {
+  if (s.status !== "ready") return true;
+  return s.capabilities?.agentHost !== false;
+}
+
 /** 是否使用原生窗口按钮：仅 ready 且后端 true。 */
 export function selectNativeWindowControls(s: PlatformState): boolean {
   return s.status === "ready" && s.capabilities?.nativeWindowControls === true;

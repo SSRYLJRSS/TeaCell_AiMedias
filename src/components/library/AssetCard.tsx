@@ -168,8 +168,12 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
           </span>
         )}
 
-        {/* hover 文件名（§3.3：只允许透明度变化，不创建媒体层） */}
-        <div className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-4 pb-1 text-[11px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+        {/* hover 文件名（§3.3：只允许透明度变化，不创建媒体层）
+            M-13：长中文文件名在卡片上只能 truncate，必须能 hover 看到全量，否则用户无从确认是哪个文件 */}
+        <div
+          className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-4 pb-1 text-[11px] text-white opacity-0 transition-opacity group-hover:opacity-100"
+          title={asset.fileName}
+        >
           {asset.fileName}
         </div>
       </div>

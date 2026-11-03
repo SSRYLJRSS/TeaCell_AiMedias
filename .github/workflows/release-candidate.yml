@@ -89,6 +89,9 @@ jobs:
         env:
           CANDIDATE_BUILD_LOG: ${{ runner.temp }}/teacell-build-${{ matrix.target }}.log
         run: npm run desktop:build -- --target ${{ matrix.target }}
+      - name: Verify staged Agent Host resources against the fresh build record
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: npm run test:agent-host-staged
       - name: Collect test candidate and hashes
         shell: bash
         env:

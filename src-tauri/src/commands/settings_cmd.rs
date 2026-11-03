@@ -21,8 +21,24 @@ pub fn get_settings(state: State<AppState>) -> AppResult<Settings> {
     settings::get_settings(&conn)
 }
 
+/// 后端独占字段：通用设置保存不得改写。
+///
+/// 前端 `Settings` 类型里没有这些字段，反序列化时按 `serde(default)` 落成
+/// false/空串；如果直接把请求体写回，就会把「本机接入」和「Agent 联网」
+/// 静默关掉。必须在**写入用的同一把数据库锁内**重新读取，否则会覆盖并发
+/// 的 `set_mcp_bridge_enabled` / `set_agent_model_network`。
+fn preserve_backend_owned_settings(conn: &rusqlite::Connection, s: &mut Settings) -> AppResult<()> {
+    let latest = settings::get_settings(conn)?;
+    s.mcp_bridge_enabled = latest.mcp_bridge_enabled;
+    s.agent_model_proxy = latest.agent_model_proxy;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
+    // A4-05：维护期间停止写入。设置里含 `library_root`，迁仓中途被写回旧根
+    // 会让库定位与磁盘真实位置分叉。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "保存设置")?;
     let _config_guard = state
         .ai_config_guard
         .lock()
@@ -51,7 +67,14 @@ pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
         }
         (current, crate::db::libraries::current(&conn)?)
     };
-    if requested_root != current.library_root.trim() {
+    // 换根判断必须按「是否同一个目录」而不是字符串比较：总仓根存的是 canonicalize
+    // 结果（Windows 上带 `\\?\` 前缀），用户用选择器重选同一目录拿到的是普通路径，
+    // 字符串不同但语义相同——按字符串比会把「重选同一目录」误判成换根并报冲突。
+    // 两边都为空是「本来就没配置」，同样属于未变化。
+    let root_unchanged =
+        crate::utils::path::same_native_path(&requested_root, &current.library_root)
+            || (requested_root.is_empty() && current.library_root.trim().is_empty());
+    if !root_unchanged {
         if requested_root.is_empty() {
             return Err(AppError::conflict(
                 "已配置总仓不能通过保存设置直接清空，请使用总仓维护流程",
@@ -70,9 +93,13 @@ pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
         let adopted =
             crate::services::managed_library::commit_initial_root(&conn, snapshot, &prepared)?;
         s.library_root = adopted.root_path;
+        preserve_backend_owned_settings(&conn, &mut s)?;
         settings::save_settings(&conn, &s)?;
     } else {
+        // 同一目录的另一种写法：保留权威那份，避免把界面上的普通路径写回设置。
+        s.library_root = current.library_root.clone();
         let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        preserve_backend_owned_settings(&conn, &mut s)?;
         settings::save_settings(&conn, &s)?;
     }
     if let Err(e) = crate::observability::set_log_level(&s.log_level) {

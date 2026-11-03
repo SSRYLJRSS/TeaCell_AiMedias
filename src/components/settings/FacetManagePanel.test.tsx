@@ -145,6 +145,34 @@ describe("W4 facetManagePanel_two_groups", () => {
     await waitFor(() => expect(deleteTagFacet).toHaveBeenCalledWith("clothing_color"));
   });
 
+  it("删除确认：影响面读不到时如实告知，而不是显示成「没有影响」（M-14 异常提示）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    vi.mocked(getTagFacetImpact).mockRejectedValueOnce(new Error("无法读取影响面"));
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("读不到这次删除的影响面");
+    expect(alert.textContent).toContain("无法读取影响面");
+    // 绝不能因为读不到就退化成「将删除 0 个标签」这类像「没有影响」的假提示
+    expect(screen.queryByText(/将删除 \d+ 个标签/)).not.toBeInTheDocument();
+    // 仍然要求手工输入分类名才能确认删除，不因为影响面缺失而放宽
+    expect(screen.getByRole("button", { name: "确认删除" })).toBeDisabled();
+  });
+
+  it("删除确认：重新打开删除面板时清掉上一次的影响面错误", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    vi.mocked(getTagFacetImpact).mockRejectedValueOnce(new Error("无法读取影响面"));
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(await screen.findByText(/将删除 2 个标签/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("停用区恢复按钮调用 restoreTagFacet", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([
       facet({ key: "scene", displayName: "场景/地点", status: "inactive", isSystem: true }),

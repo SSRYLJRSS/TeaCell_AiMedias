@@ -151,6 +151,55 @@ pub fn prepare_initial_root(
     }
 }
 
+/// Inspect a *new* root for a controlled whole-library move (A4-05).
+///
+/// This is deliberately different from [`prepare_initial_root`], which only
+/// accepts an unconfigured library. Two behaviours are required by the card:
+///
+/// - `create_marker = true` (software migration): the target is expected to be a
+///   fresh directory, so writing our own marker there is how we claim it. A
+///   directory that already carries a *different* library's marker is refused —
+///   the user pointed at somebody else's library.
+/// - `create_marker = false` (relocation of a hand-moved root): the marker must
+///   already be present and equal to our `library_id`. This is what stops an
+///   arbitrary empty folder from being adopted as "the original library".
+///
+/// Nothing is copied here, and the returned evidence is only committed by the
+/// caller through [`commit_initial_root`] (same compare-and-swap).
+pub fn prepare_root_for_migration(
+    snapshot: &LibrarySnapshot,
+    requested_root: &Path,
+    create_marker: bool,
+) -> AppResult<PreparedInitialRoot> {
+    if !requested_root.is_absolute() {
+        return Err(AppError::invalid_arg("总仓位置必须是绝对路径"));
+    }
+    let candidate = LibrarySnapshot {
+        root_path: crate::utils::path::encode_native_path(requested_root)?,
+        ..snapshot.clone()
+    };
+    match inspect_root(&candidate, create_marker)? {
+        RootInspection::Ready {
+            canonical_root,
+            root_identity,
+        } => Ok(PreparedInitialRoot {
+            canonical_root: crate::utils::path::encode_native_path(&canonical_root)?,
+            root_identity,
+        }),
+        RootInspection::Unconfigured => Err(AppError::invalid_arg("请选择目标目录")),
+        RootInspection::Offline => Err(AppError::coded(
+            crate::error::AppErrorCode::InvalidLibraryRoot,
+            "目标目录不存在或无法访问",
+        )),
+        RootInspection::WrongRoot if create_marker => {
+            Err(AppError::conflict("目标目录已有其他茶馆总仓标记，不能覆盖"))
+        }
+        RootInspection::WrongRoot => Err(AppError::conflict(
+            "目标目录不是当前茶馆总仓：缺少或不匹配的库身份标记，无法把它识别为搬走的原库",
+        )),
+    }
+}
+
 /// Commit a root inspection prepared outside the database lock. The snapshot
 /// compare-and-swap rejects a concurrent root/locator transition.
 pub fn commit_initial_root(

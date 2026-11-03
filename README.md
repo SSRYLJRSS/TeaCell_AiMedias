@@ -72,7 +72,7 @@
 | macOS Apple Silicon | `TeaCell_AI_Media_Manager_<版本>_aarch64.dmg` |
 | Ubuntu 24.04 x64 | `TeaCell_AI_Media_Manager_<版本>_amd64.AppImage` |
 
-当前为公测版本。macOS、Linux 尚未完成真机验收，macOS 安装包尚未签名与公证。平台支持标准见 [平台说明](docs/PLATFORM.md)，当前验证结果和待验收项见 [项目计划](docs/PROJECT_PLAN.md#20-v102-当前发布状态)。
+当前为公测版本。macOS、Linux 尚未完成真机验收，macOS 安装包尚未签名与公证。平台支持标准见 [平台说明](docs/PLATFORM.md)，当前验证结果和待验收项见 [项目计划](docs/PROJECT_PLAN.md#20-v102-品牌迁移与发布状态)。
 
 对应源码、第三方许可证、构建记录和校验值可从各版本的 Release 说明获取。
 

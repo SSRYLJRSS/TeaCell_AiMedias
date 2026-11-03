@@ -13,7 +13,15 @@ export type StartupMark =
   | "react_first_render"
   | "settings_ready"
   | "library_ready"
-  | "first_thumbnail_ready";
+  | "first_thumbnail_ready"
+  // WP3-B：助手页「极限秒开」细粒度打点（导航→骨架可见 / Host 就绪 / 列表就绪 / 可输入）
+  | "assistant_skeleton_visible"
+  | "assistant_host_ready"
+  | "assistant_list_ready"
+  | "assistant_can_input"
+  // WP3-B：应用空闲后台预热 Agent Host（Started 为调度时刻，Ready 为真正就绪时刻）
+  | "host_warmup_started"
+  | "host_warmup_ready";
 
 /** 全部打点（{ mark, atMs }，atMs 相对首次调用时间戳）。 */
 export interface StartupMarkEntry {

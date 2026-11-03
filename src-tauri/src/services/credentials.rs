@@ -256,12 +256,16 @@ fn resolve_agent_model_connection_metadata_inner(
 ) -> AppResult<crate::db::ai_connections::AiConnection> {
     let connection = {
         let conn = db.lock()?;
+        // 这两个分支专用错误码必须区分开：`NOT_FOUND` 会被前端读成「资源找不到」，
+        // 用户看到的应当是可行动的「还没绑定 / 绑定的服务已不存在」。
         let connection_id =
             crate::db::ai_connections::binding_id(&conn, "agent")?.ok_or_else(|| {
-                AppError::not_found("Agent 尚未绑定专用 AI 服务，请先选择 Agent 服务")
+                AppError::agent_service_unbound("Agent 尚未绑定专用 AI 服务，请先选择 Agent 服务")
             })?;
-        let connection = crate::db::ai_connections::get(&conn, &connection_id)?
-            .ok_or_else(|| AppError::not_found("Agent 绑定的 AI 服务不存在，请重新选择"))?;
+        let connection =
+            crate::db::ai_connections::get(&conn, &connection_id)?.ok_or_else(|| {
+                AppError::agent_service_unbound("Agent 绑定的 AI 服务不存在，请重新选择")
+            })?;
         validate_agent_model_connection(&connection)?;
         connection
     };
@@ -781,7 +785,8 @@ mod tests {
         let error = resolve_agent_model_connection_with_credential(&db, &backend, None)
             .err()
             .expect("Agent must not inherit another usage or legacy profile");
-        assert_eq!(error.code(), "NOT_FOUND");
+        // 专用错误码：`NOT_FOUND` 会被前端读成「资源找不到」，这里必须是可行动的「没绑定」。
+        assert_eq!(error.code(), "AGENT_SERVICE_UNBOUND");
         assert!(error.to_string().contains("Agent 尚未绑定"));
     }
 

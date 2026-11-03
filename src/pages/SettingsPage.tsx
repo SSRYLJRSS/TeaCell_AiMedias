@@ -9,7 +9,7 @@ import { useShallow } from "zustand/react/shallow";
 import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
-import { displayBasename } from "@/utils/pathDisplay";
+import { displayBasename, formatPathForDisplay, isSamePath } from "@/utils/pathDisplay";
 import { ollamaInstallerCacheInfo, ollamaRemoveInstaller } from "@/api/ollama";
 import { backupDb, clearThumbnailCache, exportDiagnostics, getAuthorPageUrl, getDataDir, getFeedbackPageUrl, getLicensePageUrl, getProjectPageUrl, openAuthorPage, openDataDir, openFeedbackPage, openHelpPage, openLicensePage, openLogsDir, openProjectPage, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
@@ -28,14 +28,27 @@ import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
 import LegacyAssetPanel from "@/components/settings/LegacyAssetPanel";
+import DirectoryGrantsPanel from "@/components/settings/DirectoryGrantsPanel";
+import McpBridgePanel from "@/components/settings/McpBridgePanel";
+import AgentNetworkPanel from "@/components/settings/AgentNetworkPanel";
+import MigrationWizard from "@/components/settings/MigrationWizard";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { selectManagedOllama, usePlatformStore } from "@/stores/platformStore";
 import { useTagStore } from "@/stores/tagStore";
-import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE, DEFAULT_NAVIGATION } from "@/stores/settingsStore";
 import { CELL_STEPS } from "@/types/settings";
 import type { CellAspect, CellFit, Settings } from "@/types/settings";
+import { defaultNavigationShortcuts } from "@/utils/normalizeSettings";
+
+/** A3-05：内置快捷项的展示文案。缺项即「不认识」，不渲染成可点按钮。 */
+const NAVIGATION_LABELS: Record<string, string> = {
+  import: "入库",
+  library: "素材库",
+  ai: "打标",
+  treasure: "百宝箱",
+};
 
 /** FB2-01/02：素材框比例与填充可选项（顺序即展示顺序） */
 const CELL_ASPECTS: { value: CellAspect; label: string }[] = [
@@ -104,6 +117,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [autosaveError, setAutosaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A4-05：总仓迁移向导的开合。向导自己读预检与真实阶段，页面只提供入口。
+  const [migrationOpen, setMigrationOpen] = useState(false);
   const [failedExternalUrl, setFailedExternalUrl] = useState<string | null>(null);
   const draftRef = useRef<Settings | null>(null);
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -505,6 +520,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
 
   // FB2-01/02（§8.4）：素材框外观 —— draft.appearance 兜底默认；改动同时写 draft 与 previewAppearance（即时预览）
   const draftAppearance = draft.appearance ?? DEFAULT_APPEARANCE;
+  // 总仓定位以后端 `libraries` 记录为准：只要它非空，设置页就不能直接改路径，
+  // 只能走迁移/重新定位向导（后端 save_settings 会拒绝裸改根目录）。
+  const libraryConfigured = Boolean(draft.libraryRoot.trim());
   const pushPreview = (appearance: Settings["appearance"]) => {
     useSettingsStore.getState().setPreviewAppearance(appearance);
   };
@@ -522,10 +540,35 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     dirty(next);
     pushPreview(next.appearance);
   };
+  // A3-05：底栏入口 —— 只改受控内置目录的顺序/可见性，「设置」是独立固定项，
+  // 隐藏或移除任何入口都不删除对应功能或数据（PRD 第 8 节）。
+  const draftNavigation = draft.navigation ?? DEFAULT_NAVIGATION;
+  const patchNavigation = (patch: Partial<Settings["navigation"]>) => {
+    dirty({ ...draft, navigation: { ...draftNavigation, ...patch } });
+  };
+  const moveShortcut = (index: number, delta: number) => {
+    const shortcuts = [...draftNavigation.shortcuts];
+    const target = index + delta;
+    if (target < 0 || target >= shortcuts.length) return;
+    const [moved] = shortcuts.splice(index, 1);
+    shortcuts.splice(target, 0, moved);
+    patchNavigation({ shortcuts });
+  };
+  const toggleShortcut = (index: number) => {
+    const shortcuts = draftNavigation.shortcuts.map((s, i) =>
+      i === index ? { ...s, visible: !s.visible } : s,
+    );
+    patchNavigation({ shortcuts });
+  };
 
   const chooseLibraryRoot = async () => {
     const dir = await pickDir({ directory: true });
-    if (typeof dir === "string") dirty({ ...draft, libraryRoot: dir });
+    if (typeof dir !== "string") return;
+    if (isSamePath(dir, draft.libraryRoot)) {
+      setNotice("总库位置没有变化");
+      return;
+    }
+    dirty({ ...draft, libraryRoot: dir });
   };
 
   const onClearCache = async () => {
@@ -655,21 +698,32 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
           {notice && <p className="text-xs text-[var(--color-text-secondary)]" role="status">{notice}</p>}
           {error && <p className="text-xs text-[var(--color-danger)]" role="alert">{error}</p>}
+          {/* A4-05：迁移/重新定位向导与当前路由无关——「素材库位置」和「存储与维护」
+              两处都要能打开它，所以只挂一次。 */}
+          <MigrationWizard open={migrationOpen} onClose={() => setMigrationOpen(false)} />
           {route === "library" && (
             <>
             <PageHeader title="素材库与入库" description="设置总库位置，以及 RAW/JPG 等同源文件的显示和打标行为。" />
             <Group title="素材库位置">
-              <Field label="总库位置" hint="选择后，导入的文件会复制到总库统一管理；未选择时仅建立索引，文件保留在原位置。">
-                <div className="flex items-center gap-2">
-                  <input
-                    readOnly
-                    value={draft.libraryRoot}
-                    placeholder="未配置"
-                    className="ui-control w-52 rounded-md px-2 py-1.5 text-sm outline-none"
-                  />
-                  <Button onClick={chooseLibraryRoot}>选择…</Button>
-                  {draft.libraryRoot && (
-                    <Button onClick={() => dirty({ ...draft, libraryRoot: "" })}>清除</Button>
+              <Field
+                label="总库位置"
+                hint={
+                  libraryConfigured
+                    ? "已配置总仓。更换位置必须走迁移向导：它会逐个校验文件后再切换，不会丢素材。"
+                    : "选择后，导入的文件会复制到总库统一管理；未选择时仅建立索引，文件保留在原位置。"
+                }
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <span
+                    className="max-w-52 truncate text-xs text-[var(--color-text-secondary)]"
+                    title={formatPathForDisplay(draft.libraryRoot) || "未配置"}
+                  >
+                    {formatPathForDisplay(draft.libraryRoot) || "未配置"}
+                  </span>
+                  {libraryConfigured ? (
+                    <Button onClick={() => setMigrationOpen(true)}>迁移或重新定位…</Button>
+                  ) : (
+                    <Button onClick={chooseLibraryRoot}>选择…</Button>
                   )}
                 </div>
               </Field>
@@ -709,6 +763,11 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 />
               </Field>
             </Group>
+            {/* A3-06：记住的目录授权必须能在这里看到并撤销（PRD 第 9 节）。
+                本次任务的一次性授权不列出，避免用户以为需要手动清理。 */}
+            <Group title="已记住的目录授权">
+              <DirectoryGrantsPanel />
+            </Group>
             </>
           )}
 
@@ -723,15 +782,23 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
 
           {route === "ai.services" && (
-            <Group title="服务管理">
-              <ServiceManagement
-                draft={draft}
-                onPatchAi={patchAi}
-                onPatchSettings={(patch) => dirty({ ...draft, ...patch })}
-                notify={setNotice}
-                fail={setError}
-              />
-            </Group>
+            <>
+              <Group title="服务管理">
+                <ServiceManagement
+                  draft={draft}
+                  onPatchAi={patchAi}
+                  onPatchSettings={(patch) => dirty({ ...draft, ...patch })}
+                  notify={setNotice}
+                  fail={setError}
+                />
+              </Group>
+              {/* WP5-1：Agent 的帮助台出口必须显式可见。
+                  修复前它是隐藏的环境变量开关，导致云模型永远「连不上」；
+                  2026-11-01 去掉「允许联网」开关，这一组只剩绑定与代理。 */}
+              <Group title="Agent 服务">
+                <AgentNetworkPanel notify={setNotice} fail={setError} />
+              </Group>
+            </>
           )}
 
           {route === "tags" && (
@@ -820,6 +887,20 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               <Field label="入库格子大小" hint="设置导入页缩略图的默认大小。">
                 <RangeSteps value={draftAppearance.grid.importCellStep} max={CELL_STEPS.length - 1} labelForStep={(v) => `${CELL_STEPS[v]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, importCellStep: v })} />
+              </Field>
+            </Group>
+
+            {/* A3-09（PRD 第 8 节）：悬浮助手只做应用内浮层，可随时开关；
+                关掉仅隐藏入口，不取消任何已在执行的任务。 */}
+            <Group title="悬浮助手">
+              <Field
+                label="显示悬浮助手"
+                hint="在页面右下角显示一个小 Logo，点开可继续最近的对话；切换页面不会中断。关掉只隐藏入口，正在执行的任务不受影响。"
+              >
+                <Toggle
+                  checked={draft.floatingAssistant !== false}
+                  onChange={() => dirty({ ...draft, floatingAssistant: draft.floatingAssistant === false })}
+                />
               </Field>
             </Group>
 
@@ -996,6 +1077,59 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </div>
               )}
             </Group>
+
+            {/* A3-05（PRD 第 8 节）：底栏入口 —— 只允许受控内置功能，可隐藏/排序；
+                「设置」是独立固定项；隐藏任何入口都不删除对应功能或数据。 */}
+            <Group title="底栏入口">
+              {draftNavigation.shortcuts.length === 0 ? (
+                <p className="px-4 py-3 text-xs text-[var(--color-text-secondary)]">
+                  当前已隐藏全部内置入口。重新载入默认入口可恢复底栏。
+                </p>
+              ) : (
+                draftNavigation.shortcuts.map((shortcut, index) => (
+                  <Field
+                    key={shortcut.id}
+                    label={NAVIGATION_LABELS[shortcut.id] ?? shortcut.id}
+                    hint={shortcut.visible ? "显示在底栏；可调整顺序" : "已隐藏（功能与数据都保留）"}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Button
+                        aria-label={`上移 ${NAVIGATION_LABELS[shortcut.id] ?? shortcut.id}`}
+                        disabled={index === 0}
+                        onClick={() => moveShortcut(index, -1)}
+                      >
+                        上移
+                      </Button>
+                      <Button
+                        aria-label={`下移 ${NAVIGATION_LABELS[shortcut.id] ?? shortcut.id}`}
+                        disabled={index === draftNavigation.shortcuts.length - 1}
+                        onClick={() => moveShortcut(index, 1)}
+                      >
+                        下移
+                      </Button>
+                      <Toggle checked={shortcut.visible} onChange={() => toggleShortcut(index)} />
+                    </div>
+                  </Field>
+                ))
+              )}
+              <Field
+                label="恢复默认入口"
+                hint="把四个内置入口恢复为全部显示并按默认顺序排列；不影响「设置」固定项。"
+              >
+                <Button onClick={() => patchNavigation({ shortcuts: defaultNavigationShortcuts() })}>
+                  恢复默认
+                </Button>
+              </Field>
+              <Field
+                label="把「设置」固定到底栏"
+                hint="「设置」不是快捷项：它只能固定到底栏，不会被计入可隐藏的内置功能目录。"
+              >
+                <Toggle
+                  checked={draftNavigation.settingsPinned}
+                  onChange={(v) => patchNavigation({ settingsPinned: v })}
+                />
+              </Field>
+            </Group>
             </>
           )}
 
@@ -1010,6 +1144,17 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   </span>
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
+              </Field>
+            </Group>
+            {/* A4-05：整库迁移 / 重新定位的唯一可信入口。
+                卡片禁止「用文本框改路径直接提交」，所以这里只有向导按钮：
+                目标由原生选择器产生、必须预检通过才允许开始。 */}
+            <Group title="总仓位置">
+              <Field
+                label="迁移或重新定位总仓"
+                hint="把整个素材目录搬到新磁盘，或核实您已经搬好的目录后切换。迁移会逐个校验文件，源目录在核验通过后仍然完整保留；本应用不会自动删除它。"
+              >
+                <Button onClick={() => setMigrationOpen(true)}>打开向导…</Button>
               </Field>
             </Group>
             <Group title="缓存管理">
@@ -1200,7 +1345,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {/* W5c：数据库备份/恢复（指导书 §W5c）——你的库唯一的副本入口 */}
             </Group>
             <Group title="历史库外记录">
-              <LegacyAssetPanel />
+              <LegacyAssetPanel onRequestRelocation={() => setMigrationOpen(true)} />
             </Group>
             <Group title="备份与恢复">
               <Field
@@ -1234,6 +1379,11 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   await Promise.all(refreshes);
                 }}
               />
+            </Group>
+            {/* A5-01：受控 stdio MCP 入口与宿主连接。默认关闭；这里只做启用与配对管理，
+                计划批准/永久清空永不经外部协议（docs/contracts/mcp-bridge-v1.md §1）。 */}
+            <Group title="本机外部接入（MCP）">
+              <McpBridgePanel />
             </Group>
             </>
           )}
@@ -1555,7 +1705,8 @@ function Toggle({
       className={`h-5 w-9 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${checked ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)]"}`}
     >
       <span
-        className={`block h-4 w-4 translate-x-0.5 rounded-full bg-white transition-transform ${checked ? "translate-x-[18px]" : ""}`}
+        // 滑块用语义底色：暗色主题的 accent 本身接近白色，写死 bg-white 会让滑块与轨道同色。
+        className={`block h-4 w-4 translate-x-0.5 rounded-full bg-[var(--color-bg)] transition-transform ${checked ? "translate-x-[18px]" : ""}`}
       />
     </button>
   );

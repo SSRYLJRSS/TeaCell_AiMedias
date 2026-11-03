@@ -16,6 +16,7 @@ import AssetGridView from "@/components/library/AssetGridView";
 import type { PaletteSegment } from "@/components/library/ColorStrip";
 import DeleteDialog from "@/components/dialogs/DeleteDialog";
 import ExportDialog from "@/components/dialogs/ExportDialog";
+import MoveDialog from "@/components/dialogs/MoveDialog";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import ViewerPage from "@/components/library/ViewerPage";
 import { useScrollDirection } from "@/hooks/useScrollDirection";
@@ -30,7 +31,7 @@ import { resolvedQueryToPlan } from "@/utils/planUtils";
 import { flattenExprForDisplay } from "@/utils/queryExprUtils";
 import { dominantFiltersFor } from "@/utils/dominantFilter";
 
-type DialogKey = "delete" | "export" | "tags" | null;
+type DialogKey = "delete" | "export" | "move" | "tags" | null;
 
 export default function SuperSearchPage() {
   const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, plan, planRevision, executionWarnings, resolvedTags, clearConditions, removeAtZonePath, applyTermSuggestion } = useSuperSearchStore(
@@ -57,7 +58,6 @@ export default function SuperSearchPage() {
   );
   const selected = useSelectionStore((s) => s.selected);
   const [dialog, setDialog] = useState<DialogKey>(null);
-  const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
   const [preview, setPreview] = useState<Asset | null>(null);
 
   // §7.2/§7.3（与素材库页一致）：打开/关闭 Viewer 同步全局 viewerOpen（App 据此隐藏 BottomBar）。
@@ -159,7 +159,7 @@ export default function SuperSearchPage() {
   }, [refresh]);
 
   useEffect(() => {
-    if (dialog === "export" && selected.size === 0) setDialog(null);
+    if ((dialog === "export" || dialog === "move") && selected.size === 0) setDialog(null);
   }, [dialog, selected.size]);
 
   const actions = {
@@ -168,13 +168,11 @@ export default function SuperSearchPage() {
       window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
     },
     onExport: () => {
-      setExportMode("copy");
+      // A4-01：只有一个入口——「复制导出」；目标目录在弹窗里走目录授权。
       setDialog("export");
     },
-    onMove: () => {
-      setExportMode("move");
-      setDialog("export");
-    },
+    // A4-02：库内分库移动
+    onMove: () => setDialog("move"),
     onDelete: () => setDialog("delete"),
   };
 
@@ -350,6 +348,8 @@ export default function SuperSearchPage() {
           hasActiveFilter={hasActiveFilter}
           onClearFilter={clearConditions}
           zeroingActions={zeroing.map((z) => ({ key: `${z.zone}:${z.path.join(".")}`, label: z.label, onRemove: () => removeAtZonePath(z.zone, z.path) }))}
+          // M-14b：右键评级/收藏必须回写超搜自己的 items（两页各有一份），不能写素材库 store
+          onPatchAssets={useSuperSearchStore.getState().patchLocal}
           {...actions}
         />
       </div>
@@ -361,7 +361,8 @@ export default function SuperSearchPage() {
       )}
 
       <DeleteDialog open={dialog === "delete"} onClose={() => setDialog(null)} />
-      <ExportDialog open={dialog === "export" && selected.size > 0} initialMode={exportMode} onClose={() => setDialog(null)} />
+      <ExportDialog open={dialog === "export" && selected.size > 0} onClose={() => setDialog(null)} />
+      <MoveDialog open={dialog === "move" && selected.size > 0} onClose={() => setDialog(null)} />
       <TagAssignDialog open={dialog === "tags"} onClose={() => setDialog(null)} />
     </div>
   );

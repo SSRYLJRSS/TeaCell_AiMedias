@@ -4,11 +4,19 @@
  *  - 胶片条文字使用与属性面板一致的 isVideoAsset 判断。
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";import ViewerPage from "@/components/library/ViewerPage";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import ViewerPage from "@/components/library/ViewerPage";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { ensureVideoProxy } from "@/api/video";
+import { setFavorite, setRating } from "@/api/assets";
 import type { Asset } from "@/types/asset";
 
+import { actRender } from "@/test/render";
+vi.mock("@/api/assets", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/api/assets")>()),
+  setRating: vi.fn().mockResolvedValue(1),
+  setFavorite: vi.fn().mockResolvedValue(1),
+}));
 vi.mock("@/api/thumbnail", () => ({
   getThumbnailUrl: vi.fn().mockResolvedValue("asset://thumb/hd.webp"),
   toFileUrl: (p: string) => `asset://${p}`,
@@ -56,6 +64,8 @@ function mkAsset(over: Partial<Asset> = {}): Asset {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(setRating).mockResolvedValue(1);
+  vi.mocked(setFavorite).mockResolvedValue(1);
   useLibraryStore.setState({
     items: [mkAsset()],
     total: 1,
@@ -75,8 +85,8 @@ beforeEach(() => {
 });
 
 describe("ViewerPage 视频识别（§7.1）", () => {
-  it("MIME 为 video/mp4 且 durationMs=null 仍渲染 VideoPlayer", () => {
-    const { container } = render(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
+  it("MIME 为 video/mp4 且 durationMs=null 仍渲染 VideoPlayer", async () => {
+    const { container } = await actRender(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
     // 渲染 <video> 元素（VideoPlayer），而非 <img>
     expect(container.querySelector("video")).not.toBeNull();
     expect(container.querySelector("img")).toBeNull();
@@ -85,14 +95,14 @@ describe("ViewerPage 视频识别（§7.1）", () => {
   it("图片素材渲染 <img> 而非 VideoPlayer", async () => {
     const img = mkAsset({ id: 2, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
     // 高清缩略图异步加载后渲染 <img>；等待出现的 img 元素
     await waitFor(() => expect(screen.getByRole("img", { name: "i.jpg" })).toBeInTheDocument());
     expect(container.querySelector("video")).toBeNull();
   });
 
-  it("胶片条对无占位图的视频显示「视频」而非「图片」（同一类型判断）", () => {
-    render(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
+  it("胶片条对无占位图的视频显示「视频」而非「图片」（同一类型判断）", async () => {
+    await actRender(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
     // 当前素材 placeholderPath=null → 胶片条退化为文字
     const text = screen.getAllByText("视频");
     expect(text.length).toBeGreaterThan(0);
@@ -107,11 +117,13 @@ describe("ViewerPage 视频识别（§7.1）", () => {
       error: null,
       updatedAt: 1,
     });
-    const { container } = render(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
+    const { container } = await actRender(<ViewerPage asset={mkAsset()} onClose={vi.fn()} />);
     const video = container.querySelector("video") as HTMLVideoElement;
     expect(video).not.toBeNull();
-    // 触发播放错误
-    video.dispatchEvent(new Event("error"));
+    // 触发播放错误（原生派发不经 RTL 事件包装，需 act）
+    act(() => {
+      video.dispatchEvent(new Event("error"));
+    });
     await waitFor(() => expect(ensureVideoProxy).toHaveBeenCalledWith(1));
     await waitFor(() =>
       expect((container.querySelector("video") as HTMLVideoElement).getAttribute("src")).toContain("asset://proxy/"),
@@ -120,7 +132,7 @@ describe("ViewerPage 视频识别（§7.1）", () => {
 });
 
 describe("ViewerPage 过片数据集可注入（超级搜索联动）", () => {
-  it("传入 listItems/listTotal 时胶片条与位置计数用注入集；不回退混入素材库 store 列表", () => {
+  it("传入 listItems/listTotal 时胶片条与位置计数用注入集；不回退混入素材库 store 列表", async () => {
     // 素材库 store 里是另一批 3 项（旧实现下查看器只会读它，导致超搜 2 项却显示 x/3）
     const lib = [
       mkAsset({ id: 301, fileName: "l1.jpg", filePath: "d:/lib/l1.jpg" }),
@@ -132,7 +144,7 @@ describe("ViewerPage 过片数据集可注入（超级搜索联动）", () => {
       mkAsset({ id: 401, mimeType: "image/jpeg", fileExt: "jpg", fileName: "s1.jpg", filePath: "d:/s/s1.jpg", placeholderPath: "t401.jpg" }),
       mkAsset({ id: 402, mimeType: "image/jpeg", fileExt: "jpg", fileName: "s2.jpg", filePath: "d:/s/s2.jpg", placeholderPath: "t402.jpg" }),
     ];
-    render(<ViewerPage asset={injected[0]} onClose={vi.fn()} listItems={injected} listTotal={2} />);
+    await actRender(<ViewerPage asset={injected[0]} onClose={vi.fn()} listItems={injected} listTotal={2} />);
     // 位置计数走注入集
     expect(screen.getByText("1 / 2")).toBeInTheDocument();
     expect(screen.queryByText(/\/ 3/)).not.toBeInTheDocument();
@@ -164,16 +176,21 @@ describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
     const imgAsset = mkAsset({ id: 9, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null, palette } as Partial<Asset>);
     // items 里放同一份资产（current 取自 store；不放会落到 beforeEach 的视频资产上）
     useLibraryStore.setState({ items: [imgAsset], total: 1 });
-    const { container, rerender } = render(<ViewerPage asset={imgAsset} onClose={vi.fn()} />);
+    const { container, rerender } = await actRender(<ViewerPage asset={imgAsset} onClose={vi.fn()} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
     expect(container.querySelector(".ui-colorstrip")).not.toBeNull();
 
     // 无 palette → 不渲染（查看器不占位）
     const noPalette = mkAsset({ id: 9, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null, palette: null } as Partial<Asset>);
-    useLibraryStore.setState({ items: [noPalette], total: 1 });
+    // 已挂载的查看器订阅了这两个 store；外部 setState 必须落在 act 内，否则状态回写逃逸。
+    act(() => {
+      useLibraryStore.setState({ items: [noPalette], total: 1 });
+    });
     rerender(<ViewerPage asset={noPalette} onClose={vi.fn()} />);
     await waitFor(() => expect(container.querySelector(".ui-colorstrip")).toBeNull());
-    sstore.setState({ settings: null, previewAppearance: null });
+    act(() => {
+      sstore.setState({ settings: null, previewAppearance: null });
+    });
   });
 });
 
@@ -222,7 +239,7 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={onClose} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
 
     // 点击「全屏浏览」→ 进入 native
@@ -246,14 +263,16 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     installFullscreenMock({ supported: true });
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
     // 等沉浸状态真正提交（chrome 卸载）→ fullscreenchange 监听器已用新 immersiveMode 重注册
     await waitFor(() => expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument());
-    // 系统退出：fullscreenElement 置空并派发 fullscreenchange
+    // 系统退出：fullscreenElement 置空并派发 fullscreenchange（原生派发不受 RTL 包装，需 act）
     (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
-    document.dispatchEvent(new Event("fullscreenchange"));
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
     await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "全屏浏览" })).toBeInTheDocument();
   });
@@ -262,12 +281,14 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     installFullscreenMock({ supported: true });
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
-    // 别的元素进了全屏
+    // 别的元素进了全屏（原生派发不受 RTL 包装，需 act）
     const other = document.createElement("div");
     (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = other;
-    document.dispatchEvent(new Event("fullscreenchange"));
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
     // 查看器保持普通模式
     expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument();
     expect(container.querySelector("[data-viewer-immersive]")).toBeNull();
@@ -278,7 +299,7 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={onClose} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
 
     fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
@@ -295,7 +316,7 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={onClose} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
     await waitFor(() => expect(document.body.querySelector("[data-immersive-canvas]")).not.toBeNull());
@@ -317,7 +338,7 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={onClose} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
     // 等沉浸状态提交（chrome 卸载）
@@ -325,9 +346,11 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     // native 中 Esc：浏览器接管（fullscreenElement 非空）→ 查看器不关闭
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
-    // 系统退出全屏（fullscreenchange）→ 普通模式
+    // 系统退出全屏（fullscreenchange）→ 普通模式（原生派发不经 RTL 事件包装，需 act）
     (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
-    document.dispatchEvent(new Event("fullscreenchange"));
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
     await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
     // 第二次 Esc → 关闭
     fireEvent.keyDown(window, { key: "Escape" });
@@ -339,16 +362,18 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
     useLibraryStore.setState({ items: [img], total: 1 });
-    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={img} onClose={onClose} />);
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument());
     // 关闭（点击返回素材库按钮也走 handleClose，但沉浸时按钮不存在 → 直接模拟关闭路径）
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled(); // native Esc 被浏览器消费
-    // 系统退出 → 普通模式 → 再 Esc 关闭
+    // 系统退出 → 普通模式 → 再 Esc 关闭（原生派发不经 RTL 事件包装，需 act）
     (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
-    document.dispatchEvent(new Event("fullscreenchange"));
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
     await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
@@ -361,7 +386,7 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     const onClose = vi.fn();
     const vid = mkAsset();
     useLibraryStore.setState({ items: [vid], total: 1 });
-    const { container } = render(<ViewerPage asset={vid} onClose={onClose} />);
+    const { container } = await actRender(<ViewerPage asset={vid} onClose={onClose} />);
     const video = container.querySelector("video") as HTMLVideoElement;
     await waitFor(() => expect(video).not.toBeNull());
     fireEvent.doubleClick(video);
@@ -369,5 +394,90 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
     // 视频沉浸为黑底
     await waitFor(() => expect(document.body.querySelector('[data-surface="video-immersive"]')).not.toBeNull());
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * M-14b（PRD R-16 / QA_PLAYBOOK F-05、J-01、J-02）：
+ * `de1fdb9`、`683628a` 两次大重构把评级/收藏的前端入口整体删掉了（后端 `set_rating`
+ * 命令与 `assets.rating/favorite` 列一直都在），导致 L-01 主链路的「查看器评级」无路可走。
+ * 这里钉住恢复后的入口：侧栏点星、点当前星清零、F 切收藏、键盘 1–5/0/F、
+ * 输入框内不抢按键、写失败要回滚并如实播报。
+ */
+describe("ViewerPage 评级与收藏（M-14b / PRD R-16 / F-05）", () => {
+  function imgAsset(over: Partial<Asset> = {}): Asset {
+    return mkAsset({ id: 7, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null, ...over });
+  }
+
+  it("左栏点第 5 颗星写入评级，星标随即点亮（查看器评级有真实入口）", async () => {
+    const img = imgAsset();
+    useLibraryStore.setState({ items: [img], total: 1 });
+    await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const five = await screen.findByRole("button", { name: "设为 5 星" });
+    expect(five).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(five);
+    await waitFor(() => expect(setRating).toHaveBeenCalledWith([7], 5));
+    await waitFor(() => expect(screen.getByRole("button", { name: "设为 5 星" })).toHaveAttribute("aria-pressed", "true"));
+  });
+
+  it("点已选中的当前星清零，不会把星级「锁死」在已选项（0 = 未评级）", async () => {
+    const img = imgAsset({ rating: 3 });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const three = await screen.findByRole("button", { name: "设为 3 星" });
+    expect(three).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(three);
+    await waitFor(() => expect(setRating).toHaveBeenCalledWith([7], 0));
+  });
+
+  it("F 键切换收藏，同样落到 set_favorite（不是只改本地状态）", async () => {
+    const img = imgAsset();
+    useLibraryStore.setState({ items: [img], total: 1 });
+    await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "收藏" })).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() => expect(setFavorite).toHaveBeenCalledWith([7], true));
+    await waitFor(() => expect(screen.getByRole("button", { name: "取消收藏" })).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "F" });
+    await waitFor(() => expect(setFavorite).toHaveBeenLastCalledWith([7], false));
+  });
+
+  it("键盘 1–5 设星级、0 清除，全程不用鼠标（F-05 纯键盘路径）", async () => {
+    const img = imgAsset();
+    useLibraryStore.setState({ items: [img], total: 1 });
+    await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "设为 1 星" })).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "4" });
+    await waitFor(() => expect(setRating).toHaveBeenCalledWith([7], 4));
+    fireEvent.keyDown(window, { key: "0" });
+    await waitFor(() => expect(setRating).toHaveBeenLastCalledWith([7], 0));
+  });
+
+  it("焦点在输入框时按 1–5 / F 不改评级收藏，避免打字就把素材改了（J-02）", async () => {
+    const img = imgAsset();
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "设为 1 星" })).toBeInTheDocument());
+    const input = document.createElement("input");
+    container.appendChild(input);
+    input.focus();
+    fireEvent.keyDown(input, { key: "5" });
+    fireEvent.keyDown(input, { key: "f" });
+    // isEditableTarget 命中 → 一个都不应发出去
+    expect(setRating).not.toHaveBeenCalled();
+    expect(setFavorite).not.toHaveBeenCalled();
+  });
+
+  it("写入失败时回滚星标并用 role=alert 如实说明，不假装保存成功", async () => {
+    vi.mocked(setRating).mockRejectedValueOnce(new Error("数据库忙"));
+    const img = imgAsset({ rating: 2 });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    await actRender(<ViewerPage asset={img} onClose={vi.fn()} />);
+    const four = await screen.findByRole("button", { name: "设为 4 星" });
+    fireEvent.click(four);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("评级/收藏没有保存：数据库忙"));
+    // 回滚到原来的 2 星：第 3 颗应为未选中，第 2 颗为选中
+    await waitFor(() => expect(screen.getByRole("button", { name: "设为 3 星" })).toHaveAttribute("aria-pressed", "false"));
+    expect(screen.getByRole("button", { name: "设为 2 星" })).toHaveAttribute("aria-pressed", "true");
   });
 });

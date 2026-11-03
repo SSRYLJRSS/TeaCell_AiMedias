@@ -66,6 +66,15 @@ const draft: Settings = {
     },
     kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
   },
+  navigation: {
+    shortcuts: [
+      { id: "import", visible: true },
+      { id: "library", visible: true },
+      { id: "ai", visible: true },
+      { id: "treasure", visible: true },
+    ],
+    settingsPinned: false,
+  },
 };
 
 function setPlatform(os: "windows" | "macos" | "linux") {

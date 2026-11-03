@@ -105,6 +105,9 @@ pub struct PlanPreview {
     pub library: LibraryScope,
     pub review_status: PlanReviewStatus,
     pub review_kind: ReviewKind,
+    pub origin_kind: CallerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_label: Option<ShortText>,
     pub item_count: u32,
     pub summary: Instructions,
     pub review_ref: ResourceRef,

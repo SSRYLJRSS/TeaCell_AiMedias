@@ -23,4 +23,10 @@ export interface PlatformCapabilities {
   primaryModifier: PrimaryModifier;
   /** 当前版本不支持跨系统素材库搬迁；保留协议字段并始终为 null。 */
   libraryTransferVersion: 1 | null;
+  /**
+   * 本平台是否提供 Agent Host（当前仅 Windows x64）。纯增量可选字段：
+   * 为保持冻结的 schemaVersion=1 契约不做版本升级，缺失按 false 处理，
+   * 此时界面必须禁用 Agent 入口并说明原因。
+   */
+  agentHost?: boolean;
 }

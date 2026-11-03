@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useImportWorkbenchStore } from "@/stores/importWorkbenchStore";
 import { useConversationStore } from "@/stores/conversationStore";
 import { AppError } from "@/api/client";
-import type { PreparedImportPlan } from "@/types/import";
+import type { ImportResultView, PreparedImportPlan } from "@/types/import";
 import type { OperationSnapshot } from "@/types/plans";
 
 const mocks = vi.hoisted(() => ({
@@ -127,7 +127,7 @@ beforeEach(() => {
   mocks.prepareImport.mockResolvedValue(plan("plan-1"));
   mocks.getImportPlan.mockImplementation(async (planRef: string) => plan(planRef));
   mocks.getImportPlanPreviewPaths.mockResolvedValue({ "item-1": "D:/private/photo.jpg" });
-  mocks.getImportResult.mockResolvedValue({ imported: 0, duplicates: 0, failed: 0, failures: [] });
+  mocks.getImportResult.mockResolvedValue({ sourceStepRef: "step-1", imported: 0, duplicateItems: [], duplicates: 0, failed: 0, failures: [] });
   mocks.getOperation.mockResolvedValue(operation());
   mocks.cancelOperation.mockResolvedValue(operation("cancelled"));
   mocks.resumeOperation.mockResolvedValue(operation("running"));
@@ -203,7 +203,7 @@ describe("importWorkbenchStore", () => {
   });
 
   it("并发读取同一操作结果时合并为一个请求", async () => {
-    let finishRead!: (result: { imported: number; duplicates: number; failed: number; failures: [] }) => void;
+    let finishRead!: (result: ImportResultView) => void;
     mocks.getImportResult.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
     const first = useImportWorkbenchStore.getState().loadOperationResult("op-1");
     const second = useImportWorkbenchStore.getState().loadOperationResult("op-1");
@@ -211,7 +211,7 @@ describe("importWorkbenchStore", () => {
 
     expect(mocks.getImportResult).toHaveBeenCalledTimes(1);
     expect(useImportWorkbenchStore.getState().operationResultLoading["op-1"]).toBe(true);
-    finishRead({ imported: 1, duplicates: 0, failed: 0, failures: [] });
+    finishRead({ sourceStepRef: "step-1", imported: 1, duplicateItems: [], duplicates: 0, failed: 0, failures: [] });
     await Promise.all([first, second]);
 
     expect(useImportWorkbenchStore.getState().operationResultLoading["op-1"]).toBeUndefined();
@@ -219,14 +219,16 @@ describe("importWorkbenchStore", () => {
   });
 
   it("恢复后的新终态结果不会被旧读取覆盖", async () => {
-    let finishOldRead!: (result: { imported: number; duplicates: number; failed: number; failures: [] }) => void;
-    const oldResult: { imported: number; duplicates: number; failed: number; failures: [] } = {
+    let finishOldRead!: (result: ImportResultView) => void;
+    const oldResult: ImportResultView = {
+      sourceStepRef: "step-1",
       imported: 1,
+      duplicateItems: [],
       duplicates: 0,
       failed: 1,
       failures: [],
     };
-    const newResult = { imported: 2, duplicates: 0, failed: 0, failures: [] };
+    const newResult = { sourceStepRef: "step-1", imported: 2, duplicateItems: [], duplicates: 0, failed: 0, failures: [] };
     let readCount = 0;
     mocks.getImportResult.mockImplementation(() => {
       readCount += 1;
@@ -248,8 +250,8 @@ describe("importWorkbenchStore", () => {
 
   it("旧 revision 的迟到失败不会清除新结果读取状态", async () => {
     let failOldRead!: (error: Error) => void;
-    let finishNewRead!: (result: { imported: number; duplicates: number; failed: number; failures: [] }) => void;
-    const newResult = { imported: 2, duplicates: 0, failed: 0, failures: [] as [] };
+    let finishNewRead!: (result: ImportResultView) => void;
+    const newResult = { sourceStepRef: "step-1", imported: 2, duplicateItems: [], duplicates: 0, failed: 0, failures: [] as [] };
     let readCount = 0;
     mocks.getImportResult.mockImplementation(() => {
       readCount += 1;
@@ -277,7 +279,7 @@ describe("importWorkbenchStore", () => {
   });
 
   it("结果读取失败后保留按操作重试的错误，并在成功重试后清除", async () => {
-    const expectedResult = { imported: 1, duplicates: 0, failed: 0, failures: [] };
+    const expectedResult = { sourceStepRef: "step-1", imported: 1, duplicateItems: [], duplicates: 0, failed: 0, failures: [] };
     mocks.getImportResult
       .mockRejectedValueOnce(new Error("结果查询暂时失败"))
       .mockResolvedValueOnce(expectedResult);
@@ -295,7 +297,7 @@ describe("importWorkbenchStore", () => {
   it("读取函数同步抛错后也能清理并重试", async () => {
     mocks.getImportResult
       .mockImplementationOnce(() => { throw new Error("同步读取错误"); })
-      .mockResolvedValueOnce({ imported: 0, duplicates: 1, failed: 0, failures: [] });
+      .mockResolvedValueOnce({ sourceStepRef: "step-1", imported: 0, duplicateItems: [], duplicates: 1, failed: 0, failures: [] });
 
     await useImportWorkbenchStore.getState().loadOperationResult("op-1");
     expect(useImportWorkbenchStore.getState().operationResultErrors["op-1"]).toBe("同步读取错误");

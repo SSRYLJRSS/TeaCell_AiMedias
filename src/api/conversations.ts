@@ -1,9 +1,10 @@
 /** 会话索引与持久工作台草稿（对应 commands/conversations_cmd.rs）。 */
 import { invoke } from "./client";
+import type { OperationSnapshot, PlanPreview } from "@/types/plans";
 
 export type ConversationStatus = "active" | "archived";
 export type DraftKind = "import" | "tagging" | "export" | "workbench" | "assistant";
-export type ConversationLinkKind = "plan" | "operation" | "batch";
+export type ConversationLinkKind = "plan" | "operation" | "batch" | "selection";
 
 export interface ConversationSummary {
   conversationRef: string;
@@ -117,4 +118,21 @@ export function linkConversation(
   reference: string,
 ): Promise<void> {
   return invoke<void>("link_conversation", { conversationRef, kind, reference });
+}
+
+/**
+ * A3-04：按会话还原计划与任务卡片。
+ *
+ * 归属由后端裁决（显式链接 ∪ `plans.session_id == 会话引用`），前端只提供会话引用，
+ * 不能指定「我想认领哪些计划」。
+ */
+export interface ConversationWork {
+  plans: PlanPreview[];
+  operations: OperationSnapshot[];
+}
+
+export function getConversationWork(
+  conversationRef: string,
+): Promise<ConversationWork> {
+  return invoke<ConversationWork>("get_conversation_work", { conversationRef });
 }

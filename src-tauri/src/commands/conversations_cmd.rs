@@ -11,7 +11,7 @@ use crate::contracts::caller::CallerContext;
 use crate::error::AppResult;
 use crate::services::authorization::{self, TrustedAdapterIdentity};
 use crate::services::conversations::{
-    self, AttachmentView, ConversationSummary, ConversationView, DraftView,
+    self, AttachmentView, ConversationSummary, ConversationView, ConversationWorkView, DraftView,
 };
 use crate::state::AppState;
 
@@ -124,4 +124,15 @@ pub fn link_conversation(
 ) -> AppResult<()> {
     let caller = gui_caller(&state)?;
     conversations::link(&state.db, &caller, &conversation_ref, &kind, &reference)
+}
+
+/// A3-04：按会话还原计划与任务卡片。归属由后端从 `conversation_links` 与
+/// `plans.session_id` 裁决，前端只提供会话引用，无法指定要认领哪些计划。
+#[tauri::command]
+pub fn get_conversation_work(
+    state: State<AppState>,
+    conversation_ref: ResourceRef,
+) -> AppResult<ConversationWorkView> {
+    let caller = gui_caller(&state)?;
+    conversations::conversation_work(&state.db, &caller, &conversation_ref)
 }

@@ -1,6 +1,6 @@
 # 平台支持与差异治理
 
-> 更新日期：2026-10-10
+> 更新日期：2026-10-26
 >
 > 本文档是支持平台、支持等级、平台能力差异和跨平台开发边界的唯一事实源。产品功能见
 > [PRD.md](PRD.md)，当前落地状态见 [PROJECT_PLAN.md](PROJECT_PLAN.md)，验证方法见
@@ -152,13 +152,13 @@ Git 提交、操作系统与架构、失败步骤、预期与实际、素材包�
 
 ## 9. 2.0 Agent平台增量
 
-本节定义平台能力边界，不提升第1–2节的支持等级。产品范围见 [PRD第8节](PRD.md#8-20-agent-与25插件的已批准目标待实现)，模块见 [ARCHITECTURE第9节](ARCHITECTURE.md#916-pi-agent-host进程与协议a3-01)，当前卡状态与证据只见[项目计划](PROJECT_PLAN.md#9-20-agent开发状态)。
+本节定义平台能力边界，不提升第1–2节的支持等级。产品范围见 [PRD第8节](PRD.md#8-20-agent-与25插件的已批准目标待实现)，模块见 [ARCHITECTURE第9节](ARCHITECTURE.md#916-pi-agent-host-进程与协议a3-01)，当前卡状态与证据只见[项目计划](PROJECT_PLAN.md#9-20-agent开发状态)。
 
 | 能力 | 当前可用目标 | 边界 |
 |---|---|---|
 | Pi Agent Host 进程/协议 | Windows x64 | 使用应用自带 Node 24.19.0 与锁定的 Pi Host；启动时不读全局 Node、Pi 配置、凭据或模型缓存；只运行离线模型 fixture。 |
 | 其他平台的 Agent Host | 未启用 | macOS、Linux、非 x64 目标返回 `unsupported`，不得显示成可启动功能。须按各自平台重新验证产物、环境隔离、进程组回收、单实例、打包和预算。 |
-| 真实模型与代理 | 未接入 | 由 A3-02/A0-03 验证专用模型网关、真实 provider、HTTPS、系统/环境代理及 TUN；不能从 Host 子进程继承代理或凭据来绕过验证。 |
+| 真实模型与代理 | 两条正交判定：**①能否外发**按网关准入（绑定服务、连接启用、密钥可用），代理只认 `settings.agent_model_proxy` 里用户显式填写的 http(s) 地址，`TEACELL_AGENT_MODEL_NETWORK` 环境变量已移除；**②能用哪层工具**按会话权限档位，默认 `Standard`。两者的权威定义见[实现契约 §6.1](../plans/v2/12-implementation-contracts.md#61-a3-02-agent-模型网关接线)与[§6.2](../plans/v2/12-implementation-contracts.md#62-agent-会话权限档位a3-10)，本节不复制 | 代理**不读系统/环境代理，也不支持 TUN/PAC**；真实 provider、外部 HTTPS、系统代理与费用验收仍按 A3-02/A3-11/A0-03 单独进行，不能从 Host 子进程继承代理或凭据来绕过。档位只收窄能力，不放宽任何审批。 |
 
 Windows Host 的进程、目录与帧规则以[协议契约](contracts/agent-host-protocol-v1.md)为准。开发工具链 Node 与随包运行时是不同制品；打包必须使用固定来源/摘要的运行时和 Tauri resource overlay。Windows 使用隐藏后台进程和 Job Object 回收自有进程树，不按进程名杀进程；会话目录每次只允许一个有效租约所有者，恢复必须由可信 GUI 明确触发。真实模型传输、完整 GUI 生命周期与会话投影、真实素材 UAT 尚未由 A3-01 覆盖。
 

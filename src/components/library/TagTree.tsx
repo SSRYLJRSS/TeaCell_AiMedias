@@ -266,6 +266,8 @@ function TreeRow({
     <button
       onClick={onClick}
       onContextMenu={onContextMenu}
+      // M-13：长中文标签会被 truncate 截断，必须能 hover 看到全量（不撑破布局即可截断，但不能只截断不给全量）
+      title={label}
       className={clsx(
         "ui-nav-item ui-nav-list-item flex min-h-8 flex-1 items-center justify-between px-2 py-1.5 text-left text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
       )}

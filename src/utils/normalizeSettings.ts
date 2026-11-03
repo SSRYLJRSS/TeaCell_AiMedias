@@ -15,10 +15,13 @@ import type {
   CustomSource,
   GridAppearance,
   HoverPreviewAppearance,
+  Navigation,
+  NavigationShortcut,
+  NavigationShortcutId,
   Settings,
   TagCategory,
 } from "@/types/settings";
-import { CELL_STEPS } from "@/types/settings";
+import { CELL_STEPS, NAVIGATION_SHORTCUT_IDS } from "@/types/settings";
 
 export const DEFAULT_MODEL = "qwen-vl-plus";
 /** FB3-07：云端每批处理数量默认 30（与 Rust default_batch_limit 一致；运行时范围 [10,50]） */
@@ -180,6 +183,45 @@ function normalizeAppearance(raw: unknown): Appearance {
   };
 }
 
+/**
+ * A3-05：底栏快捷项归一化（与 Rust `db::settings::normalize_navigation` 同语义）。
+ *
+ * 规则：
+ *  - 未知 id（含任意 URL/命令）直接丢弃；重复 id 保留首次出现的位置；
+ *  - 显式空数组 = 用户主动隐藏了全部入口，保持为空，不擅自恢复默认；
+ *  - 有条目但全部无法映射时回落默认目录，避免底栏凭空消失。
+ */
+function normalizeNavigation(raw: unknown): Navigation {
+  const r = isRecord(raw) ? raw : {};
+  const settingsPinned = asBool(r.settingsPinned, false);
+  // 整个 navigation 缺失（旧库）→ 用默认目录；显式空数组才算「用户隐藏了全部入口」。
+  if (!Array.isArray(r.shortcuts)) {
+    return { shortcuts: defaultNavigationShortcuts(), settingsPinned };
+  }
+  const entries = r.shortcuts;
+  const hadEntries = entries.length > 0;
+  const kept: NavigationShortcut[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    const id = entry.id;
+    if (typeof id !== "string") continue;
+    if (!(NAVIGATION_SHORTCUT_IDS as readonly string[]).includes(id)) continue;
+    const known = id as NavigationShortcutId;
+    if (kept.some((s) => s.id === known)) continue;
+    kept.push({ id: known, visible: asBool(entry.visible, true) });
+    if (kept.length === NAVIGATION_SHORTCUT_IDS.length) break;
+  }
+  return {
+    shortcuts: hadEntries && kept.length === 0 ? defaultNavigationShortcuts() : kept,
+    settingsPinned,
+  };
+}
+
+/** 默认底栏目录（PRD 第 8 节：「入库｜素材库｜中央 Logo｜打标｜百宝箱」中的可配置项）。 */
+export function defaultNavigationShortcuts(): NavigationShortcut[] {
+  return NAVIGATION_SHORTCUT_IDS.map((id) => ({ id, visible: true }));
+}
+
 /** 对一份 `unknown` 设置做运行时归一化，返回可安全渲染的完整 Settings。 */
 export function normalizeSettings(raw: unknown): Settings {
   const r = isRecord(raw) ? raw : {};
@@ -204,5 +246,8 @@ export function normalizeSettings(raw: unknown): Settings {
     modelDownloadProxy: asStr(r.modelDownloadProxy, ""),
     tutorialPromptHandled: asBool(r.tutorialPromptHandled, false),
     appearance: normalizeAppearance(r.appearance),
+    navigation: normalizeNavigation(r.navigation),
+    // A3-09：悬浮助手默认开启；旧设置缺字段也按开启处理。
+    floatingAssistant: asBool(r.floatingAssistant, true),
   };
 }

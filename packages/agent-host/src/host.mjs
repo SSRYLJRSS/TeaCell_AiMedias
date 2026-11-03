@@ -3,8 +3,10 @@ import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { FrameDecoder, encodeFrame, MAX_PROMPT_BYTES, PROTOCOL_VERSION, RESOURCE_TOKEN, SCHEMA_VERSION, SDK_VERSION, requireRequestId } from './protocol.mjs';
-import { createOfflineSession } from './sdk-session.mjs';
+import { createOfflineSession, readConversationProjection } from './sdk-session.mjs';
 import { createGatewayRpc, gatewayErrorDetails } from './gateway-rpc.mjs';
+import { createCapabilityRpc } from './capability-rpc.mjs';
+import { normalizeSessionToolNames, PI_TOOL_NAMES } from './tools.mjs';
 import { verifyAgentDirectory } from './paths.mjs';
 import { acquireLease } from './lease.mjs';
 import { createWriteQueue } from './write-queue.mjs';
@@ -18,6 +20,7 @@ let activeAgentDir;
 let releaseLease;
 let activeRun;
 let gatewayRpc;
+let capabilityRpc;
 const sessions = new Map();
 const MAX_OPEN_SESSIONS = 8;
 const output = createWriteQueue(process.stdout);
@@ -28,7 +31,7 @@ const RECOVERABLE_COMMAND_ERRORS = new Set([
   'INVALID_CONVERSATION_ID', 'INVALID_OPEN_MODE', 'RUN_BUSY', 'CONVERSATION_EXISTS',
   'SESSION_LIMIT', 'SESSION_OPEN_FAILED', 'INVALID_PROMPT', 'INVALID_RUN_ID',
   'CONVERSATION_NOT_OPEN', 'RUN_MISMATCH', 'SESSION_FILE_INVALID', 'INVALID_COMMAND',
-  'INVALID_MODEL_LEASE',
+  'INVALID_MODEL_LEASE', 'SESSION_NOT_FOUND',
 ]);
 
 class CommandRejection extends Error {
@@ -79,6 +82,7 @@ async function shutdown() {
     await stopRun();
     process.stdin.pause();
     gatewayRpc?.close();
+    capabilityRpc?.close();
     await Promise.allSettled([...pendingCommands]);
     for (const [conversationId, record] of sessions) {
       try { await record.session.dispose(); } catch { /* Continue disposing the remaining sessions. */ }
@@ -87,6 +91,7 @@ async function shutdown() {
   } finally {
     process.stdin.pause();
     gatewayRpc?.close();
+    capabilityRpc?.close();
     sessions.clear();
     try { await releaseLease?.(); } catch { /* The process is exiting; do not hold the lease indefinitely. */ }
     try { await output.flush(); } catch { /* A broken output pipe must not block process cleanup. */ }
@@ -104,22 +109,83 @@ async function finishRun(run, text) {
     if (gatewayFailure) {
       error(undefined, 'RUN_FAILED', run.runId, run.conversationId, gatewayFailure);
     }
-    send({ type: 'settled', conversationId: run.conversationId, runId: run.runId,
-      aborted: Boolean(gatewayFailure) ||
-        run.session.agent.state.messages.at(-1)?.stopReason === 'aborted' });
+    send(settledFrame(run, gatewayFailure));
   } catch (failure) {
     error(undefined, 'RUN_FAILED', run.runId, run.conversationId,
       gatewayErrorDetails(failure) ?? gatewayRpc?.failureForRun(run.runId));
-    send({ type: 'settled', conversationId: run.conversationId, runId: run.runId, aborted: true });
+    send({ type: 'settled', conversationId: run.conversationId, runId: run.runId,
+      aborted: true, stopReason: 'error' });
   } finally {
     run.clearGatewayLease?.(run.runId);
     if (activeRun === run) activeRun = undefined;
   }
 }
 
+// Builds the settled event. `stopReason` lets the UI distinguish a normal end
+// ("stop") from a max-token truncation ("length", which the UI may offer to
+// continue) and an aborted turn ("aborted"); `rawStopReason` is the provider's
+// literal finish_reason/stop_reason; `usage` is the provider's own token
+// accounting (never fabricated - omitted when the provider did not report it).
+function settledFrame(run, gatewayFailure) {
+  const last = run.session.agent.state.messages.at(-1);
+  const stopReason = typeof last?.stopReason === 'string'
+    ? last.stopReason
+    : (gatewayFailure ? 'error' : 'stop');
+  const frame = {
+    type: 'settled',
+    conversationId: run.conversationId,
+    runId: run.runId,
+    aborted: Boolean(gatewayFailure) || stopReason === 'aborted',
+    stopReason,
+  };
+  if (typeof last?.rawStopReason === 'string' && last.rawStopReason.length <= 64) {
+    frame.rawStopReason = last.rawStopReason;
+  }
+  const usage = last?.usage;
+  if (usage && Number.isFinite(usage.input) && Number.isFinite(usage.output)) {
+    frame.usage = {
+      input: usage.input,
+      output: usage.output,
+      cacheRead: Number.isFinite(usage.cacheRead) ? usage.cacheRead : 0,
+      cacheWrite: Number.isFinite(usage.cacheWrite) ? usage.cacheWrite : 0,
+      totalTokens: Number.isFinite(usage.totalTokens) ? usage.totalTokens : usage.input + usage.output,
+    };
+  }
+  return frame;
+}
+
 function conversationIdOf(value) {
   if (typeof value !== 'string' || !RESOURCE_TOKEN.test(value)) rejectCommand('INVALID_CONVERSATION_ID');
   return value;
+}
+
+// 把 Pi SessionProjection 的消息压成 UI 可渲染的只读历史项。
+// 只取文本（type==='text' 的块拼接）；工具调用/结果等非文本块不进入文本历史，
+// 但整条消息仍保留（文本可能为空）。stopReason 仅在 assistant 消息上是字符串时透出，
+// 便于 UI 标注「因长度停止」等。绝不新增、不改写内容。
+function projectHistoryMessages(projection) {
+  const messages = Array.isArray(projection?.messages) ? projection.messages : [];
+  return messages.map((message, index) => {
+    const role = message?.role === 'assistant' ? 'assistant' : 'user';
+    let text = '';
+    if (typeof message?.content === 'string') {
+      text = message.content;
+    } else if (Array.isArray(message?.content)) {
+      text = message.content
+        .filter(block => block && block.type === 'text' && typeof block.text === 'string')
+        .map(block => block.text)
+        .join('');
+    }
+    const item = {
+      id: typeof message?.id === 'string' && message.id ? message.id : `history-${index}`,
+      role,
+      text,
+    };
+    if (role === 'assistant' && typeof message?.stopReason === 'string') {
+      item.stopReason = message.stopReason;
+    }
+    return item;
+  });
 }
 
 async function handle(frame) {
@@ -132,18 +198,29 @@ async function handle(frame) {
       return;
     }
     send({ type: 'ready', requestId, sdk: SDK_VERSION, appBuild,
-      schemaVersion: SCHEMA_VERSION, tools: [], modelNetwork: false, gatewayProtocol: 1 });
+      schemaVersion: SCHEMA_VERSION, tools: [...PI_TOOL_NAMES], modelNetwork: false, gatewayProtocol: 1 });
     return;
   }
 
   if (frame.type === 'conversation.open') {
     const conversationId = conversationIdOf(frame.conversationId);
     if (!['new', 'open', 'resume'].includes(frame.mode)) rejectCommand('INVALID_OPEN_MODE');
+    // A3-10：档位由 Rust 判定，Host 只校验它认识这个取值并照单注册工具集合。
+    if (!['read', 'standard', 'full'].includes(frame.permission)) rejectCommand('INVALID_COMMAND');
+    let sessionTools;
+    try { sessionTools = normalizeSessionToolNames(frame.tools); }
+    catch { rejectCommand('INVALID_COMMAND'); }
     if (activeRun) rejectCommand('RUN_BUSY');
     const current = sessions.get(conversationId);
     if (current) {
       if (frame.mode === 'new') rejectCommand('CONVERSATION_EXISTS');
-      ack(requestId, frame.type, { conversationId, sessionId: current.session.sessionManager.getSessionId() });
+      // 已打开的会话不会被重建，工具表也就不会变。把实际注册集合回给 Rust 由它
+      // 断言与本次请求一致，避免「界面显示窄档、会话里跑着宽档」。
+      ack(requestId, frame.type, {
+        conversationId,
+        sessionId: current.session.sessionManager.getSessionId(),
+        tools: [...current.tools],
+      });
       return;
     }
     if (sessions.size >= MAX_OPEN_SESSIONS) rejectCommand('SESSION_LIMIT');
@@ -151,11 +228,15 @@ async function handle(frame) {
     try {
       session = await createOfflineSession(activeAgentDir, conversationId, frame.mode, {
         gatewayRpc,
+        capabilityRpc,
         pinSessionFile: fileName => requestSessionPin(conversationId, fileName),
         unpinSessionFile: fileName => unpinSessionFile(conversationId, fileName),
+        tools: sessionTools,
       });
-    } catch {
-      rejectCommand('SESSION_OPEN_FAILED');
+    } catch (error) {
+      // 「会话文件不存在」与「打开失败」必须分开：前者可以用 new 重建，后者不能。
+      // 其余原因（资源损坏、结点链接、SDK 版本不符）仍按 SESSION_OPEN_FAILED 上报。
+      rejectCommand(error?.message === 'CONVERSATION_NOT_FOUND' ? 'SESSION_NOT_FOUND' : 'SESSION_OPEN_FAILED');
     }
     sessions.set(conversationId, session);
     session.session.subscribe(event => {
@@ -165,7 +246,11 @@ async function handle(frame) {
       try { send({ type: 'delta', conversationId, runId: run.runId, text: event.assistantMessageEvent.delta }); }
       catch { void shutdown(); }
     });
-    ack(requestId, frame.type, { conversationId, sessionId: session.session.sessionManager.getSessionId() });
+    ack(requestId, frame.type, {
+      conversationId,
+      sessionId: session.session.sessionManager.getSessionId(),
+      tools: [...session.tools],
+    });
     return;
   }
 
@@ -212,6 +297,33 @@ async function handle(frame) {
     return;
   }
 
+  if (frame.type === 'conversation.history') {
+    const conversationId = conversationIdOf(frame.conversationId);
+    let projection;
+    try {
+      const current = sessions.get(conversationId);
+      if (current) {
+        // 会话已在内存中打开：直接读 compaction-aware 投影，零文件 IO。
+        projection = current.session.sessionManager.buildSessionProjection();
+      } else {
+        // 会话未打开（例如应用重启后）：从磁盘 JSONL 只读投影，读毕立即 unpin。
+        projection = await readConversationProjection(activeAgentDir, conversationId, {
+          pinSessionFile: fileName => requestSessionPin(conversationId, fileName),
+          unpinSessionFile: fileName => unpinSessionFile(conversationId, fileName),
+        });
+      }
+    } catch (error) {
+      // 「会话文件不存在」允许前端当作空历史处理；其它（损坏/链接/打开失败）
+      // 必须显式失败，绝不能伪造一个空历史。
+      rejectCommand(error?.message === 'CONVERSATION_NOT_FOUND' ? 'SESSION_NOT_FOUND' : 'SESSION_OPEN_FAILED');
+    }
+    ack(requestId, frame.type, {
+      conversationId,
+      messages: projectHistoryMessages(projection),
+    });
+    return;
+  }
+
   if (frame.type === 'conversation.cancel_run') {
     const conversationId = conversationIdOf(frame.conversationId);
     if (!activeRun || activeRun.conversationId !== conversationId || activeRun.runId !== frame.runId) {
@@ -252,11 +364,19 @@ export async function runHost(options = {}) {
     instanceId: hostInstanceId,
     sendFrame: frame => send(frame),
   });
+  capabilityRpc = createCapabilityRpc({
+    instanceId: hostInstanceId,
+    sendFrame: frame => send(frame),
+  });
   const decoder = new FrameDecoder();
   process.stdin.on('data', chunk => {
     try {
       for (const frame of decoder.push(chunk)) {
         if (!frame || Array.isArray(frame) || typeof frame !== 'object') throw new Error('INVALID_FRAME');
+        if (frame.type === 'capability.result') {
+          capabilityRpc.receive(frame);
+          continue;
+        }
         if (frame.type === 'session.pin_result') {
           receiveSessionPinResult(frame);
           continue;

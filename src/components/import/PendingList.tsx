@@ -1,4 +1,6 @@
-/** 待入库清单（PRD v2.6）：列表/缩略图网格双视图，右上角图标切换
+/** 待入库清单（PRD v2.6）：列表/缩略图网格/单图三视图，右上角图标切换
+ *  R13（PRD §8 右栏「默认素材预览，支持缩略图列表与单图切换」）：单图视图一次只放大一张，
+ *  用上一张/下一张定位，切换视图保留当前索引（不丢选择上下文）。
  *  性能：缩略图 IntersectionObserver 懒加载 + 模块级请求缓存，大清单不卡
  *  §10（FB-04）：视频在卡片内原位播放（不恢复素材库 hover；AssetCard 无媒体层冻结不变）。
  *  PendingItem 结构：relative 容器 + absolute inset-0 封面 + 仅 active 挂载的视频层 inset-0 + 角标 + 文件名。
@@ -21,7 +23,7 @@ import { currentAppearance, useSettingsStore } from "@/stores/settingsStore";
 import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
 import type { ImportPlan, ImportPlanItem } from "@/types/import";
 
-type ViewMode = "list" | "grid";
+type ViewMode = "list" | "grid" | "single";
 
 export function formatSize(bytes: number): string {
   if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
@@ -255,6 +257,126 @@ const GridIcon = () => (
     <rect x="8" y="8" width="5" height="5" rx="1" />
   </svg>
 );
+/** 单图：一个放大的画框（与列表/网格区分开，避免第三个图标也像方格） */
+const SingleIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+    <rect x="1.5" y="3" width="11" height="8" rx="1.2" />
+    <path d="M4 9.5 6.2 7l1.4 1.4" strokeLinecap="round" />
+    <circle cx="9.6" cy="6" r="0.9" fill="currentColor" stroke="none" />
+  </svg>
+);
+
+/** 视图切换按钮的固定中文名（R13 要求可辨的列表/单图切换，不靠图猜） */
+const VIEW_LABELS: Record<ViewMode, string> = {
+  list: "列表视图",
+  grid: "缩略图视图",
+  single: "单图视图",
+};
+
+interface SinglePaneProps {
+  items: ImportPlan["items"];
+  index: number;
+  running: boolean;
+  onGoto: (index: number) => void;
+  onRemove: (path: string) => void;
+  onRemoveCandidate?: (item: ImportPlanItem) => void;
+  onOpenItem: (path: string) => void;
+}
+
+/** R13「单图」视图：一次只放大一张，用上一张/下一张定位。
+ *  这里只做预览与定位，不写任何状态到后端：移除仍走父级回调，
+ *  所以列表/网格/单图三种视图对同一份清单是同一套动作，不存在第二份数据。 */
+function SinglePane({ items, index, running, onGoto, onRemove, onRemoveCandidate, onOpenItem }: SinglePaneProps) {
+  const item: ImportPlanItem | undefined = items[index];
+  const { onClick, onDoubleClick } = useDoubleAction(
+    () => {
+      /* 单击暂不动作 */
+    },
+    () => {
+      if (item?.path) onOpenItem(item.path);
+    },
+  );
+
+  if (!item) {
+    return (
+      <div className="flex h-full items-center justify-center px-4 py-10 text-xs text-[var(--color-text-secondary)]">
+        清单为空，先用「添加文件」选择素材。
+      </div>
+    );
+  }
+
+  const isVideo = item.kind === "video";
+  const advance = (delta: number) => {
+    const next = index + delta;
+    if (next < 0 || next >= items.length) return;
+    onGoto(next);
+  };
+
+  return (
+    // 容器标签刻意与切换按钮的「单图视图」区分：同名会让 aria 查询同时命中两者
+    <div aria-label="单图预览" role="group" className="flex h-full min-h-0 flex-col gap-2 p-2">
+      <div className="flex shrink-0 items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+        <button
+          type="button"
+          onClick={() => advance(-1)}
+          disabled={index === 0}
+          aria-label="上一张"
+          className="rounded px-1.5 py-0.5 transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          上一张
+        </button>
+        <span aria-live="polite" data-testid="pending-single-position">
+          第 {index + 1} / {items.length} 张
+        </span>
+        <button
+          type="button"
+          onClick={() => advance(1)}
+          disabled={index >= items.length - 1}
+          aria-label="下一张"
+          className="rounded px-1.5 py-0.5 transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          下一张
+        </button>
+        <span className="ml-auto shrink-0 rounded bg-[var(--color-surface)] px-1.5 py-0.5 text-[10px]">
+          {isVideo ? "视频" : "图片"} · {formatSize(item.size)}
+        </span>
+      </div>
+      {item.previewStatus === "limited" && (
+        <p className="shrink-0 rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-status)]">
+          可能受限：{item.previewMessage ?? "入库后部分预览或元数据能力受限"}
+        </p>
+      )}
+      <div
+        className="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]"
+        onClick={onClick}
+        onDoubleClick={onDoubleClick}
+        title={item.displayName || item.path}
+      >
+        <LazyThumb path={item.path} kind={item.kind} fit="contain" className="absolute inset-0" />
+      </div>
+      <div className="flex shrink-0 items-center gap-2 text-sm">
+        <span className="min-w-0 flex-1 truncate text-[var(--color-text)]" title={item.displayName || item.path}>
+          {fileName(item.path, item.displayName)}
+        </span>
+        {!running && (
+          <button
+            type="button"
+            aria-label="移除"
+            onClick={() => {
+              if (onRemoveCandidate) onRemoveCandidate(item);
+              else onRemove(item.path);
+              // 删掉最后一张时把索引收回到新末尾，避免停在一个已不存在的序号上
+              if (index >= items.length - 1) onGoto(Math.max(items.length - 2, 0));
+            }}
+            className="shrink-0 text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-danger)]"
+          >
+            ×
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 interface PendingListProps {
   items: ImportPlan["items"];
@@ -284,6 +406,9 @@ export default function PendingList({
   onOpenItemFallback,
 }: PendingListProps) {
   const [view, setView] = useState<ViewMode>("list");
+  /** 单图视图的当前索引：切到列表/网格再切回来仍停在同一张（R13「切换不丢选择上下文」） */
+  const [singleIndex, setSingleIndex] = useState(0);
+  const activeIndex = items.length === 0 ? 0 : Math.min(Math.max(singleIndex, 0), items.length - 1);
   // FB2-01/02：入库网格格宽档位驱动（CELL_STEPS[importCellStep]）
   const { grid } = useAppearance();
 
@@ -388,13 +513,15 @@ export default function PendingList({
             [
               ["list", <ListIcon key="l" />],
               ["grid", <GridIcon key="g" />],
+              ["single", <SingleIcon key="s" />],
             ] as const
           ).map(([mode, icon]) => (
             <button
               key={mode}
               onClick={() => setView(mode)}
-              title={mode === "list" ? "列表视图" : "缩略图视图"}
-              aria-label={mode === "list" ? "列表视图" : "缩略图视图"}
+              title={VIEW_LABELS[mode]}
+              aria-label={VIEW_LABELS[mode]}
+              aria-pressed={view === mode}
               className={clsx(
                 "flex h-6 w-8 items-center justify-center transition-colors duration-150",
                 view === mode
@@ -419,7 +546,20 @@ export default function PendingList({
       </div>
 
       <div ref={scrollRef} data-testid="pending-grid-scroll" className="min-h-0 flex-1 overflow-y-auto">
-        {view === "list" ? (
+        {view === "single" ? (
+          <SinglePane
+            items={items}
+            index={activeIndex}
+            running={running}
+            onGoto={setSingleIndex}
+            onRemove={onRemove}
+            onRemoveCandidate={onRemoveCandidate}
+            onOpenItem={(p) => {
+              if (onOpenItem) onOpenItem(p);
+              else onOpenItemFallback?.(p);
+            }}
+          />
+        ) : view === "list" ? (
           <div>
             {items.map((i) => (
               <div

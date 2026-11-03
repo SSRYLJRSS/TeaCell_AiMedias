@@ -1,18 +1,25 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Button from "@/components/common/Button";
 import Modal from "@/components/common/Modal";
 import {
+  batchEntriesNeedingAttention,
+  batchHeadline,
   cancelLegacyResolution,
   confirmLegacyResolution,
+  confirmLegacyResolutionsBatch,
+  legacyOutcomeLabel,
   listLegacyAssets,
   listUnlinkedLegacyAssets,
   prepareLegacyCopyBack,
+  prepareLegacyCopyBackBatch,
   prepareLegacyUnlink,
+  prepareLegacyUnlinkBatch,
   reopenUnlinkedLegacyAsset,
 } from "@/api/legacyAssets";
 import type {
   LegacyAsset,
   LegacyAssetPage,
+  LegacyBatchReport,
   LegacyHashMatch,
   LegacyResolutionPreview,
 } from "@/api/legacyAssets";
@@ -23,6 +30,11 @@ type ResolutionSelection = {
   action: "copy_back" | "unlink";
   matchingAssets: LegacyHashMatch[];
 };
+
+export interface LegacyAssetPanelProps {
+  /** 总仓离线/归属不明时给出的可操作出口：打开「总仓位置」向导重新定位。 */
+  onRequestRelocation?: () => void;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -46,6 +58,20 @@ function healthLabel(health: string): string {
   }
 }
 
+/** 总仓不可用时该做什么。只说这几种状态，不猜原因。 */
+function offlineHint(health: string): string {
+  switch (health) {
+    case "offline":
+      return "总仓目录当前不可访问（可能是移动硬盘未接或目录被移动）。请重新连接，或把整个总仓搬回来后用「总仓位置」里的重新定位核对，再回来处置。逐项处置已全部暂停，记录与原文件都不会被改动。";
+    case "wrong_root":
+      return "当前总仓目录的位置或身份标记与记录不一致，可能是搬动过、或选错了目录。请用「总仓位置」里的重新定位核对完整总仓后重试；归属未确认前不会自动解除关联。";
+    case "unconfigured":
+      return "这台电脑还没有可用的总仓。请先在「总仓位置」里选择并核验总仓目录，再回来处置这些记录。";
+    default:
+      return "总仓尚未通过身份核验，逐项处置暂时不可用。请先完成总仓核验（见「总仓位置」）。";
+  }
+}
+
 function sizeLabel(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
@@ -62,7 +88,7 @@ function toSelection(preview: LegacyResolutionPreview): ResolutionSelection {
   };
 }
 
-export default function LegacyAssetPanel() {
+export default function LegacyAssetPanel({ onRequestRelocation }: LegacyAssetPanelProps = {}) {
   const [page, setPage] = useState<LegacyAssetPage | null>(null);
   const [unlinked, setUnlinked] = useState<LegacyAsset[]>([]);
   const [unlinkedCursor, setUnlinkedCursor] = useState<number | null>(null);
@@ -71,6 +97,9 @@ export default function LegacyAssetPanel() {
   const [busyAssetId, setBusyAssetId] = useState<number | null>(null);
   const [busyResolutionId, setBusyResolutionId] = useState<string | null>(null);
   const [selection, setSelection] = useState<ResolutionSelection | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchReport, setBatchReport] = useState<LegacyBatchReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -222,6 +251,74 @@ export default function LegacyAssetPanel() {
     }
   };
 
+  /** 本页可勾选的行：已确认在总仓外、且没有进行中的处置。 */
+  const selectableIds = useMemo(
+    () => (page?.items ?? [])
+      .filter((item) => item.status === "external_pending" && item.activeResolutionId === null)
+      .map((item) => item.assetId),
+    [page],
+  );
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const toggleSelected = (assetId: number) => {
+    setSelectedIds((current) => current.includes(assetId)
+      ? current.filter((id) => id !== assetId)
+      : [...current, assetId]);
+  };
+  const selectAll = () => setSelectedIds(selectableIds);
+  const clearSelection = () => setSelectedIds([]);
+
+  const prepareBatch = async (action: "unlink" | "copy_back") => {
+    if (selectedIds.length === 0) return;
+    setBatchBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const report = action === "unlink"
+        ? await prepareLegacyUnlinkBatch(selectedIds)
+        : await prepareLegacyCopyBackBatch(selectedIds);
+      if (report.cancelled) {
+        setNotice("已取消，没有处置任何记录。");
+        return;
+      }
+      setBatchReport(report);
+      setSelectedIds([]);
+      await refresh();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      await refresh();
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const confirmBatch = async () => {
+    const resolutions = (batchReport?.entries ?? [])
+      .filter((entry) => entry.state === "prepared" && entry.resolutionId)
+      .map((entry) => entry.resolutionId as string);
+    if (resolutions.length === 0) {
+      setBatchReport(null);
+      return;
+    }
+    setBatchBusy(true);
+    setError(null);
+    try {
+      const report = await confirmLegacyResolutionsBatch(resolutions);
+      setBatchReport(report);
+      setNotice(batchHeadline(report));
+      await refresh();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      await refresh();
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const assetName = (assetId: number) =>
+    page?.items.find((item) => item.assetId === assetId)?.fileName
+    ?? unlinked.find((item) => item.assetId === assetId)?.fileName
+    ?? `素材 ${assetId}`;
+
   const activeState = selection
     ? page?.items.find((item) => item.activeResolutionId === selection.resolutionId)?.activeResolutionState ?? null
     : null;
@@ -232,6 +329,10 @@ export default function LegacyAssetPanel() {
     : activeState === "copying" || activeState === "published"
       ? "继续核验并完成回仓"
       : "确认复制回仓";
+
+  const batchPending = (batchReport?.entries ?? []).filter((entry) => entry.state === "prepared");
+  const batchTrouble = batchReport ? batchEntriesNeedingAttention(batchReport) : [];
+  const batchTitle = batchReport?.action === "unlink" ? "批量解除关联检查结果" : "批量复制回仓检查结果";
 
   return (
     <div className="space-y-4">
@@ -255,8 +356,41 @@ export default function LegacyAssetPanel() {
           当前总仓：{page.rootPath}
         </p>
       )}
+
+      {page && !page.canResolve && (
+        <div
+          role="alert"
+          data-testid="legacy-offline-hint"
+          className="space-y-2 rounded-[var(--radius-control)] border border-[var(--color-border)] p-3"
+        >
+          <p className="text-sm font-medium">{healthLabel(page.libraryHealth)}：逐项处置已暂停</p>
+          <p className="text-xs text-[var(--color-text-secondary)]">{offlineHint(page.libraryHealth)}</p>
+          {onRequestRelocation && (
+            <Button onClick={onRequestRelocation}>打开「总仓位置」向导…</Button>
+          )}
+        </div>
+      )}
+
       {error && <p role="alert" className="text-sm text-[var(--color-danger)]">{error}</p>}
       {notice && <p role="status" className="text-sm text-[var(--color-status)]">{notice}</p>}
+
+      {selectableIds.length > 0 && page?.canResolve && (
+        <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-control)] border border-[var(--color-border)] p-3">
+          <span className="text-xs text-[var(--color-text-secondary)]">
+            已选 {selectedIds.length} 条 · 本页可处理 {selectableIds.length} 条
+          </span>
+          <Button disabled={batchBusy} onClick={selectAll}>全选本页</Button>
+          <Button disabled={batchBusy || selectedIds.length === 0} onClick={clearSelection}>清除选择</Button>
+          <Button
+            disabled={batchBusy || selectedIds.length === 0}
+            onClick={() => void prepareBatch("copy_back")}
+          >批量复制回仓…</Button>
+          <Button
+            disabled={batchBusy || selectedIds.length === 0}
+            onClick={() => void prepareBatch("unlink")}
+          >批量解除关联</Button>
+        </div>
+      )}
 
       {loading && !page ? (
         <p className="text-sm text-[var(--color-text-secondary)]">正在读取待处理记录…</p>
@@ -265,22 +399,34 @@ export default function LegacyAssetPanel() {
           {page.items.map((asset) => {
             const hasActive = asset.activeResolutionId !== null;
             const canResume = hasActive && ["prepared", "copying", "published"].includes(asset.activeResolutionState ?? "");
+            const selectable = page.canResolve && asset.status === "external_pending" && !hasActive;
             return (
               <div key={asset.assetId} className="flex flex-wrap items-center justify-between gap-3 p-3">
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium" title={asset.fileName}>{asset.fileName}</p>
-                  <p className="mt-1 text-xs text-[var(--color-text-secondary)]">
-                    ID {asset.assetId} · {statusLabel(asset.status)} · {sizeLabel(asset.fileSize)} · 评分 {asset.rating} · {asset.favorite ? "已收藏" : "未收藏"}
-                  </p>
-                  {asset.activeResolutionState && (
+                <div className="flex min-w-0 flex-1 items-start gap-2">
+                  {selectable && (
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      aria-label={`选择 ${asset.fileName}`}
+                      checked={selectedSet.has(asset.assetId)}
+                      onChange={() => toggleSelected(asset.assetId)}
+                    />
+                  )}
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium" title={asset.fileName}>{asset.fileName}</p>
                     <p className="mt-1 text-xs text-[var(--color-text-secondary)]">
-                      处置状态：{asset.activeResolutionState === "prepared" ? "等待确认" : asset.activeResolutionState === "copying" ? "复制中断，可继续核验" : asset.activeResolutionState === "published" ? "文件已发布，等待登记" : "结果未知，需人工核对"}
-                      {asset.resolutionErrorCode ? `（${asset.resolutionErrorCode}）` : ""}
+                      ID {asset.assetId} · {statusLabel(asset.status)} · {sizeLabel(asset.fileSize)} · 评分 {asset.rating} · {asset.favorite ? "已收藏" : "未收藏"}
                     </p>
-                  )}
-                  {asset.status !== "external_pending" && (
-                    <p className="mt-1 text-xs text-[var(--color-text-secondary)]">归属未确认前，不能复制回仓或解除关联。</p>
-                  )}
+                    {asset.activeResolutionState && (
+                      <p className="mt-1 text-xs text-[var(--color-text-secondary)]">
+                        处置状态：{legacyOutcomeLabel(asset.activeResolutionState)}
+                        {asset.resolutionErrorCode ? `（${asset.resolutionErrorCode}）` : ""}
+                      </p>
+                    )}
+                    {asset.status !== "external_pending" && (
+                      <p className="mt-1 text-xs text-[var(--color-text-secondary)]">归属未确认前，不能复制回仓或解除关联。</p>
+                    )}
+                  </div>
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {canResume && asset.activeResolutionId && (
@@ -351,6 +497,63 @@ export default function LegacyAssetPanel() {
           </div>
         )}
       </div>
+
+      <Modal
+        open={batchReport !== null}
+        title={batchTitle}
+        onClose={() => { if (!batchBusy) setBatchReport(null); }}
+        wide={batchReport !== null ? true : undefined}
+        footer={(
+          <>
+            <Button disabled={batchBusy} onClick={() => setBatchReport(null)}>关闭</Button>
+            <Button
+              variant={batchReport?.action === "unlink" ? "danger" : "primary"}
+              disabled={batchBusy || batchPending.length === 0}
+              onClick={() => void confirmBatch()}
+            >
+              {batchBusy
+                ? "逐条处置中…"
+                : batchPending.length === 0
+                  ? "没有可确认的条目"
+                  : `确认处置这 ${batchPending.length} 条`}
+            </Button>
+          </>
+        )}
+      >
+        {batchReport && (
+          <div className="space-y-3">
+            <p className="text-[var(--color-text-secondary)]">{batchHeadline(batchReport)}</p>
+            <p className="text-xs text-[var(--color-text-secondary)]">
+              每条都有自己的收据；确认后逐条复核源文件，任何一条结果不明都会单独标出，不会连带其他记录。
+            </p>
+            <ul className="space-y-2" data-testid="legacy-batch-entries">
+              {batchReport.entries.map((entry) => (
+                <li key={`${entry.assetId}-${entry.state}`} className="rounded border border-[var(--color-border)] p-2">
+                  <p className="text-sm">
+                    {assetName(entry.assetId)} · ID {entry.assetId} · {legacyOutcomeLabel(entry.state)}
+                  </p>
+                  {entry.message && (
+                    <p className="mt-1 text-xs text-[var(--color-text-secondary)]">{entry.message}</p>
+                  )}
+                  {entry.errorCode && (
+                    <p className="mt-1 text-xs text-[var(--color-text-secondary)]">错误码：{entry.errorCode}</p>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {batchReport.action === "copy_back" && batchPending.some((entry) => entry.message) && (
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                上面标出的同哈希情况一律按独立记录复制：本次不会合并标签，也不会走普通重复项跳过流程。
+              </p>
+            )}
+            {batchTrouble.length > 0 && (
+              <p role="alert" className="text-sm text-[var(--color-danger)]">
+                其中 {batchTrouble.length} 条需要先处理：{batchTrouble.map((entry) => assetName(entry.assetId)).join("、")}。
+              </p>
+            )}
+          </div>
+        )}
+      </Modal>
 
       <Modal
         open={selection !== null}

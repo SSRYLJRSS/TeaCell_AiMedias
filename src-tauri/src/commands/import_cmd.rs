@@ -234,6 +234,7 @@ pub async fn inspect_import(
         return Err(AppError::invalid_arg("未选择任何文件"));
     }
     validate_task_id(&task_id)?;
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "检查导入来源")?;
     let _operation = ImportOperationGuard::acquire(&state)?;
     let (cancel, registration) = register_prepare_cancellation(&state, &task_id)?;
     let library_root = {
@@ -313,6 +314,8 @@ pub async fn prepare_import(
     task_id: ResourceRef,
     request: PrepareImportRequest,
 ) -> AppResult<ImportPlanView> {
+    // A4-05：维护期间停止写入。预检会暂存文件到总仓内，迁仓正把总仓搬走。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "准备入库")?;
     let caller = gui_caller(&state)?;
     let key = task_id.as_str().to_string();
     let (cancel, registration) = register_prepare_cancellation(&state, &key)?;
@@ -375,6 +378,7 @@ pub async fn verify_import_plan(
     state: State<'_, AppState>,
     plan_ref: ResourceRef,
 ) -> AppResult<ImportPlanVerification> {
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "校验入库计划")?;
     let caller = gui_caller(&state)?;
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || {
@@ -393,6 +397,7 @@ pub async fn confirm_import(
     plan_ref: ResourceRef,
     idempotency_key: ResourceRef,
 ) -> AppResult<crate::contracts::agent::SubmissionResult> {
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "确认入库")?;
     let caller = gui_caller(&state)?;
     let db = Arc::clone(&state.db);
     let submitted = tauri::async_runtime::spawn_blocking(move || {

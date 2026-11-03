@@ -296,6 +296,34 @@ pub fn prepare_copy_back(
     })
 }
 
+/// 读一条待处理记录（供批量处置按记录定位用户选中的文件）。
+///
+/// 只做 GUI 会话校验 + 同一次读；真正的所有权复核仍由 `prepare_copy_back`
+/// 重做一遍——批量入口不允许跳过任何一项检查。
+pub fn pending_record(
+    db: &Database,
+    caller: &CallerContext,
+    asset_id: i64,
+) -> AppResult<Option<legacy_db::PendingLegacyAsset>> {
+    require_gui(caller)?;
+    let conn = db.lock()?;
+    authorization::validate_caller(&conn, caller)?;
+    legacy_db::pending_asset(&conn, asset_id)
+}
+
+/// 读一条处置收据对应的素材 id。批量确认要先用它给失败项归位，因为确认成功后
+/// 该记录会从待处理投影里消失，回头再查就拿不到 id 了。
+pub fn resolution_asset_id(
+    db: &Database,
+    caller: &CallerContext,
+    id: &ResourceRef,
+) -> AppResult<Option<i64>> {
+    require_gui(caller)?;
+    let conn = db.lock()?;
+    authorization::validate_caller_grant(&conn, caller)?;
+    Ok(legacy_db::get_resolution(&conn, id.as_str())?.map(|record| record.asset_id))
+}
+
 pub fn cancel_prepared(db: &Database, caller: &CallerContext, id: &ResourceRef) -> AppResult<()> {
     require_gui(caller)?;
     let conn = db.lock()?;

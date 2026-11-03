@@ -1,0 +1,1879 @@
+{
+  "contractVersion": "acceptance-evidence-v1",
+  "description": "R01–R60 的需求→真实证据映射（A6-01）。本文件只记录关系与引用：每条必须指向工作树里真实存在的 Rust 用例名或前端用例标题，由 scripts/acceptance-evidence.mjs 在每次门禁里重建索引后校验。真机条目一律 manual.status=pending，不写「已通过」。",
+  "requirements": [
+    {
+      "id": "R01",
+      "requirement": "2.0 提供 Agent 与桌面主链路，插件生态只在 2.5 开启；2.0 安装包没有真实插件运行能力。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-01",
+        "A6-04"
+      ],
+      "automated": {
+        "rust": [
+          "canonical_catalog_round_trips_and_unknown_enum_values_fail"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/TreasurePage.test.tsx",
+            "contains": [
+              "本地不渲染任何 iframe"
+            ]
+          }
+        ]
+      },
+      "note": "2.0 的能力目录是封闭枚举，百宝箱页面不含 iframe/script/外链；插件宿主的真实运行能力属 2.5（B 卡）。"
+    },
+    {
+      "id": "R02",
+      "requirement": "完整 Pi SDK 与受控宿主：真实会话与工具运行成功，但没有任意 shell、用户扩展或外部脚本自动加载。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-02",
+        "A3-01"
+      ],
+      "automated": {
+        "rust": [
+          "handshake_requires_exact_build_sdk_gateway_schema_tools_and_offline_mode",
+          "bundled_node_host_uses_only_the_rust_mock_gateway_for_a_leased_model",
+          "controlled_model_searches_prepares_and_cannot_submit_before_gui_approval"
+        ]
+      },
+      "note": "会话走真实 pi-agent-core 与真实 Node Host，模型端由脚本化网关替身驱动（本机 mock 约定）。接真实模型端点属 A6-03。"
+    },
+    {
+      "id": "R03",
+      "requirement": "GUI、内置 Pi、外部 MCP 共用同一套 Rust 领域能力；三种入口对同一非法写入返回相同业务拒绝。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-01",
+        "A3-01",
+        "A3-03",
+        "A5-01"
+      ],
+      "automated": {
+        "rust": [
+          "pi_and_mcp_cannot_use_gui_approval_or_resume_entries",
+          "capability_payloads_cannot_forge_approval_or_plan_references",
+          "a_client_cannot_smuggle_its_own_approval_into_a_submit_payload"
+        ]
+      }
+    },
+    {
+      "id": "R04",
+      "requirement": "2.0 对外提供受控 stdio MCP：外部客户端可查询与准备计划，茶馆界面确认后才执行，并能查真实结果。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A5-01",
+        "A5-02",
+        "A5-03"
+      ],
+      "automated": {
+        "rust": [
+          "node_client_prepares_then_only_writes_after_the_gui_approves",
+          "python_client_prepares_and_gui_rejection_keeps_the_library_untouched",
+          "two_independent_clients_agree_on_protocol_and_tool_table"
+        ]
+      },
+      "manual": [
+        {
+          "id": "I-40",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R05",
+      "requirement": "2.5 的网页插件生态与受控宿主服务（安装、授权、联网/工作区、产物保存与维护闭环）。",
+      "version": "2.5",
+      "status": "deferred",
+      "cards": [
+        "B0-01",
+        "B1-01",
+        "B2-01",
+        "B3-01",
+        "B4-01"
+      ],
+      "reason": "全部属 2.5 的 B 卡；2.0 只提供百宝箱说明页，不建任何插件运行能力（R01 已锁）。"
+    },
+    {
+      "id": "R06",
+      "requirement": "沿用统一视觉体系与完整助手界面：现有素材功能与新助手在主题、布局和交互上一致。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-05",
+        "A6-01"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "没有活动会话时提示选择或新建"
+            ]
+          },
+          {
+            "file": "src/components/layout/TitleBar.test.tsx",
+            "contains": [
+              "工作状态区在设置右侧"
+            ]
+          },
+          {
+            "file": "src/App.test.tsx",
+            "contains": [
+              "换页只换内容不换壳层：素材库页与助手页挂在同一个 main 上",
+              "两类页面容器只用主题语义变量，不写死字面颜色"
+            ]
+          },
+          {
+            "file": "src/components/library/AssetCard.test.tsx",
+            "contains": [
+              "hover 文件名层带 title 全量提示，超长中文文件名不被截断后失去可读途径"
+            ]
+          },
+          {
+            "file": "src/components/library/TagTree.test.tsx",
+            "contains": [
+              "标签行带 title 全量提示，长中文标签被截断后仍可看到完整内容"
+            ]
+          },
+          {
+            "file": "src/components/supersearch/QueryBuilder.test.tsx",
+            "contains": [
+              "enum_multi_select_chips_carry_full_label_via_title：多选 chip 提供 title 全量提示"
+            ]
+          },
+          {
+            "file": "src/components/media/VideoPlayer.test.tsx",
+            "contains": [
+              "解码失败态的文件名带 title 全量提示（长中文名截断后仍可读）"
+            ]
+          },
+          {
+            "file": "src/components/common/Modal.test.tsx",
+            "contains": [
+              "打开后焦点进入弹窗，并落在容器上而不是危险按钮上",
+              "关闭后焦点归还给打开它的触发按钮，而不是掉到 body",
+              "Tab 在弹窗内循环，不会跑到底层页面（Shift+Tab 反向同理）",
+              "弹窗内部已有 autoFocus 元素时不抢走它的焦点"
+            ]
+          },
+          {
+            "file": "src/components/dialogs/DeleteDialog.test.tsx",
+            "contains": [
+              "对「永久清空」连点多次只执行一次，不会产生第二次删除效果（M-14 误点）"
+            ]
+          }
+        ],
+        "rust": []
+      },
+      "manual": [
+        {
+          "id": "L-01",
+          "status": "executed"
+        },
+        {
+          "id": "M-11",
+          "status": "pending"
+        }
+      ],
+      "note": "A6-04 补证：原证据只断言「某些元素存在」。新增两条结构层门禁——换页时 main 壳层是同一节点且 class 串一致；两页子树带内联颜色的节点不得出现字面色值、必须走 var(--color-*)。jsdom 无法断实际渲染色值，颜色/间距一致仍由人工 L-01。\n\nM-13 真机走查补证（2026-10-27）：超长中文文件名/标签在 960×640 与 1200×800 两档都不会撑破布局（溢出元素 0），但「截断后仍能看到全量」原先有 4 处缺口，已逐处补 title 并加回归：素材卡 hover 文件名层、标签树行、枚举多选 chip、视频解码失败态文件名。去掉 title 后四条用例各自转红（4 处均先验红再验绿），证明确实钉住了行为而不是空断言。\n\nM-14 真机走查补证（2026-10-27）：`src/components/common/Modal.tsx` 是全仓唯一基础模态（18 处业务弹窗都用它），原先只有 Esc 关闭与遮罩点击关闭，没有焦点进入、没有 Tab 循环、没有焦点归还（全仓 grep 0 命中），与 `docs/UI_DESIGN_SYSTEM.md:279` 「Dialog 打开后焦点进入，关闭后返回触发点」不符。现在补了焦点进入（落在容器本身，因此 footer 里的危险按钮永远不会成为默认焦点）、Tab/Shift+Tab 在弹窗内循环、关闭后焦点归还触发按钮；内部已有 autoFocus 元素时不抢焦点。另外「永久清空」的连点防护此前只靠按钮 disabled 挡，属未钉住的既有行为，已补用例固定（去掉 disabled 里的 busy 即转红）。 L-01 主链路闭环真机走查（2026-10-28，真实安装包 SHA-256 4C551E7FAA7F35E1F6BBABF14F6E5A128F181E69BD53E0E2CD3635FE41EE55E4）：导入（2 项全判重复、不覆盖原素材）→ AI 打标（本地 Ollama 2/2 成功）→ 采纳（ai_batches 56=done/2/2/2，asset_tags 全部 ai_local+ai_reviewed）→ 超级搜索命中（输入 IMG 被解析为「文件名：IMG」，命中 3 项）→ 查看器评级（点星写入 rating=4、点当前星清零、F 切收藏、数字键 1-5/0 生效）→ 导出 by_tag（按首个标签分子目录，产物含 导出清单.csv，源文件未被移动）。六环节在同一安装包上分别通过，未做一次性不间断连跑；「按评级筛选/排序」的联动未复验。详见 docs/PROJECT_PLAN.md 的「L-01 主链路闭环真机走查」段。"
+    },
+    {
+      "id": "R07",
+      "requirement": "默认五入口：入库、素材库、中央 Logo、打标、百宝箱均可达，Logo 始终居中。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-05"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/components/layout/BottomBar.test.tsx",
+            "contains": [
+              "默认五入口顺序为"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R08",
+      "requirement": "2.0 可调整内置底栏入口（增删/隐藏/排序），未知旧 ID 安全跳过，不运行任意路由脚本。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-05"
+      ],
+      "automated": {
+        "rust": [
+          "navigation_defaults_to_controlled_builtin_catalog",
+          "navigation_drops_unknown_ids_and_duplicates_but_keeps_order",
+          "navigation_falls_back_to_defaults_when_every_id_is_unknown"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/layout/BottomBar.test.tsx",
+            "contains": [
+              "按用户保存的顺序渲染入口",
+              "未知旧 id 被安全跳过",
+              "隐藏的入口不渲染，但功能目录本身不被删除"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R09",
+      "requirement": "百宝箱在 2.0 显示「尚未开放」说明页，2.5 才是固定入口的插件管理。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A3-05",
+        "B1-02"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/pages/TreasurePage.test.tsx",
+            "contains": [
+              "明确说明 2.0 尚未开放",
+              "说明隐藏入口不影响功能与数据"
+            ]
+          },
+          {
+            "file": "src/components/layout/BottomBar.test.tsx",
+            "contains": [
+              "百宝箱"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R10",
+      "requirement": "启动恢复最近对话并可新建，新会话内容为空。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A3-04"
+      ],
+      "automated": {
+        "rust": [
+          "two_conversations_keep_separate_drafts_and_links",
+          "agent_plans_are_attributed_by_persisted_session_not_by_frontend"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "进入助手页时自动恢复最近的活动会话",
+              "没有活动会话时提示选择或新建",
+              "点「新建对话」建出空白新会话，不继承上一个会话的草稿与待执行清单"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-09",
+          "status": "executed"
+        }
+      ],
+      "note": "A6-04 补证：原证据只有「零会话时不自动建会话」的负向断言。新增正向用例：点新建 → createConversation 恰好一次、新会话 messages 为空、草稿与待执行清单都不继承，且旧会话草稿仍在。\n\nM-09 真机走查（2026-10-28，真实安装包）：完全退出应用后重启，助手页自动恢复原会话（标题/创建时间不变、updated_at 未增长），历史问答完整，草稿 revision 与 conversation_links（2 operation + 1 selection + 1 plan）一致，未重新提交、未重放。"
+    },
+    {
+      "id": "R11",
+      "requirement": "悬浮窗与完整页共用统一历史：按最近使用排序、可搜索、可改名。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A3-04"
+      ],
+      "automated": {
+        "rust": [
+          "archive_rename_and_search_project_from_stable_ids"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/assistant/FloatingAssistant.test.tsx",
+            "contains": [
+              "继续最近的对话"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R12",
+      "requirement": "对话可归档与删除：归档可找回；删除前说明影响，不误删素材、不撤销已执行任务。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A3-04"
+      ],
+      "automated": {
+        "rust": [
+          "delete_is_blocked_by_unfinished_operation_and_keeps_rows_otherwise"
+        ],
+        "frontend": [
+          {
+            "file": "src/stores/conversationStore.test.ts",
+            "contains": [
+              "删除会话只移除本地投影"
+            ]
+          },
+          {
+            "file": "src/components/settings/FacetManagePanel.test.tsx",
+            "contains": [
+              "删除确认：影响面读不到时如实告知，而不是显示成「没有影响」（M-14 异常提示）",
+              "删除确认：重新打开删除面板时清掉上一次的影响面错误"
+            ]
+          }
+        ]
+      },
+      "note": "M-14 真机走查补证（2026-10-27）：分类删除确认原先在 getTagFacetImpact 失败时静默把影响面置空，面板看起来就像「没有影响」，用户仍可继续删——这是「读不到影响面却照删」的可行动性缺口。现在失败会留下 role=\"alert\" 的可行动提示（不知道影响多少就必须先重试），且仍需手工输入分类名才能确认删除，不因为缺少影响数字而放宽。"
+    },
+    {
+      "id": "R13",
+      "requirement": "入库页待入库清单支持列表/缩略图/单图三视图切换且不丢选择；助手右栏对交接集合只读数量预览，点按钮才在素材库打开可明确退出的临时结果视图，不加载素材行、不改写素材库筛选与选择。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-07"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/components/import/PendingList.test.tsx",
+            "contains": [
+              "提供列表 / 缩略图 / 单图三个可辨视图",
+              "切到列表再切回单图",
+              "单图里移除当前项走同一个 onRemove"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "R13 右栏预览只读数量、不加载素材行，打开结果视图不改写素材库筛选与选择"
+            ]
+          },
+          {
+            "file": "src/components/library/SelectionResultView.test.tsx",
+            "contains": [
+              "快照属于别的会话时明说来源不同，不冒充当前会话的结果"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 复核发现两处偏差：①原需求写「右栏支持缩略图列表与单图切换」，与 A3-08 冻结设计（右栏只读数量、不加载素材行、点按钮进素材库临时结果视图）冲突；按裁决改需求文字与 PRD §8 助手区域表，三视图归位入库页待入库清单。②原证据只引了 PendingList，漏引了已有的右栏只读预览用例（AssistantWorkbench.test.tsx）。"
+    },
+    {
+      "id": "R14",
+      "requirement": "工作台可调宽；窄窗时收起历史但保留聊天，用户能手动恢复。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-07"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "工作台按需展开",
+              "窄窗把历史收成浮层：聊天区照常保留，用户点开浮层能选回旧会话"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "工作台只跟随自己的对话",
+              "R14 加宽后工作台宽度变化，再收窄能回到原宽度"
+            ]
+          }
+        ],
+        "rust": []
+      },
+      "manual": [
+        {
+          "id": "M-11",
+          "status": "pending"
+        },
+        {
+          "id": "M-12",
+          "status": "pending"
+        }
+      ],
+      "note": "A6-04 补证：两半各自补上——工作台 380px↔620px 的收窄/加宽切换，以及窄窗（max-width:1099px）把历史收成浮层、聊天区仍在、点开浮层可切回旧会话。jsdom 无布局引擎，只断言形态与 class，不断像素宽度。"
+    },
+    {
+      "id": "R15",
+      "requirement": "左上角小型工作状态区：缓慢轮播、悬停暂停、可手动滚动，进度来自真实任务投影，旁边直接显示「设置」。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-05"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/components/layout/TitleBar.test.tsx",
+            "contains": [
+              "工作状态区来自真实任务投影",
+              "多条任务缓慢轮播，悬停即暂停",
+              "支持手动滚动切换",
+              "软件名不显示，图标位置让给「设置」，工作状态区在设置右侧"
+            ]
+          },
+          {
+            "file": "src/components/layout/WorkStatus.test.tsx",
+            "contains": [
+              "同时有三个任务时按 6 秒缓慢自动轮播，序号循环回到第一条（M-13 轮播）",
+              "鼠标悬停时暂停自动轮播，移开后恢复（M-13 悬停暂停）",
+              "方向键可手动切换并在 8 秒保持期内不被自动轮播抢走（M-13 手动滚动）"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-13",
+          "status": "pending"
+        }
+      ],
+      "note": "M-13 真机走查（2026-10-27，960×640 与 1200×800）：状态区缓慢轮播 (`WORK_STATUS_ROTATE_MS = 6000`)、悬停与聚焦暂停、滚轮与方向键手动切换、`prefers-reduced-motion` 时不自动轮播，均已实现；未知总量走不定进度条不编百分比。本条只声明自动化证据，真机复验结论与未覆盖项记在 docs/PROJECT_PLAN.md。\n\nM-13 轮播补证（2026-10-28）：`src/components/layout/WorkStatus.test.tsx` 新增三条用例，分别用假定时器钉住「6 秒自动轮播并循环」「悬停暂停/移开恢复」「方向键手动切换 + 8 秒保持期内不被自动轮播抢走」。三条均做过验红（去掉轮播 effect / 去掉保持期判断 / 去掉 onMouseEnter 处理器后各自转红）。真机上「同时排队 ≥3 个任务」仍需真实并发任务才能复现，本轮未在安装版构造。"
+    },
+    {
+      "id": "R16",
+      "requirement": "仅应用内的可开关悬浮 Logo：跨茶馆页面可用、拖动吸边，切到其他应用不出现桌面悬浮窗。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-09"
+      ],
+      "automated": {
+        "rust": [
+          "floating_assistant_defaults_on_and_survives_round_trip",
+          "only_one_application_window_exists_and_no_desktop_floating_window_is_created"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/assistant/FloatingAssistant.test.tsx",
+            "contains": [
+              "缩窗后重新夹紧位置",
+              "首次挂载不抢走页面焦点",
+              "有模态弹窗打开时 Esc 只关弹窗，不连带收起浮层",
+              "拖动 Logo 松手后吸附到最近的水平边缘，左半区吸左、右半区吸右",
+              "入口不落到底栏上：底部导航占位时贴底也停在导航条之上",
+              "收起状态的小圆点夹在底栏左侧上面，不压住页面右下角的主操作（M-04 确认写入不重叠）",
+              "没被拖动过时缩放窗口仍贴回左下，不会停在旧视口的中间压住左栏内容（M-11 真机复现）",
+              "用户拖动摆放过的位置在缩窗后保留，不被重新贴回左下（尊重用户意图）",
+              "旧版绝对坐标记录被丢弃，入口不会浮到页面中部压住左栏内容（M-11 真机第 4 次复现）"
+            ]
+          },
+          {
+            "file": "src/App.test.tsx",
+            "contains": [
+              "默认显示应用内悬浮助手入口",
+              "设置里关掉入口后不渲染"
+            ]
+          },
+          {
+            "file": "src/components/library/SideBar.test.tsx",
+            "contains": [
+              "左侧栏容器留出悬浮入口安全区，任何滚动位置最后一行都不在入口底下（M-11）"
+            ]
+          },
+          {
+            "file": "src/pages/AiTaggingPage.test.tsx",
+            "contains": [
+              "左栏容器留出悬浮入口安全区，默认滚动位置也不会压住批次行（M-11 最小窗口）",
+              "打开批次后顶部区块自己在安全区内滚动，不会顶穿悬浮入口安全区（M-11 最小窗口）"
+            ]
+          },
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "左栏容器留出悬浮入口安全区，入库进度不被入口压住（M-11 最小窗口）"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补证：拖动吸边由「松手后 left 吸附到 EDGE_MARGIN / 右侧对称值并写回 localStorage」覆盖；「不出现桌面悬浮窗」改为静态门禁——tauri.conf.json 只能声明一个 main 窗口、不得有 trayIcon，Rust 与前端生产代码不得出现任何动态建窗调用。 M-11 真机补证：960×640 下入口曾压住底栏「百宝箱」，现已改为按底栏上边缘硬夹紧，并由「入口不落到底栏上：底部导航占位时贴底也停在导航条之上」覆盖（底部导航占位时贴底也停在导航条之上）。 M-04 真机走查补证：入口默认停在右下时圆心正好压住打标页「确认写入」，点确认变成点入口；默认位置改为左下并补用例锁定，用户仍可主动拖到右侧。 M-11 最小窗口补证（960×640 真机）：收起态入口是 fixed 浮层、停在左下，会压住左侧栏底部的可滚动内容（素材库筛选树最后两行、打标页历史批次行的继续/撤销、入库页「入库完成/已处理 N/N」）。因为浮层无法感知内容区边界，改为内容侧自留安全区（三处容器 `pb-16`），最后一行才能滚到入口之上；三条用例分别锁定这三处安全区。\n\n安全区落点从「内容内边距」改为「左栏容器内边距」（2026-10-27 真机复验后修正）：pb-16/pb-20 只在滚到最底时把末行顶上去，默认滚动位置的行仍落在入口底下（打标页历史批次 #51/#50 实测被压 60x30 / 60x32）。改为 SideBar / AiTaggingPage / ImportPage 的 aside 承担 pb-24，使滚动可视区整体上移，任何滚动位置都不会有内容落到入口底下。\n\nM-11 二次真机复验（960×640 打开批次）：aside 的 pb-24 只在内容不溢出时等于安全区；打开批次后「服务信息 + 当前批次 + 统计 + 提示」合计约 690px，flex 子项会顶穿 padding 落到悬浮入口底下（实测内容顶到 y=734，安全区底边 695，入口 y=645）。因此非滚动的顶部区块本身改为 min-h-0 shrink overflow-y-auto（data-testid=tagging-side-header），由它自己收缩和滚动。\n\nM-11 第四次真机复验（2026-10-27，960×640 与 1200×800 两档）：入口位置在 resize 时只被夹紧、从不重新锚定，默认位置是按当时视口算出的绝对像素，放大窗口后就浮在页面中部压住打标页左栏的批次行。修复为「用户拖动过才沿用绝对坐标，否则每次视口变化重新贴左下」，并让默认位置自身受窗口范围约束（缩到 240 高时不再算出越界值）。两条新回归先验红（去掉修复 2 failed / 12 passed）再转绿。"
+    },
+    {
+      "id": "R17",
+      "requirement": "小聊天保持简洁，复杂批准回到完整助手：浮层只显示摘要与「查看并确认」。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-09"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/components/assistant/FloatingAssistant.test.tsx",
+            "contains": [
+              "计划在浮层只显示摘要与「查看并确认」，不提供批准入口",
+              "「待确认计划」只列待确认项，不把已批准的计划当待确认",
+              "「查看并确认」把要定位的计划交给助手页，不只做一次裸导航"
+            ]
+          },
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "从浮层「查看并确认」进来时定位到同一张计划卡并清掉待定位目标"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R18",
+      "requirement": "独立入库页与助手右侧工作台双入口，复用同一业务任务，不重复导入。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A2-05",
+        "A3-07"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "没有 AI 服务时也能在右侧准备入库",
+              "待确认计划已失效时说明原因并指向「清空」，而不是只把「开始入库」变灰（M-14 可行动提示）"
+            ]
+          },
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "选择文件后只准备固定草稿计划",
+              "重复项要点名，不能只报一个数字（M-03 真机补证）",
+              "没有重复项时不渲染空的重复明细（避免给出假提示）"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "入库已经跑起来时右栏能取消，而不是只留一个禁用按钮",
+              "受理响应待核对时右栏给出「重试并核对受理」，不清空丢幂等键"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-08",
+          "status": "executed"
+        }
+      ],
+      "note": "M-03 真机补证：清单里同内容文件会并列显示，入库完成后把重复项逐个点名（查看重复项（N）），并修正空态文案——重复识别发生在执行期、判的是与素材库已有素材的内容哈希重复，不是预检期自动去重。 M-08 真机走查（2026-10-28，真实安装包 SHA-256 9BDC662C91935CF7EEF5CBCA3DCB0A5A70BF347FFB6E8B3105E71669C3044A19）：入库页「选择文件…」多选 m08-a.png / m08-b.png → 待入库清单 2 项、出现「待确认计划 · 2 项」与「交给助手（待确认）」→ 点击后跳到助手页并打开会话「手动入库工作台」，conversation_links 新增 ('plan','importplan_d56f303ad303437f9b6a4fc5b20dfa7d')；右栏工作台显示同一份清单与设置，「开始入库（2）」enabled=True，点击后 assets 由 950 增至 952（仅新增 6217 m08-a.png / 6218 m08-b.png），conversation_links 再新增 ('operation','operation_efb54645163e4b16a79970914726dc30')。即：交接只写归属链接、不重复导入、不重建在途任务，两个入口看到同一业务任务。本轮同时修复 P1 缺陷：import plan 引用（前缀 importplan_）此前不被 ensure_plan_linkable 识别，导致点「交给助手」恒报「资源引用已失效，请重新选择。」；现改为按前缀分派到 db::import_plans 校验（不存在→REFERENCE_EXPIRED、主体不符→UNAUTHORIZED、库/epoch 不符→LIBRARY_CHANGED、过期→PLAN_EXPIRED）。未覆盖/观察项：过期 import plan 会一直留在 pendingPlanRefs 让「开始入库」永久禁用，只能靠右栏「清空」恢复（与 ARCHITECTURE §9.15「失效时保留引用并阻止提交」一致，属可恢复降级）。\n\nM-14 可行动提示补证（2026-10-28，M-06/M-08 走查期间在真实安装包上观测到）：导入计划 30 分钟 TTL 到期后，草稿 `pendingPlanRefs` 仍留着引用、「清空」是唯一出口，而右栏「开始入库」因 `draft.pendingPlanRefs.length !== Object.keys(plans).length` 被静默禁用、界面上没有任何原因说明。已在 `src/components/assistant/AssistantWorkbench.tsx` 补一条 `role=\"alert\"` 提示「有 N 份待确认计划已失效或读取失败，暂时不能开始入库。请点「清空」后回到入库页重新选择素材（导入计划 30 分钟内有效）」；按钮仍按数据条件禁用（不假装可入库）。行为未变、只补可行动说明。"
+    },
+    {
+      "id": "R19",
+      "requirement": "拖入文件先作附件，不自动入库或上传；附件旁「导入」进入预检。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A2-01",
+        "A2-05",
+        "A3-07"
+      ],
+      "automated": {
+        "rust": [
+          "prepare_binds_fingerprint_and_rename_preview_without_writing_assets"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "明确提交待入库计划，交接动作不调用提交",
+              "拖入只留下附件条目，不触发预检也不入库",
+              "点附件旁「导入」才进入预检，并只把这一项送去检查",
+              "「移除」把附件丢掉，既不入库也不预检"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-02",
+          "status": "pending"
+        }
+      ],
+      "note": "A6-04 补实现：原实现拖入即进预检，缺「先作附件」这一环。现在拖入只把路径收进「待导入附件」，不触发 prepareImport、不写库、不外发；点附件旁「导入」（或「全部导入」）才走原来的预检链路。"
+    },
+    {
+      "id": "R20",
+      "requirement": "没有配置 AI 也能纯手动完成导入，不被模型配置阻塞。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A2-02",
+        "A2-05",
+        "A3-06"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/App.test.tsx",
+            "contains": [
+              "首次引导最后一步说明未配置 AI 也不影响手动流程"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "没有 AI 服务时也能在右侧准备入库"
+            ]
+          },
+          {
+            "file": "src/pages/AiTaggingPage.test.tsx",
+            "contains": [
+              "未绑定打标服务时如实说明可以先手工填写，AI 入口改成「先去设置」而不是报错",
+              "绑定打标服务后主按钮恢复成「开始打标」"
+            ]
+          }
+        ],
+        "rust": [
+          "manual_import_completes_end_to_end_without_any_ai_binding",
+          "batch_mode_degrades_to_manual_without_tagging_binding"
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-07",
+          "status": "pending"
+        }
+      ],
+      "note": "A6-04 补证：新增集成测试跑完整链路（prepare → confirm → dispatch），全程用 SQL 断言 ai_connections / ai_usage_bindings 计数为 0，收据与落库数都证明导入真的完成了，而不是「文案说可以」。\n\nM-07 降级路线补证（2026-10-27，真机走查暴露）：未绑定打标用途时，素材库选中素材点「打标」原本会直接报「尚未绑定打标服务」，连批次都建不出来，纯手工打标没有入口——违反 R-44「所有批次都可直接手工填写」与 QA 手册 M-07「不配置 AI 全链路可用 / AI 入口给『先去设置』而不是报错」。修复：后端 `resolve_batch_mode` 在无绑定时把 `auto` 降级为 `manual`（批次仍可创建、仍可手工填写，绑定后点「开始打标」会经 `set_batch_mode` 改成真实部署类型）；前端未绑定时如实说明「可以先直接手工填写标签」，主按钮改为「先去设置选择打标服务」并跳设置。证据为上述三条用例。"
+    },
+    {
+      "id": "R21",
+      "requirement": "自然语言可指定文件/目录导入：授权范围内识别输入，缺权限先请求，完成后准确定位成功项。",
+      "version": "2.0",
+      "status": "deferred",
+      "cards": [
+        "A2-01",
+        "A2-02",
+        "A3-03"
+      ],
+      "reason": "自然语言发起导入要求 Agent 侧调用 `imports.prepare/submit`，而 A5-03 已裁决 2.0 不向 MCP/Pi 发布 `imports.*`（[mcp-bridge v1 §4.1.1](../../docs/contracts/mcp-bridge-v1.md#411-为什么-20-不发布-imports设计结论不是待办)），导入仍由本机可信界面驱动。授权目录候选准备与撤销后恢复的 Rust 证据已具备（原两条用例保留在 A5-03 行），缺的是 Agent→imports 的发布与前端缺权限引导接线，属被冻结的产品范围，不是可补的测试缺口。"
+    },
+    {
+      "id": "R22",
+      "requirement": "导入预检、分库、改名与失败说明：右侧或独立页都能改设置，未知/不支持文件解释原因。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A2-01",
+        "A2-02",
+        "A2-05",
+        "A3-07"
+      ],
+      "automated": {
+        "rust": [
+          "import_preflight_rejects_unsupported_and_accepts_limited_previews",
+          "unsupported_items_stay_visible_and_excluded_on_reprepare"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "恢复草稿时要求剔除不支持项后才能提交",
+              "独立入库页也能改目标分库与改名模板，写回同一份计划状态"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "扫描异常在右栏也可见，不因窄布局丢掉异常明细",
+              "R22 右栏能改目标分库与改名模板，两处写回同一份草稿计划"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-02",
+          "status": "pending"
+        }
+      ],
+      "note": "A6-04 补证：原证据只覆盖预检拒绝与扫描异常。新增两侧各一条——右栏与独立页都能改目标分库/改名模板，且两次改动写回同一份草稿计划（plans 对象引用不变、只有一个 plan），不产生第二份真相。"
+    },
+    {
+      "id": "R23",
+      "requirement": "显式「交给助手」：当前清单与设置随交接进入指定会话，不自动执行、不重建在途任务。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A2-05",
+        "A3-08"
+      ],
+      "automated": {
+        "frontend": [
+          {
+            "file": "src/pages/LibraryPage.test.tsx",
+            "contains": [
+              "交给助手"
+            ]
+          },
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "交接动作不调用提交"
+            ]
+          },
+          {
+            "file": "src/pages/LibraryPage.test.tsx",
+            "contains": [
+              "不会因此重新提交或改写集合"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R24",
+      "requirement": "各会话的附件、计划、工作台状态各自保留；切回旧会话仍在，新会话不继承旧待执行清单。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-06",
+        "A2-05",
+        "A3-04",
+        "A3-08"
+      ],
+      "automated": {
+        "rust": [
+          "two_conversations_keep_separate_drafts_and_links",
+          "agent_plans_are_attributed_by_persisted_session_not_by_frontend",
+          "operations_are_reachable_only_through_their_plan"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "两个会话各自展示自己的消息"
+            ]
+          },
+          {
+            "file": "src/pages/LibraryPage.test.tsx",
+            "contains": [
+              "会明说这份快照不是当前会话交的"
+            ]
+          },
+          {
+            "file": "src/components/library/SelectionResultView.test.tsx",
+            "contains": [
+              "快照属于别的会话时明说来源不同"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-06",
+          "status": "executed"
+        }
+      ],
+      "note": "M-06 真机走查（2026-10-28，真实安装包，1200×800 / DPI 216 / agent 绑定本机 Ollama 且 TEACELL_AGENT_MODEL_NETWORK=1）：会话内发消息→切素材库→回助手→再发→再离开→再返回，会话/待审计划/工作台状态全程保持；Host 侧会话文件里只有 2 条 user 与各自 1 条 assistant，无重复消息、无第二次提交（不重放）。暴露的环境前提：默认安装下 agent 侧模型外发为关断，需显式开启才出模型回复。"
+    },
+    {
+      "id": "R25",
+      "requirement": "长写任务默认排队：新任务显示等待且可取消，聊天与只读浏览继续可用。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-05"
+      ],
+      "automated": {
+        "rust": [
+          "gui_pi_and_mcp_writes_share_one_queue_in_arrival_order",
+          "explicit_worker_reservation_cannot_skip_an_older_queued_operation",
+          "same_second_arrivals_are_ordered_without_regard_to_source"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/assistant/AgentCards.start.test.tsx",
+            "contains": [
+              "排队中的任务同时给出开始与取消入口，取消按操作 ID 只调用一次后端命令"
+            ]
+          },
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "排队中的任务不阻塞聊天：输入框照常可用，也不会被自动启动"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补证：排队态由两层覆盖——任务卡层证明「等待中可取消、取消按操作 ID 只调一次且不偷偷启动」，页面层证明排队期间聊天输入照常可用、页面加载不会自动调用 startOperation。只读浏览本身由素材库页的只读用例覆盖。"
+    },
+    {
+      "id": "R26",
+      "requirement": "完整计划一次批准；范围变更需重新审查；批准绑定确切范围，模型或文本伪造批准无效。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-04",
+        "A2-01",
+        "A3-03",
+        "A4-08",
+        "A5-02"
+      ],
+      "automated": {
+        "rust": [
+          "submit_requires_a_trusted_gui_approval",
+          "changed_scope_or_service_invalidates_the_plan_without_consuming_approval",
+          "submit_rejects_forged_identity_approval_and_unknown_versions",
+          "mismatched_review_reference_cannot_approve_a_plan"
+        ]
+      }
+    },
+    {
+      "id": "R27",
+      "requirement": "标签建议在右侧审核（切图、编辑、批量确认写正式标签），模型不能替用户确认。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A2-04",
+        "A3-07"
+      ],
+      "automated": {
+        "rust": [
+          "late_ai_results_and_failures_cannot_replace_user_review",
+          "confirm_records_review_added_tag_as_manual_and_undo_keeps_it",
+          "confirm_records_fully_replaced_tags_as_manual"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AiTaggingPage.test.tsx",
+            "contains": [
+              "页面逐步审批、提交并显式启动打标 operation"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "审批通过后按 批准 → 提交 → 显式启动 顺序执行"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AssistantWorkbench.test.tsx",
+            "contains": [
+              "审核页显示真实打标进度并可批量确认，与独立打标页一致"
+            ]
+          }
+        ]
+      },
+      "note": "M-07 真机走查补证（2026-10-27）：确认写入时把「AI 原建议的标签」与「用户审核时手工新增/替换的标签」分开落库——前者记批次来源（source=ai_local/ai_cloud + source_batch_id），后者记 source=manual、source_batch_id=NULL、review_state=manual。修复前一律按批次来源写入，导致手工标签被挂「AI」角标，且撤销该批次会连手工标签一起删掉（违反 docs/PRD.md:119 R-37）。"
+    },
+    {
+      "id": "R28",
+      "requirement": "实时任务状态与重要异常提示：任务更新落到同一状态卡，未知总量不编百分比。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-05",
+        "A3-04",
+        "A3-05"
+      ],
+      "automated": {
+        "rust": [
+          "unknown_operation_references_fail_closed"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/layout/TitleBar.test.tsx",
+            "contains": [
+              "工作状态区来自真实任务投影"
+            ]
+          },
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "流式回答中显示「停止回答」"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AgentCards.test.tsx",
+            "contains": [
+              "total 缺省时渲染不确定进度条，已完成数只写「已完成 N」",
+              "total 为 0（总量未知的另一种快照）同样不编造百分比"
+            ]
+          },
+          {
+            "file": "src/pages/AiTaggingPage.test.tsx",
+            "contains": [
+              "页面级错误用 role=alert 播报，键盘与读屏用户不会只看到界面没反应（M-14）"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补证：新增 AgentCards.test.tsx 覆盖「未知总量不编百分比」——total 缺省时进度条无 aria-valuenow、文案不出现 % 与 N/total；对照组证明有真实 total 时仍显示真实分数。\n\nM-14 真机走查补证（2026-10-27）：页面级错误原先只渲染彩色的 <p>，辅助技术感知不到，键盘用户点完只看到界面没反应。现已加 role=\"alert\"，并用上面的用例钉住（去掉 role 该用例即转红）。空 catch 已逐个看过上下文，其余属 localStorage/浏览器 API 兜底，不需要提示。"
+    },
+    {
+      "id": "R29",
+      "requirement": "「停止回答」与「取消业务任务」是两个独立动作：停止输出不取消已批准任务，取消不假装回滚已成功项。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-05",
+        "A2-02",
+        "A3-04",
+        "A3-09"
+      ],
+      "automated": {
+        "rust": [
+          "operations_cancel_queued_operation_settles_as_cancelled",
+          "claim_cancel_and_receipts_preserve_successful_items"
+        ],
+        "frontend": [
+          {
+            "file": "src/stores/agentSessionStore.test.ts",
+            "contains": [
+              "停止回答只取消当前 run"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R30",
+      "requirement": "重开先恢复摘要，用户手动继续剩余项；重启不自动重放，核实成功收据后才处理剩余部分。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-05",
+        "A2-02",
+        "A3-04"
+      ],
+      "automated": {
+        "rust": [
+          "startup_recovery_requires_resume_and_keeps_unknown_effect_visible",
+          "restart_requires_explicit_resume_before_dispatch"
+        ]
+      }
+    },
+    {
+      "id": "R31",
+      "requirement": "素材库可查看「本次结果」并可退出，不变成全局永久筛选。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A3-08"
+      ],
+      "automated": {
+        "rust": [
+          "page_keeps_snapshot_order_and_reports_the_next_offset"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/LibraryPage.test.tsx",
+            "contains": [
+              "点开可退出回原浏览上下文"
+            ]
+          },
+          {
+            "file": "src/components/library/SelectionResultView.test.tsx",
+            "contains": [
+              "来源与标题都用后端给的口径"
+            ]
+          },
+          {
+            "file": "src/components/library/SelectionResultView.test.tsx",
+            "contains": [
+              "失败时给出可重试的提示"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-05",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R32",
+      "requirement": "首次可跳过的分步引导：介绍素材库/AI 配置/主要操作，跳过不妨碍手动功能。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-06",
+        "A3-06"
+      ],
+      "automated": {
+        "rust": [
+          "first_run_tutorial_defaults_to_unhandled_for_new_and_legacy_settings"
+        ],
+        "frontend": [
+          {
+            "file": "src/App.test.tsx",
+            "contains": [
+              "新安装首次启动进入可跳过的引导向导",
+              "跳过引导后手动入口照常可用：底栏还能打开入库，也能回到素材库",
+              "首次引导最后一步说明未配置 AI 也不影响手动流程"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-01",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R33",
+      "requirement": "设置里配置服务，聊天旁只切换已配置且可用的服务与模型，并显示当前选择。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-03",
+        "A3-02",
+        "A3-06"
+      ],
+      "automated": {
+        "rust": [
+          "agent_requires_its_own_explicit_binding_and_never_uses_tagging_or_search"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "输入区展示当前服务并可切换"
+            ]
+          },
+          {
+            "file": "src/components/assistant/Composer.inject.test.tsx",
+            "contains": [
+              "停用的服务在选项里标「已停用」且不可选，当前选择显示在触发器上",
+              "云端服务缺密钥时选项标「密钥不可用」，并在输入框旁如实说明发送会失败",
+              "切换服务只写绑定并更新当前选择，不碰输入框里的内容"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补证：原证据里两条连接都是 enabled:true，没验负向。新增停用项 disabled + 「（已停用）」、云端缺密钥标「（密钥不可用）」并给 alert、本机缺密钥不误报、切换只写绑定不改输入框。"
+    },
+    {
+      "id": "R34",
+      "requirement": "服务失败保留工作、不暗中换供应商，由用户选择重试或切换；已批准任务的服务变更需重新核实范围。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A3-02",
+        "A3-06"
+      ],
+      "automated": {
+        "rust": [
+          "disabled_agent_binding_fails_closed_without_selecting_another_usage",
+          "changed_scope_or_service_invalidates_the_plan_without_consuming_approval"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "外发摘要如实说明只发文字且不回显密钥",
+              "云端服务缺密钥时才提示发送会失败，并说明不会自动改用其他服务"
+            ]
+          },
+          {
+            "file": "src/components/assistant/Composer.inject.test.tsx",
+            "contains": [
+              "发送失败时保留输入内容，并给出「重试发送」与「切换服务」两个明确动作",
+              "「重试发送」用同一段内容再发一次，成功后清空输入框",
+              "「切换服务」只把焦点交给服务选择器，自己不改绑定"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补实现：失败态原来只有一行 role=alert 文本，用户得自己猜怎么继续。现在错误旁给出两个显式动作——「重试发送」重发同一段文字（失败时文字不清空），「切换服务」聚焦到服务选择器由用户自己选；后端仍守「不暗中换供应商」与「已批准任务换服务需重新核实范围」。"
+    },
+    {
+      "id": "R35",
+      "requirement": "默认压缩预览外发（最长边 1024 JPEG），高清另提示；附件拖入不自动外发。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A2-04",
+        "A3-02",
+        "A3-06"
+      ],
+      "automated": {
+        "rust": [
+          "ai_image_is_normalized_to_jpeg_and_max_edge"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/AssistantPage.test.tsx",
+            "contains": [
+              "外发摘要如实说明只发文字且不回显密钥"
+            ]
+          },
+          {
+            "file": "src/pages/AiTaggingPage.test.tsx",
+            "contains": [
+              "批准前如实写出外发清晰度：最长边 1024 的 JPEG，高清要另行确认",
+              "没有当前批次时不单独渲染外发清晰度说明",
+              "全部确认后再进页面，如实说明已确认写入、再点开始打标不会改动素材（M-04 真机补证）"
+            ]
+          },
+          {
+            "file": "src/components/assistant/Composer.inject.test.tsx",
+            "contains": [
+              "有关联附件时不自动外发，并如实说明只发文字、不发图片内容"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补实现：「默认压缩预览、高清另提示」原来只落在后端 summary 里。现在打标批准前在按钮区明写清晰度口径（最长边 1024 JPEG，更高清须单独确认，且不会自动改尺寸再发）；附件侧由 Composer 用例证明有附件也不自动外发、摘要明说不发图片内容。 M-04 补证：后端 ai_confirm_all 只确认 pending，已全部确认的批次再点「开始打标」会白跑请求且不写任何东西，页面现在明说「都已确认写入、不会改动任何素材」。"
+    },
+    {
+      "id": "R36",
+      "requirement": "目录默认只授权本次，可选记住并可撤销；记住读取范围不等于写入/上传许可，撤销后旧句柄不可扩权。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-03",
+        "A3-06"
+      ],
+      "automated": {
+        "rust": [
+          "revocation_and_forged_or_expired_handles_fail_closed",
+          "export_grants_create_new_outputs_without_overwrite_or_read_expansion"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/settings/DirectoryGrantsPanel.test.tsx",
+            "contains": [
+              "导入来源只显示读取"
+            ]
+          },
+          {
+            "file": "src/pages/ImportPage.test.tsx",
+            "contains": [
+              "已记住的目录可直接复用：换发新句柄后走同一条 prepareDirectory 路径"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R37",
+      "requirement": "只追踪当前总仓内的托管素材；外部附件只是任务输入，所有入口遵循同一管理边界。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-05",
+        "A1-02",
+        "A1-03",
+        "A4-05"
+      ],
+      "automated": {
+        "rust": [
+          "new_and_changed_assets_cannot_inherit_verified_ownership",
+          "verified_scope_controls_normal_reads_facets_and_expired_cleanup"
+        ]
+      }
+    },
+    {
+      "id": "R38",
+      "requirement": "移动只在总仓内；库外导出只复制。旧 UI/API 也不能库外移动并继续追踪，导出保留原素材。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A4-01",
+        "A4-02"
+      ],
+      "automated": {
+        "rust": [
+          "export_plan_summary_states_copy_and_keeps_the_source",
+          "move_targets_never_escape_the_managed_root",
+          "a4_01_export_keeps_library_record_and_source",
+          "resolve_target_dir_rejects_unsafe_names_with_a_per_file_code",
+          "resolve_target_dir_rejects_a_subdirectory_that_became_a_link",
+          "guard_target_directory_rejects_a_link_destination_root",
+          "hard_failure_leaves_the_export_task_in_a_terminal_failed_state",
+          "move_mode_is_rejected_by_the_command_gate_not_silently_copied",
+          "copy_mode_passes_and_unknown_modes_are_rejected"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/dialogs/ExportDialog.test.tsx",
+            "contains": [
+              "只提供复制导出：没有移动选项",
+              "目标子目录被拒绝时给出可读原因",
+              "后端拒绝（move 已停用 / 目标未授权）时原样显示错误"
+            ]
+          },
+          {
+            "file": "src/components/assistant/AgentCards.plan.test.tsx",
+            "contains": [
+              "导出能力的标签直说「复制导出」",
+              "计划卡把目标位置单列一行，导出这一行写成「复制到」"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "F-07",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R39",
+      "requirement": "旧库外记录可复制回仓或解除关联：用户确认后处理，外部原文件不删，回仓保留身份与元数据。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-02",
+        "A2-03",
+        "A4-06"
+      ],
+      "automated": {
+        "rust": [
+          "batch_copy_back_pairs_each_record_with_its_own_file_and_skips_unpicked_ones",
+          "legacy_unlink_command_flow_updates_real_database_and_preserves_source"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/settings/LegacyAssetPanel.test.tsx",
+            "contains": [
+              "未点确认前只做准备检查，确认后执行一次且回仓记录保留身份与元数据",
+              "批量回仓同样要过确认门：没勾选不准备，勾选后只准备，确认后才逐条执行"
+            ]
+          }
+        ]
+      },
+      "note": "A6-04 补证：补上「用户确认后处理」的确认门（准备阶段不调用 confirm、勾选才准备、再确认才执行）与回仓后仍按同一记录身份展示。外部原文件保留与字段级元数据由 legacy_assets_cmd.rs 的既有 Rust 用例覆盖。"
+    },
+    {
+      "id": "R40",
+      "requirement": "总仓离线和归属不明时保护数据：不触发逐项清空记录或自动清理，提供恢复定位入口。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-05",
+        "A1-02",
+        "A2-03",
+        "A4-05",
+        "A4-06"
+      ],
+      "automated": {
+        "rust": [
+          "offline_root_never_turns_external_assets_into_unlink_candidates",
+          "unavailable_root_disables_actions_even_when_database_health_is_stale"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/settings/LegacyAssetPanel.test.tsx",
+            "contains": [
+              "offers a way out instead of a dead end"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R41",
+      "requirement": "两种总仓操作向导（软件搬迁与已搬好后重新定位），校验后切换，失败可恢复。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-05",
+        "A4-05",
+        "A4-06"
+      ],
+      "automated": {
+        "rust": [
+          "migration_moves_a_library_and_keeps_identity_and_the_source",
+          "relocation_requires_a_complete_target_with_our_marker",
+          "cancellation_before_the_switch_aborts_without_touching_the_locator"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/settings/MigrationWizard.test.tsx",
+            "contains": [
+              "两条入口互不替代"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "I-16",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R42",
+      "requirement": "助手可把素材移入回收站：常规删除计划只软删，保留恢复与单独手动永久删除的边界。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A4-03"
+      ],
+      "automated": {
+        "rust": [
+          "trash_prepare_only_plans_and_submit_requires_gui_approval",
+          "trash_submit_rejects_a_foreign_principal_and_a_changed_selection",
+          "restore_prepare_only_plans_and_execution_keeps_identifiers"
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-14",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R43",
+      "requirement": "清空回收站是独立受限能力：普通计划批准不能授权任意永久删除，必须单独审核。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-04",
+        "A4-04",
+        "A4-08"
+      ],
+      "automated": {
+        "rust": [
+          "empty_needs_a_permanent_review_and_an_agent_cannot_start_it",
+          "permanent_trash_plan_is_stored_with_its_own_review_kind"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/dialogs/DeleteDialog.test.tsx",
+            "contains": [
+              "二次确认后才调用 emptyTrash"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "H-09",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R44",
+      "requirement": "永久清空只作用于「这 N 项」固定清单；确认后的新增项、恢复项、归属变化项不被旧批准误处理。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-04",
+        "A4-04"
+      ],
+      "automated": {
+        "rust": [
+          "trash_prepare_rejects_truncated_selections",
+          "empty_reports_a_missing_file_and_keeps_its_row",
+          "expiry_only_takes_items_that_were_already_expired"
+        ]
+      }
+    },
+    {
+      "id": "R45",
+      "requirement": "默认 30 天清理，仅限明确托管文件：界面显示预计时间，到期检查归属、健康与真实删除结果。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A4-03",
+        "A4-04"
+      ],
+      "automated": {
+        "rust": [
+          "trash_plan_summary_lists_names_and_the_cleanup_date",
+          "expiry_uses_the_same_formula_as_the_purge_job",
+          "restart_reconciles_an_interrupted_wipe_from_the_deletion_journal"
+        ]
+      }
+    },
+    {
+      "id": "R46",
+      "requirement": "可命名、编辑、保存个人常用流程，使用受控能力而非任意脚本。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-07",
+        "A4-07",
+        "A4-08"
+      ],
+      "automated": {
+        "rust": [
+          "only_catalogue_capabilities_can_be_saved",
+          "editing_appends_a_version_and_never_rewrites_history"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/workflows/WorkflowPanel.test.tsx",
+            "contains": [
+              "新建时只能从受控目录选步骤"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-10",
+          "status": "executed"
+        }
+      ],
+      "note": "M-10 真机走查（2026-10-28，真实安装包）：新建「M10 导出流程」（1 个复制导出步骤）→ 素材库选中 3 项 → 用本次输入开始 → 现场授权导出目标 → 准备计划，库内新增 plan_4b49581610144db88d3fe2e33858c6f0（capability=workflows.submit/pending/gui）与 workflow_instantiations(workflow_446ff38a03f3424a9d43dba067d6a783, version=1)；编辑后「保存为新版本」→ workflows.current_version 1→2、新增 v2，而在途实例仍指向 version=1，符合「生成新计划与新版本引用、不继承旧批准、编辑不改在途实例」。限制（既定设计）：含 sourceRef 的流程在 2.0 无法实例化（src/api/workflowRun.ts:228 无条件拦截、入库页无启动流程入口），docs/OPERATIONS.md:280 已补说明。"
+    },
+    {
+      "id": "R47",
+      "requirement": "个人流程每次调用重新取输入与授权、生成新计划与新版本引用；不继承旧批准，编辑不改在途实例。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-07",
+        "A4-07",
+        "A4-08"
+      ],
+      "automated": {
+        "rust": [
+          "two_calls_of_the_same_workflow_produce_independent_plans",
+          "revoked_directory_grant_blocks_reuse",
+          "instantiations_survive_renames_and_point_at_one_version"
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-10",
+          "status": "executed"
+        }
+      ],
+      "note": "M-10 真机走查（2026-10-28，真实安装包）：新建「M10 导出流程」（1 个复制导出步骤）→ 素材库选中 3 项 → 用本次输入开始 → 现场授权导出目标 → 准备计划，库内新增 plan_4b49581610144db88d3fe2e33858c6f0（capability=workflows.submit/pending/gui）与 workflow_instantiations(workflow_446ff38a03f3424a9d43dba067d6a783, version=1)；编辑后「保存为新版本」→ workflows.current_version 1→2、新增 v2，而在途实例仍指向 version=1，符合「生成新计划与新版本引用、不继承旧批准、编辑不改在途实例」。限制（既定设计）：含 sourceRef 的流程在 2.0 无法实例化（src/api/workflowRun.ts:228 无条件拦截、入库页无启动流程入口），docs/OPERATIONS.md:280 已补说明。"
+    },
+    {
+      "id": "R48",
+      "requirement": "各入口都不提供原始 SQL、shell、密钥读取或伪造批准能力；模型不能成为授权事实源。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-01",
+        "A1-03",
+        "A3-03",
+        "A4-04",
+        "A5-01",
+        "A5-02"
+      ],
+      "automated": {
+        "rust": [
+          "pi_and_mcp_cannot_use_gui_approval_or_resume_entries",
+          "gui_only_approval_and_resume_entries_have_no_pi_tool",
+          "a_request_carrying_extra_fields_such_as_secrets_is_refused",
+          "publishable_set_never_contains_approval_or_resume_entries",
+          "only_contract_tools_are_declared_and_approval_entries_stay_hidden"
+        ]
+      },
+      "manual": [
+        {
+          "id": "M-14",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R49",
+      "requirement": "不把外部内容（文件名、标签、技能描述、模型响应）中的指令当作权限或扩大工具作用范围。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-04",
+        "A1-03",
+        "A3-03",
+        "A4-08"
+      ],
+      "automated": {
+        "rust": [
+          "external_agent_conversion_drops_raw_paths_keys_and_unclassified_messages",
+          "library_stats_injected_as_facts_not_prohibitions",
+          "link_and_parent_escape_are_rejected_without_path_disclosure"
+        ]
+      }
+    },
+    {
+      "id": "R50",
+      "requirement": "所有模型请求（含总结、压缩、重试）都受传输网关与预算约束：连接、限流、外发、取消规则一致生效。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-03",
+        "A3-02",
+        "A6-03"
+      ],
+      "automated": {
+        "rust": [
+          "run_budget_only_consumes_eight_attempts_before_its_fixed_deadline",
+          "lease_rechecks_binding_revision_enabled_protocol_and_model_before_budget",
+          "gateway_open_frame_accepts_only_fixed_post_routes_and_exact_fields",
+          "rate_limited_status_is_surfaced_without_streaming_the_body"
+        ]
+      },
+      "note": "网关对全部模型请求的结构性约束（路由白名单、预算/重试次数、取消、PRIVACY 边界）已由本卡 rust 用例覆盖。离线假服务证据之外，本机用真实 OpenAI 兼容端点跑通了 HttpGatewayTransport 实链路，覆盖四类场景：① 正常流式（200 + 非空 SSE 帧、端点与密钥不出现在回传帧、凭据每次尝试只读一次）；② 上游错误（结构化 gateway.response.error，不含端点与密钥，错误后不再发残余帧）；③ 流中取消（取消被及时响应、释放并发/额度令牌、不泄露密钥）；④ 本网关自有并发额度门（第二请求在第一请求占用期间不被静默转发，额度门为 wait 语义）。脱敏证据见 artifacts/agent-runtime/a3-02-real-egress/real-egress-result.json，运行方式 node scripts/a3-02-real-egress.mjs（需 TEACELL_A302_E2E_* 环境变量）。真实模型端自身的限流配额与计费预算行为仍属 A6-03（需获准预算与脱敏数据）。"
+    },
+    {
+      "id": "R51",
+      "requirement": "幂等、真实收据、取消竞争与结果未知：丢响应/重试/重启不重复文件效果或收费提交，未知结果先对账。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-04",
+        "A1-04",
+        "A1-05",
+        "A2-02",
+        "A4-01",
+        "A4-02",
+        "A4-03",
+        "A4-04",
+        "A5-03",
+        "A6-02"
+      ],
+      "automated": {
+        "rust": [
+          "lost_response_replays_same_operation_even_after_source_disappears",
+          "concurrent_confirmations_accept_once",
+          "claim_cancel_and_receipts_preserve_successful_items",
+          "unknown_send_result_preserves_run_and_shutdown_interrupts_a_pending_request",
+          "failed_receipt_insert_rolls_back_item_and_progress",
+          "interrupted_move_is_reconciled_against_real_disk_state",
+          "export_receipt_failure_after_files_are_copied_never_reports_success",
+          "hard_failure_leaves_the_export_task_in_a_terminal_failed_state",
+          "move_mode_is_rejected_by_the_command_gate_not_silently_copied"
+        ]
+      }
+    },
+    {
+      "id": "R52",
+      "requirement": "迁移追加且幂等，SQL 与文件 IO 分层，UI 与 Operation 不成为第二份子任务真相。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-04",
+        "A1-02",
+        "A1-05",
+        "A2-03",
+        "A2-04",
+        "A6-02"
+      ],
+      "automated": {
+        "rust": [
+          "fresh_install_is_transactional",
+          "v17_idempotent_and_crash_recoverable",
+          "migrate_twice_is_idempotent",
+          "v25_adds_connection_rate_limit_columns_idempotently",
+          "legacy_v22_database_upgrades_idempotently_and_keeps_user_data",
+          "upgrading_an_empty_legacy_database_creates_agent_tables_without_error",
+          "personal_workflows_survive_a_restart",
+          "database_layer_has_no_network_subprocess_or_decoder_dependency",
+          "file_io_stays_out_of_the_sql_layer_except_the_database_file_itself",
+          "operation_progress_is_projected_from_backend_events_instead_of_recomputed_in_the_ui"
+        ]
+      },
+      "manual": [
+        {
+          "id": "I-47",
+          "status": "pending"
+        }
+      ],
+      "note": "后三条是 `src-tauri/tests/architecture_contract.rs` 里的静态分层门（A6-04 复核新增）：`db/` 不得依赖网络/子进程/解码；文件 IO 只允许留在 `db/{mod,reset,backup}.rs`（数据库文件本身），业务 IO 必须在 `services/`；打标进度只允许 `aiStore.patchProgress` 一个写入口并从后端事件回灌。三条都在引入违规文件时实测转红，不是空转门。"
+    },
+    {
+      "id": "R53",
+      "requirement": "平台支持按证据登记并明确降级；未验证不宣称通过，受支持平台失败会阻止相应交付。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A5-03",
+        "A6-03",
+        "A6-04"
+      ],
+      "automated": {
+        "rust": [
+          "platform_support_is_reported_honestly",
+          "capabilities_are_internally_consistent"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/settings/McpBridgePanel.test.tsx",
+            "contains": [
+              "平台不支持时开关禁用"
+            ]
+          }
+        ]
+      },
+      "manual": [
+        {
+          "id": "X-01",
+          "status": "pending"
+        }
+      ],
+      "note": "非 Windows x64 的 MCP 桥接按契约返回 UNSUPPORTED；其他平台的安装与运行证据属 A6-03，本表不宣称。"
+    },
+    {
+      "id": "R54",
+      "requirement": "受控运行时与干净机器打包：无需用户配置系统 Node，启动/退出/升级不遗留错误进程。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A0-02",
+        "A3-01",
+        "A6-03"
+      ],
+      "automated": {
+        "rust": [
+          "packaged_sidecar_is_resolved_beside_the_app_executable",
+          "release_resolver_never_uses_path_when_sidecar_is_missing_or_invalid"
+        ]
+      },
+      "manual": [
+        {
+          "id": "X-01",
+          "status": "executed"
+        }
+      ],
+      "note": "干净机器证据已于 A6-03 用当前源码构建的安装包在 Windows Sandbox（全新 WDAGUtilityAccount，无系统 Node）实际执行：installer SHA-256 49E54E19DF40AA414415310524E0354A1F6BF8A7284BA25F4940AB9675771ED5。① 干净安装静默 installExitCode=0；② 首次启动窗口可见（title=茶馆）；③ 退出 exitExitCode=0、residualAfterExit 为空；④ 卸载 uninstallExitCode=0、无残留；⑤ 非 ASCII+空格安装路径 `…\\TeaCell 茶馆 媒体管理器` installExitCode=0；⑥ 覆盖安装升级 upgradeExitCode=0 且 userDataPreservedOnUpgrade=true、升级后重启动窗口可见。证据文件：artifacts/agent-runtime/a6-03-sandbox/results/clean-install-result.json 与 nonascii-upgrade-result.json（均绑定上述 SHA）。内置运行时路径解析与预算另有 rust 自动化证据。开发机/真实 ASAR 模型外发仍未覆盖（DisabledGatewayTransport 仍注入），但本卡要求的打包与干净机器旅程已实测通过。"
+    },
+    {
+      "id": "R55",
+      "requirement": "备份恢复与迁仓更换代次：旧票据不能重新执行写入，不得从旧备份复活可直接写入的批准凭证。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A4-05",
+        "A6-02"
+      ],
+      "automated": {
+        "rust": [
+          "public_restore_installs_fresh_unverified_locator_before_opening_access",
+          "published_restore_survives_restart_without_reviving_backup_epoch",
+          "successful_restore_keeps_the_previous_database_as_old_file",
+          "restore_rotates_identity_and_an_old_caller_cannot_plan_again",
+          "restore_never_revives_a_directly_writable_approval",
+          "restore_keeps_the_previous_database_as_a_valid_recovery_point"
+        ]
+      },
+      "manual": [
+        {
+          "id": "L-08",
+          "status": "pending"
+        },
+        {
+          "id": "I-48",
+          "status": "pending"
+        },
+        {
+          "id": "I-49",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "R56",
+      "requirement": "只保留有当前消费者的插件接点：2.0 没有空插件表、任意动态注册器或提前公开的 SDK。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A3-05",
+        "B0-01",
+        "B4-01"
+      ],
+      "automated": {
+        "rust": [
+          "only_contract_tools_are_declared_and_approval_entries_stay_hidden"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/TreasurePage.test.tsx",
+            "contains": [
+              "本地不渲染任何 iframe"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "R57",
+      "requirement": "既有媒体功能保留（HEIC/RAW 预览、视频代理等），专业 RAW 显影独立验证，未验证不宣传支持。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A6-02",
+        "A6-03"
+      ],
+      "automated": {
+        "rust": [
+          "ai_image_is_normalized_to_jpeg_and_max_edge",
+          "known_black_raw_samples_never_emit_black_thumbnails",
+          "creates_proxy_atomically_and_marks_ready",
+          "heic_and_raw_decoder_guards",
+          "favorite_toggles_and_persists"
+        ],
+        "frontend": [
+          {
+            "file": "src/components/library/ViewerPage.test.tsx",
+            "contains": [
+              "左栏点第 5 颗星写入评级，星标随即点亮（查看器评级有真实入口）",
+              "点已选中的当前星清零，不会把星级「锁死」在已选项（0 = 未评级）",
+              "F 键切换收藏，同样落到 set_favorite（不是只改本地状态）",
+              "键盘 1–5 设星级、0 清除，全程不用鼠标（F-05 纯键盘路径）",
+              "焦点在输入框时按 1–5 / F 不改评级收藏，避免打字就把素材改了（J-02）",
+              "写入失败时回滚星标并用 role=alert 如实说明，不假装保存成功"
+            ]
+          },
+          {
+            "file": "src/components/library/AssetGrid.test.tsx",
+            "contains": [
+              "右键素材菜单提供评级与收藏入口，选中后可批量设星（M-14b / PRD R-16 / J-03）",
+              "右键评级子菜单批量设星写库并同步星标，取消收藏也只改选中项（J-01 / J-03）",
+              "右键「收藏 / 取消收藏」批量写入，全部已收藏时再次点击是取消（可预期取反）",
+              "右键收藏写库失败时回滚星标并用 role=alert 提示，与查看器和批量操作栏口径一致（U-04）"
+            ]
+          },
+          {
+            "file": "src/components/library/ContextActionBar.test.tsx",
+            "contains": [
+              "批量操作栏提供与右键一致的收藏入口，选中全部未收藏的素材后整体收藏",
+              "选中项全部已收藏时再次点击是取消收藏，取反语义与右键菜单一致",
+              "收藏写入失败时回滚本地星标并用 role=alert 如实说明，不假装保存成功"
+            ]
+          }
+        ]
+      },
+      "note": "真实设备样本（各相机 RAW/HEIC）与大批量视频转码属 A6-03 的真机/性能证据。\n\nM-14b 补证（2026-10-27，L-01 真机走查前的断点排查）：L-01 要求的「查看器评级」在 2.0 前端原本没有任何入口——`src/api/assets.ts` 的 `setRating` 全仓无调用点（死代码），`set_favorite` 的后端函数、命令与前端 API 在 `de1fdb9` 中已被整体删除，`683628a` 同时删掉了网格右键的评级子菜单与 1–5/0 快捷键。`assets.favorite` 列、`idx_assets_favorite` 索引与迁移测试都还在，属「数据保留、能力丢失」的误删，git 提交说明里没有任何范围裁决记录。现已按 A6-01「普通功能不被新布局遮蔽或移除」补回：后端 `db::assets::set_favorite` + `commands::set_favorite`（已注册）、前端 `setFavorite` API 与 `Asset.favorite` 类型、查看器左栏评级星与收藏按钮、查看器键盘 1–5/0/F、网格右键评级子菜单与批量收藏。写作入口只有 ViewerPage 一处（侧栏与键盘共用同一 `applyRating`/`toggleFavorite`，失败统一回滚并 `role=alert` 如实说明），避免两处各写一份库。PRD R-16 仍保持「需真机/UAT」，待 L-01 真机闭环后按实际结果更新。\n\n**M-14b 续（2026-10-27，U-04 四入口一致性）**：`docs/QA_PLAYBOOK.md:217` 的 U-04（P0）把「收藏」明确列为必须在【网格右键、工具栏、查看器、批量操作栏】四处行为一致的动作，并写明「不一致即 A 类缺陷」。M-14b 先补回右键与查看器，批量操作栏（`src/components/library/ContextActionBar.tsx`，素材库顶栏经 `GridToolbar` 渲染）当时缺失，本轮补上「收藏 / 取消收藏」按钮：与右键共用 `src/api/assets.ts` 的 `setFavorite`，取反语义一致（只要有一项未收藏就整体收藏），失败逐项回滚并用 `role=\"alert\"` 如实提示；截断集合上走与打标/导出相同的二次确认。`git log -S` 显示该入口在批量操作栏**从未存在过**（不是被误删），因此这是按 U-04 补齐的一致性缺口，不是恢复历史实现。\n\n**M-14b 续二（2026-10-27，U-04 失败提示一致性）**：逐个入口比对失败路径时发现，查看器与批量操作栏在写库失败时都会 `role=\"alert\"` 如实提示（「评级/收藏没有保存：…」「收藏没有保存：…」），而网格右键的 `applyRating`/`toggleFavorite` 原来只有空 `catch`「只回滚、不提示」。按 U-04「同一动作走遍所有入口对比，行为完全一致」的口径，失败提示不一致同样属于 A 类不一致：用户会以为已经保存成功。本轮给 `src/components/library/AssetGridView.tsx` 补 `actionError` state 与 `role=\"alert\"` 提示条，三处入口现在共用同一口径；同时新增用例固定「回滚 + 提示」两件事，避免以后有人把提示再删掉。"
+    },
+    {
+      "id": "R58",
+      "requirement": "前端只经 src/api 调用，沿用搜索/分面协议，精确选择集合不被分页全选误当当前页。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A1-01",
+        "A3-03",
+        "A3-08",
+        "A5-02"
+      ],
+      "automated": {
+        "rust": [
+          "assets_search_returns_a_page_and_persists_the_exact_selection",
+          "pagination_cursor_is_explicitly_unsupported",
+          "page_reports_missing_members_instead_of_silently_shrinking",
+          "store_rejects_ids_that_are_not_in_this_library",
+          "frontend_invokes_commands_only_through_the_api_module"
+        ],
+        "frontend": [
+          {
+            "file": "src/pages/LibraryPage.test.tsx",
+            "contains": [
+              "全选被截断时弹窗明说只交接已加载部分"
+            ]
+          }
+        ]
+      },
+      "note": "`invoke` 只能出现在 `src/api/*`（唯一例外 `src/utils/logger.ts`：日志回传必须绕开 client.ts，否则 invoke 失败会递归调 logger）；页面不得直接 `listen` 事件，`@tauri-apps/api/event` 只允许 `import type`。门禁同样在 `src-tauri/tests/architecture_contract.rs`，实测对越界文件转红。"
+    },
+    {
+      "id": "R59",
+      "requirement": "真实测试证据与独立复核：每卡区分通过/失败/未运行，必要检查失败不能解锁依赖卡。",
+      "version": "2.0",
+      "status": "gap",
+      "cards": [
+        "A0-01",
+        "A0-04",
+        "A6-01",
+        "A6-03",
+        "A6-04"
+      ],
+      "automated": {},
+      "manual": [
+        {
+          "id": "L-01",
+          "status": "executed"
+        }
+      ],
+      "reason": "本表与 npm run test:tooling 里的 acceptance-evidence 校验已把两件事变成机器门禁：①证据引用必须真实存在（引用找不到、子串多义即失败）；②未被跳过的必要测试清点——collectIgnoredTests() 扫描 src-tauri 下每处 #[ignore]，要求写明环境或安全前置（外发凭据/真机/破坏性/手动/网络），无理由或理由不说明前置即报错，当前 12 处逐条核对成立且不计为通过，并已用注入无反例验证门禁会真的失败。仍未结算的是「独立复核」：复核已实际执行并归档于 artifacts/v2-review/a6-04-independent-review.json（结论有条件通过，报出的 2 个真缺陷与 2 处表述/口径问题均已修复并补回归），但其结论尚未被负责人作为第三方审计采信；以及 L-01 主链路闭环真机走查（导入→打标→采纳→搜索命中→评级→导出 by_tag）——该项已于 2026-10-28 在真实安装包上六环节分别通过（见 PROJECT_PLAN 的「L-01 主链路闭环真机走查」段），故 R59 剩余的关闭条件只有「独立复核结论待负责人采信」。按 PROJECT_PLAN 第 6 条属 A6-04 关闭条件，不在本卡宣称。",
+      "note": " L-01 主链路闭环真机走查（2026-10-28，真实安装包 SHA-256 4C551E7FAA7F35E1F6BBABF14F6E5A128F181E69BD53E0E2CD3635FE41EE55E4）：导入（2 项全判重复、不覆盖原素材）→ AI 打标（本地 Ollama 2/2 成功）→ 采纳（ai_batches 56=done/2/2/2，asset_tags 全部 ai_local+ai_reviewed）→ 超级搜索命中（输入 IMG 被解析为「文件名：IMG」，命中 3 项）→ 查看器评级（点星写入 rating=4、点当前星清零、F 切收藏、数字键 1-5/0 生效）→ 导出 by_tag（按首个标签分子目录，产物含 导出清单.csv，源文件未被移动）。六环节在同一安装包上分别通过，未做一次性不间断连跑；「按评级筛选/排序」的联动未复验。详见 docs/PROJECT_PLAN.md 的「L-01 主链路闭环真机走查」段。"
+    },
+    {
+      "id": "R60",
+      "requirement": "文档权威与唯一真实进度：待实现规格与已交付事实分开，进度只在 PROJECT_PLAN 维护。",
+      "version": "2.0",
+      "status": "gap",
+      "cards": [
+        "A0-01",
+        "A6-01",
+        "A6-04"
+      ],
+      "automated": {},
+      "reason": "本表只维护需求与证据的对应关系（不写完成勾选、不累计进度），矩阵结构由 acceptance-evidence 校验。唯一进度事实源这一子句已变成机器门禁：collectSpecificationProgressClaims() 扫描 plans/ 下每个 .md，出现「本卡已验收」「已交付：」「[x]」「Rdd 表行写已完成/covered/通过」等肯定式交付状态即失败，同时要求 docs/PROJECT_PLAN.md 自己声明「进度只在本文档维护」或「唯一进度来源」，否则报错；否定式表述（不是已完成进度、不被当作已交付功能、不等于任务验收通过）逐条放行，三条注入反例已锁进 scripts/acceptance-evidence.test.mjs。当前实测 plans/ 下 0 处交付状态宣称。仍未结算的是 A6-04 承担的文档清理与阶段关闭最终核对，不在本卡宣称。"
+    },
+    {
+      "id": "R61",
+      "requirement": "Agent 会话权限档位只能收窄能力、不能扩大审批：模型在各档位下可用的工具集是该档位应暴露能力的稳定子集，档位判定由 Rust 在 dispatch 前独立执行，Host 或前端回传的档位字段一律不被采信；用户批准、恢复、永久清空与打标开始在任何档位下都保持 GUI 专属。",
+      "version": "2.0",
+      "status": "covered",
+      "cards": [
+        "A3-10",
+        "A3-11"
+      ],
+      "automated": {
+        "rust": [
+          "tier_tool_sets_are_exact",
+          "tiers_are_strictly_monotonic_subsets",
+          "full_tier_cannot_widen_the_host_surface",
+          "read_tier_rejects_writes_and_keeps_queries",
+          "standard_excludes_only_move_and_trash",
+          "pi_and_mcp_cannot_use_gui_approval_or_resume_entries",
+          "capability_payloads_cannot_forge_approval_or_plan_references",
+          "a_client_cannot_smuggle_its_own_approval_into_a_submit_payload",
+          "redirect_and_cancel_are_terminal_and_drop_buffered_request_data",
+          "validate_agent_proxy_url_rejects_credentials_path_query_fragment_and_socks",
+          "endpoint_appends_route_path_to_the_user_base_url_verbatim",
+          "disabled_production_transport_rejects_before_reading_credentials",
+          "lease_issue_fails_closed_for_disabled_and_unlisted_connection_protocols",
+          "preflight_reports_network_disabled_before_touching_credentials",
+          "preflight_reports_unbound_service_when_nothing_is_bound",
+          "preflight_reports_missing_credential_for_a_bound_cloud_service",
+          "run_budget_only_consumes_eight_attempts_before_its_fixed_deadline"
+        ]
+      },
+      "note": "A3-10 三档 AgentPermission（Read/Standard/Full，默认 Standard）只收窄不放宽、Host 或前端回传的档位字段不被采信（Rust 在 dispatch 前复判）、GUI 专属入口（plans.approve/operations.resume/trash.empty.*/imports.*）在任何档位均不放行、Full 不等于自批，由 tier_tool_sets_are_exact（Read 4 / Standard 12 / Full 16 项）、tiers_are_strictly_monotonic_subsets、full_tier_cannot_widen_the_host_surface、read_tier_rejects_writes_and_keeps_queries、standard_excludes_only_move_and_trash 与 R03 的伪造批准/越权入口用例覆盖。A3-11 的可验证拒绝项负向测试（重定向不跟随、代理地址校验、连接地址含 userinfo、失败关闭传输、三种 preflight 缺项）与 run 预算默认值由 redirect_and_cancel_are_terminal_and_drop_buffered_request_data、validate_agent_proxy_url_rejects_credentials_path_query_fragment_and_socks、endpoint_appends_route_path_to_the_user_base_url_verbatim、disabled_production_transport_rejects_before_reading_credentials、lease_issue_fails_closed_for_disabled_and_unlisted_connection_protocols、preflight_reports_network_disabled_before_touching_credentials、preflight_reports_unbound_service_when_nothing_is_bound、preflight_reports_missing_credential_for_a_bound_cloud_service、run_budget_only_consumes_eight_attempts_before_its_fixed_deadline 覆盖。2026-11-02 实跑 services::agent_runtime 76 passed/0 failed/20 ignored。2026-11-02 已用本机回环网关（http://127.0.0.1:3425，opencode-zen-free/mimo-v2.6-flash-free，本地 dummy key，无真实凭据/无外网/无费用）实跑 4 项 real_provider --ignored 全部通过（证据 artifacts/agent-runtime/a3-11-real-egress/real-egress-result.json），已补齐 A3-11 ③ 真实出网实测；A3-11 ② 独立复核仍待第三方采信，属卡内验收项，不在本需求矩阵计为通过。"
+    }
+  ]
+}

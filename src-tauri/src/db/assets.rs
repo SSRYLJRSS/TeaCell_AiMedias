@@ -804,6 +804,32 @@ pub(crate) fn by_ids_ordered(conn: &Connection, ids: &[i64]) -> AppResult<Vec<As
     Ok(items)
 }
 
+/// A3-08: same ordering contract as `by_ids_ordered`, but only returns rows that
+/// are still live (not trashed) and still match the verified managed scope.
+///
+/// The handed-off selection is a fixed id snapshot; rendering it must not show
+/// items the user already deleted, and the caller needs the difference between
+/// "snapshot size" and "still available" to report how much is gone.
+pub(crate) fn by_ids_ordered_active(conn: &Connection, ids: &[i64]) -> AppResult<Vec<Asset>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT {COLUMNS} FROM assets a
+          WHERE a.id IN ({placeholders}) AND a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut items: Vec<Asset> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let pos: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    items.sort_by_key(|a| pos.get(&a.id).copied().unwrap_or(usize::MAX));
+    fill_tags(conn, &mut items)?;
+    Ok(items)
+}
+
 fn metadata_items(
     conn: &Connection,
     value_expr: &str,
@@ -1164,6 +1190,171 @@ pub fn soft_delete(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
     Ok(n as u64)
 }
 
+/// A3-03：统计仍处于活动状态（未软删且托管归属完好）的素材数量。
+/// 计划准备与提交都用它确认选择集在批准前后没有发生漂移。
+pub fn count_active(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM assets AS a
+              WHERE a.id IN ({list}) AND a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// A3-08：统计给定 id 中「库里确实存在且归属完好」的数量，**不排除回收站**。
+///
+/// 快照落库前必须用它确认 id 真的来自当前总库。`count_active` 会顺手排除
+/// 已软删的行，但恢复/永久删除/移动的计划恰恰以回收站里的记录为目标，所以
+/// 校验成员是否存在只能用这个口径：存在且定位证据完好即可，软删与否交给下游
+/// 各自的领域校验。
+pub fn count_known(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM assets AS a
+              WHERE a.id IN ({list}) AND {VERIFIED_ASSET_SCOPE}"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// A4-03：回收站里的一条记录（恢复前要拿它的路径与软删时间）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashRecord {
+    pub asset_id: i64,
+    pub file_path: String,
+    pub file_name: String,
+    pub deleted_at: i64,
+}
+
+/// A4-03：按 id 读取仍在回收站里的记录，保持传入顺序并只返回归属完好的行。
+///
+/// 恢复不能只看 `deleted_at`：记录必须先证明它仍属于当前总仓，否则一次
+/// 恢复会把已经失效的定位重新当成在库素材。
+pub fn trash_records(conn: &Connection, ids: &[i64]) -> AppResult<Vec<TrashRecord>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_path, a.file_name, a.deleted_at FROM assets a
+          WHERE a.id IN ({placeholders}) AND a.deleted_at IS NOT NULL AND {VERIFIED_ASSET_SCOPE}"
+    ))?;
+    let mut items: Vec<TrashRecord> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok(TrashRecord {
+                asset_id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_name: row.get(2)?,
+                deleted_at: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let pos: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    items.sort_by_key(|a| pos.get(&a.asset_id).copied().unwrap_or(usize::MAX));
+    Ok(items)
+}
+
+/// A4-03：取给定 id 中仍在库内（未软删、归属完好）的素材文件名，按传入顺序。
+///
+/// 回收站计划的摘要要写清「具体是哪几项」，但同时不能为此把整份 `Asset`
+/// 连标签一起取回来——计划审阅只需要名字。
+pub fn active_names(conn: &Connection, ids: &[i64]) -> AppResult<Vec<(i64, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT a.id, a.file_name FROM assets a
+          WHERE a.id IN ({placeholders}) AND a.deleted_at IS NULL AND {VERIFIED_ASSET_SCOPE}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows: Vec<(i64, String)> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let pos: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    rows.sort_by_key(|(id, _)| pos.get(id).copied().unwrap_or(usize::MAX));
+    Ok(rows)
+}
+
+/// A4-03：按 id 读「是否仍在回收站」，不考虑归属证据，供重启对账判定真实效果。
+///
+/// 和 `trash_records` / `active_names` 的区别是这里**不加** `VERIFIED_ASSET_SCOPE`：
+/// 对账要回答的是「`deleted_at` 现在到底是不是 NULL」，而不是「这条记录还算不算
+/// 在库」。总仓尚未 ready 时也可能走到这里，加上归属过滤会把两种情况都判成
+/// 「查不到」，从而把确定的结论误报成不确定。返回的 `bool` 语义是「仍在回收站」。
+pub fn trash_states(conn: &Connection, ids: &[i64]) -> AppResult<Vec<(i64, bool)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.deleted_at FROM assets a WHERE a.id IN ({placeholders})"
+    ))?;
+    let mut rows: Vec<(i64, bool)> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            let deleted_at: Option<i64> = row.get(1)?;
+            Ok((row.get(0)?, deleted_at.is_some()))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let pos: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    rows.sort_by_key(|(id, _)| pos.get(id).copied().unwrap_or(usize::MAX));
+    Ok(rows)
+}
+
+/// A4-03：列出回收站内容（最近软删在前），供界面显示移入时间与预计清理时间。
+pub fn list_trashed(conn: &Connection, limit: usize) -> AppResult<Vec<TrashRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.id, a.file_path, a.file_name, a.deleted_at FROM assets a
+          WHERE a.deleted_at IS NOT NULL AND {VERIFIED_ASSET_SCOPE}
+          ORDER BY a.deleted_at DESC, a.id DESC
+          LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+        Ok(TrashRecord {
+            asset_id: row.get(0)?,
+            file_path: row.get(1)?,
+            file_name: row.get(2)?,
+            deleted_at: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// A4-03：统计给定 id 中仍在回收站里、归属完好的数量。
+pub fn count_trashed(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM assets AS a
+              WHERE a.id IN ({list}) AND a.deleted_at IS NOT NULL AND {VERIFIED_ASSET_SCOPE}"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n as u64)
+}
+
 /// R-22 从回收站恢复：deleted_at 置空
 pub fn restore(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
     if ids.is_empty() {
@@ -1364,6 +1555,23 @@ pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 
 /// 回填 GPS 定位与拍摄时间（仅补空，不覆盖已有值；老素材无定位保持 NULL）。
 /// 注意 COALESCE 参数顺序：已有列值在前，新值在后 —— COALESCE(旧, 新) 才是「只补空」。
+/// W2-8：批量收藏/取消收藏（`favorite` 0/1；PRD R-16）。
+/// M-14b 恢复：`de1fdb9` 大规模重构时把本函数与命令、前端入口一起删掉了，
+/// 但 `assets.favorite` 列、`idx_assets_favorite` 索引与迁移测试都还在，
+/// 是「数据保留、能力丢失」。这里补回，校验与 `set_rating` 一致（只动当前总仓的托管素材）。
+pub fn set_favorite(conn: &Connection, ids: &[i64], favorite: bool) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    libraries::ensure_managed_assets(conn, ids)?;
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n = conn.execute(
+        &format!("UPDATE assets SET favorite = ?1 WHERE id IN ({list})"),
+        rusqlite::params![i64::from(favorite)],
+    )?;
+    Ok(n as u64)
+}
+
 /// W2-8：批量评级（0–5；0 = 清除评级）。
 pub fn set_rating(conn: &Connection, ids: &[i64], rating: i64) -> AppResult<u64> {
     if ids.is_empty() {
@@ -1705,18 +1913,27 @@ pub fn set_hd_thumbnail_path(conn: &Connection, id: i64, path: &str) -> AppResul
     Ok(())
 }
 
-/// B04：move 导出后同步更新库记录的文件路径与文件名（unique_dest 可能加了后缀）
-pub fn update_file_path_and_name(
+/// A4-02：总仓内移动后把文件路径、文件名与实测修改时间一起写回。
+///
+/// 必须与 `managed_asset_locations` 的核验证据在同一事务里落库：`file_path` 或
+/// `modified_at` 一改，`trg_managed_asset_location_changed` 就会把该素材的定位标记为
+/// `unknown`，只有在同一事务里重新 `record_verified` 才不会留下半截状态。
+/// 返回是否真的命中一行——路径没变时的空更新会让调用方误以为已提交。
+pub fn update_file_location(
     conn: &Connection,
     id: i64,
     file_path: &str,
     file_name: &str,
-) -> AppResult<()> {
-    conn.execute(
-        "UPDATE assets SET file_path = ?1, file_name = ?2 WHERE id = ?3",
-        rusqlite::params![file_path, file_name, id],
+    modified_at: i64,
+) -> AppResult<bool> {
+    let changed = conn.execute(
+        "UPDATE assets SET file_path = ?1, file_name = ?2, modified_at = ?3 WHERE id = ?4",
+        rusqlite::params![file_path, file_name, modified_at, id],
     )?;
-    Ok(())
+    if changed == 0 {
+        return Err(AppError::not_found("素材记录已不在素材库中"));
+    }
+    Ok(true)
 }
 
 /// B27：清空所有素材的占位图路径（清缓存时回写 DB，避免 DB 指向已删文件）

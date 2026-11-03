@@ -55,6 +55,26 @@ fn gui_caller(state: &AppState) -> AppResult<CallerContext> {
     )
 }
 
+/// 解析本次批次的实际执行类型。
+///
+/// M-07（PRD R-44）：打标工作台不区分 AI/手动模式，所有批次都能直接手工填写。
+/// 没有可用打标服务时不能连批次都建不出来——那会让「不配置 AI 也能用手动标签」整条路线失效。
+/// 因此 auto（以及历史 cloud/local 请求）在无绑定/已停用时降级为 manual 批次：素材照常进入
+/// 工作台供手工填写，之后绑定服务再点「开始打标」会经 `set_batch_mode` 改成实际部署类型。
+fn resolve_batch_mode(
+    conn: &rusqlite::Connection,
+    cfg: &mut settings::AiSettings,
+    requested: &str,
+) -> String {
+    if requested == "manual" {
+        return requested.to_string();
+    }
+    if require_tagging_binding(conn, cfg).is_err() {
+        return "manual".to_string();
+    }
+    mode_for_active_profile(cfg).to_string()
+}
+
 /// 用选中素材创建批次（pending 建议占位）
 /// mode 保留为旧客户端兼容参数；除历史 manual 外，实际部署类型一律按 tagging 用途绑定解析。
 /// retagMode（A3，可缺省 = append）：append / replaceAiOnly / reviewOnly
@@ -79,13 +99,7 @@ pub fn ai_create_batch(
     };
     let conn = lock_db(&state)?;
     let mut s = settings::get_settings(&conn)?;
-    // 新前端不再创建 manual 批次；保留历史协议兼容，存量 manual 批次仍可查看和手工编辑。
-    let mode = if mode == "manual" {
-        mode
-    } else {
-        require_tagging_binding(&conn, &mut s.ai)?;
-        mode_for_active_profile(&s.ai).to_string()
-    };
+    let mode = resolve_batch_mode(&conn, &mut s.ai, &mode);
     // 指导书阶段 5 §8.1/§8.3：用户选择的素材**完整**进入逻辑批次，不做静默截断。
     // 「批量上限」不再作为总批次截断——执行层按「分块大小」内存分块、限流、重试。
     // 若确需保护上限，必须在提交前明确展示与阻断，而非默认取前 N 张。
@@ -141,6 +155,9 @@ pub async fn ai_start_tagging(
     operation_id: ResourceRef,
     step_id: ResourceRef,
 ) -> AppResult<AiBatch> {
+    // A4-05：维护期间停止写入。打标会读素材文件并回写标签，迁仓中途两者
+    // 都可能指向旧根。
+    crate::commands::library_maintenance_cmd::ensure_writable(&state, "开始打标")?;
     let db = Arc::clone(&state.db);
     let registry = Arc::clone(&state.ai_cancel);
     let ai_config_guard = Arc::clone(&state.ai_config_guard);
@@ -498,5 +515,59 @@ mod tests {
 
         let err = require_tagging_binding(&conn, &mut cfg.ai).unwrap_err();
         assert!(err.to_string().contains("尚未绑定打标服务"));
+    }
+
+    // M-07 / PRD R-44：没有打标服务时不能连批次都建不出来——那会让「不配置 AI 也能手工填写」
+    // 整条路线失效。降级成 manual 批次，素材照常进工作台，手工标签的 source 也才是 manual。
+    #[test]
+    fn batch_mode_degrades_to_manual_without_tagging_binding() {
+        let conn = init_memory().unwrap();
+        let mut cfg = settings::get_settings(&conn).unwrap();
+        // 遗留 active_profile 不能当绑定用，否则降级判断会被旧配置骗过。
+        cfg.ai.profiles.push(settings::ApiProfile {
+            id: "legacy".into(),
+            name: "Legacy".into(),
+            api_mode: "openai".into(),
+            kind: "cloud".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: "secret".into(),
+            model: "vision-model".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
+        });
+        cfg.ai.active_profile = "legacy".into();
+
+        assert_eq!(resolve_batch_mode(&conn, &mut cfg.ai, "auto"), "manual");
+        // 已绑定的连接被停用也算「没有可用服务」。
+        ai_connections::upsert(
+            &conn,
+            "cloud-1",
+            "Cloud",
+            "cloud",
+            "openai_chat",
+            "https://example.com/v1",
+            "vision-model",
+            None,
+        )
+        .unwrap();
+        ai_connections::bind_usage(&conn, "tagging", "cloud-1").unwrap();
+        // 没有 set_enabled 命令：停用状态就是 ai_connections.enabled=0，这里直接写库模拟界面上关掉服务。
+        conn.execute(
+            "UPDATE ai_connections SET enabled = 0 WHERE id = 'cloud-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(resolve_batch_mode(&conn, &mut cfg.ai, "auto"), "manual");
+
+        // 恢复启用后回到真实部署类型，降级不是永久改行为。
+        conn.execute(
+            "UPDATE ai_connections SET enabled = 1 WHERE id = 'cloud-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(resolve_batch_mode(&conn, &mut cfg.ai, "auto"), "cloud");
+        // 显式 manual 请求保持 manual，不被绑定改写。
+        assert_eq!(resolve_batch_mode(&conn, &mut cfg.ai, "manual"), "manual");
     }
 }

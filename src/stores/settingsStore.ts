@@ -1,9 +1,9 @@
 /** 应用设置状态：启动加载，保存即落库 */
 import { create } from "zustand";
 import { getSettings, saveSettings } from "@/api/settings";
-import { normalizeSettings } from "@/utils/normalizeSettings";
+import { defaultNavigationShortcuts, normalizeSettings } from "@/utils/normalizeSettings";
 import { markStartup } from "@/utils/startupMarks";
-import type { Appearance, Settings } from "@/types/settings";
+import type { Appearance, Navigation, Settings } from "@/types/settings";
 import { logger } from "@/utils/logger";
 
 /** R-24：主题写入 <html> 的 data-theme（system 时 media query 接管，light/dark 显式生效） */
@@ -35,6 +35,16 @@ export const DEFAULT_APPEARANCE: Appearance = {
   hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
   colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
   kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
+};
+
+/**
+ * A3-05 默认底栏目录（与 Rust `db::settings::default_navigation_shortcuts` 对齐）。
+ *
+ * 只在设置未加载时兜底；用户改过的顺序/可见性始终以落库值为准。
+ */
+export const DEFAULT_NAVIGATION: Navigation = {
+  shortcuts: defaultNavigationShortcuts(),
+  settingsPinned: false,
 };
 
 /**

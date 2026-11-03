@@ -51,6 +51,10 @@ rayon = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "tga"] }
 # T05a 云端 AI 打标：blocking 与现有同步 command 风格一致（避免跨 await 持 DB 锁）
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# A3-02 production transport keeps the upstream stream cancellable while the
+# broker's pull loop is blocked. The request itself stays on a dedicated
+# current-thread runtime.
+tokio = { version = "1", features = ["rt", "time", "net", "io-util", "sync"] }
 base64 = "0.22"
 # Phase 2 F04：RAW 真解码（darktable 系纯 Rust 解析器；API 不守 SemVer，锁精确版本）
 rawler = "=0.7.2"

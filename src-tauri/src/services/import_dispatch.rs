@@ -35,7 +35,15 @@ pub fn drain<F: Fn(ImportProgress) + Sync>(
         let claim = Claim { queue, id };
         let operation = ResourceRef::from_trusted(claim.id.clone())?;
         let result = (|| {
-            let caller = import_submission::execution_context(db, &operation)?;
+            // 执行身份必须按计划持久行里的 `origin_kind` 重建，不能固定成 GUI：
+            // 原先这里调 `import_submission::execution_context`，它对
+            // `principal_gui_host` 以外的主体直接返回 `UnsupportedCapability`，
+            // 于是任何非 GUI 来源的导入操作即使已批准、已排到队首也永远排不空。
+            // `operation_dispatch::execution_caller` 是同一手法的泛化版本
+            // （principal/session/instance/grant_epoch 全部取自持久行），
+            // 不新增任何权限：请求仍只作用于已经批准、已经提交且排到队首的那一个操作。
+            // `import_ref` 仍然拒绝非 `imports.submit` 的操作。
+            let caller = crate::services::operation_dispatch::execution_caller(db, &operation)?;
             let import_ref = import_submission::import_ref(db, &operation)?;
             import_execute::execute_import(
                 db,

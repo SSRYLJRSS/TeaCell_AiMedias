@@ -192,15 +192,15 @@ store：`aiWarnings`（生命周期跟 AI 解析）/ `executionWarnings`（生�
 
 | 契约范围 | 条数 | 测试 |
 |---|---|---|
-| 查询转换映射 | 3 | `resolved_query_to_plan_covers_all_flat_fields` / `exclude_tag_ids_become_positive_tag_in_must_not` / `facet_filter_mode_and_descendants_survive` |
+| 查询转换映射 | 3 | `covers_all_flat_fields` / `exclude_tag_ids_become_positive_tag_in_must_not` / `facet_filter_mode_and_descendants_survive`（后者三条均在 `src/utils/planUtils.test.ts`，用用例名前缀而不是 Rust 函数名） |
 | `must_not` 极性 | 4 | `must_not_single_exclusion_excludes_not_includes` / `must_not_multiple_exclusions_are_or_semantics` / `validate_rejects_exclude_tag_in_must_not` / `validate_rejects_not_node_in_must_not` |
-| warning 剔除 | 4 | `must_not_invalid_leaf_is_removed_not_negated` / `should_invalid_clause_is_removed_not_always_true` / `min_should_converges_after_should_pruned` / `prune_reports_zone_in_warning` |
+| warning 剔除 | 4 | `must_not_invalid_leaf_is_removed_not_negated` / `should_invalid_clause_is_removed_and_min_converges` / `filter_invalid_leaf_is_removed_keeping_rest` / `facet_number_invalid_facet_pruned_with_warning` |
 | 计划校验 | 5 | `validate_rejects_bad_weight` / `validate_rejects_min_gt_should_len` / `validate_rejects_bad_dir` / `validate_rejects_nonpositive_retriever_weight` / `validate_rejects_future_schema_version` |
-| 版本与 hydrate | 4 | `plan_missing_version_defaults_to_current` / `diagnose_also_rejects_future_version` / `future_plan_discarded_on_hydrate` / `persisted_plan_hydrates_and_executes` |
-| 诊断同链 | 2 | `diagnose_uses_same_pruned_plan_as_list` / `pruned_leaf_is_not_diagnosed` |
+| 版本与 hydrate | 4 | `validate_rejects_future_schema_version` / `future_plan_discarded_on_hydrate` / `persisted_plan_hydrates_and_executes` / `facet_number_leaf_compiles_and_filters` |
+| 诊断同链 | 2 | `diagnose_uses_same_pruned_plan_and_omits_pruned_leaf` / `diagnostic_can_remove_leaf_nested_under_not` |
 | 全选截断 | 3 | `truncated_ids_block_delete_and_invert` / `truncated_ids_require_confirm_for_export` / `selection_bar_shows_partial_count` |
 | AI 追加合并 | 4 | `append_and_merges_filter_keeps_inner_or` / `append_or_merges_must_not` / `append_concats_should_and_caps_at_12` / `append_never_changes_user_ranking` |
-| 列表与 ID 一致性 | 2 | `plan_list_and_ids_return_same_set` / `plan_ids_respect_ranking_order` |
+| 列表与 ID 一致性 | 2 | `plan_list_and_ids_return_same_set` / `plan_ids_do_not_use_the_list_page_cap` |
 | 诊断交集 | 1 | `should_hit_count_is_intersection_with_result_set` |
 | 空 filter 软排序 | 1 | `empty_filter_with_should_min_zero_returns_all` |
 | 字段排序次级键 | 1 | `field_ranking_uses_should_score_as_tiebreak` |

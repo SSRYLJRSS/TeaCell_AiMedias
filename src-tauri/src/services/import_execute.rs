@@ -115,10 +115,24 @@ pub struct ImportFailureView {
     pub error_code: Option<String>,
 }
 
+/// One `duplicate_mapped` plan item, listed so the trusted GUI can ask the user
+/// explicitly before those assets join an AI tagging scope (A3-07 / 契约 §4.4).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDuplicateView {
+    pub item_ref: ResourceRef,
+    pub display_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResultView {
+    /// The `imports.submit` step that produced these receipts. The tagging
+    /// preparation path is keyed by `(operationId, stepId)`, so the GUI must be
+    /// able to name the exact step instead of guessing one.
+    pub source_step_ref: ResourceRef,
     pub imported: u32,
+    pub duplicate_items: Vec<ImportDuplicateView>,
     pub duplicates: u32,
     pub failed: u32,
     pub failures: Vec<ImportFailureView>,
@@ -134,13 +148,14 @@ pub fn import_result(
 ) -> AppResult<ImportResultView> {
     crate::services::plans::get_operation(db, caller, operation_ref)?;
     let plan_ref = crate::services::import_submission::import_ref(db, operation_ref)?;
-    let (plan_items, items, receipts) = {
+    let (source_step_ref, plan_items, items, receipts) = {
         let conn = db.lock()?;
         let step = operations_db::steps(&conn, operation_ref.as_str())?
             .into_iter()
             .find(|step| step.capability == "imports.submit")
             .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
         (
+            ResourceRef::from_trusted(step.step_id.clone())?,
             import_plans::items(&conn, plan_ref.as_str())?,
             operations_db::items(&conn, operation_ref.as_str(), &step.step_id)?,
             operations_db::receipts(&conn, operation_ref.as_str(), &step.step_id)?,
@@ -157,7 +172,9 @@ pub fn import_result(
         }
     }
     let mut result = ImportResultView {
+        source_step_ref,
         imported: 0,
+        duplicate_items: Vec::new(),
         duplicates: 0,
         failed: 0,
         failures: Vec::new(),
@@ -166,7 +183,16 @@ pub fn import_result(
         match item.state.as_str() {
             "succeeded" => match latest_events.get(&item.item_id).map(String::as_str) {
                 Some("item_imported") => result.imported += 1,
-                Some("duplicate_mapped") => result.duplicates += 1,
+                Some("duplicate_mapped") => {
+                    let display_name = plan_item_names
+                        .get(&item.item_id)
+                        .ok_or_else(|| AppError::from(AgentErrorCode::ReferenceExpired))?;
+                    result.duplicates += 1;
+                    result.duplicate_items.push(ImportDuplicateView {
+                        item_ref: ResourceRef::from_trusted(item.item_id)?,
+                        display_name: display_name.clone(),
+                    });
+                }
                 _ => return Err(AppError::internal("入库成功项缺少可识别的结果收据")),
             },
             "failed" | "outcome_unknown" => {
@@ -1766,6 +1792,12 @@ mod tests {
             (result.imported, result.duplicates, result.failed),
             (0, 1, 0)
         );
+        // The GUI must be able to name the exact import step and each duplicate
+        // item before preparing an AI tagging scope (A3-07, contract §4.4).
+        assert_eq!(result.duplicate_items.len(), 1);
+        assert_eq!(result.duplicate_items[0].display_name, "ok.jpg");
+        assert!(!result.duplicate_items[0].item_ref.as_str().is_empty());
+        assert!(!result.source_step_ref.as_str().is_empty());
         assert!(receipt_events(&db, &second)
             .iter()
             .any(|event| event == "duplicate_mapped"));

@@ -23,9 +23,13 @@
   --color-status-soft: #f3e8d8;
   --color-success: #566856;
   --color-danger: #eb5757;
+  /* 危险背景上的前景色（窗口关闭钮悬停、危险实心按钮）：亮/暗主题都必须足够对比。 */
+  --color-danger-contrast: #ffffff;
   --shadow-soft: 0 10px 30px rgb(48 47 43 / 8%);
   --radius-control: 8px;
   --radius-item: 6px;
+  /* 对话输入卡片：比控件层大一档，靠圆角区分「容器」与「容器内的控件」。 */
+  --radius-card: 14px;
   --font-sans: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
 }
 
@@ -48,6 +52,7 @@
   --color-status-soft: #3a3025;
   --color-success: #99aa95;
   --color-danger: #eb5757;
+  --color-danger-contrast: #ffffff;
 }
 
 /* system（或属性缺失，启动初始态）：跟随系统 */
@@ -71,5 +76,6 @@
     --color-status-soft: #3a3025;
     --color-success: #99aa95;
     --color-danger: #eb5757;
+    --color-danger-contrast: #ffffff;
   }
 }

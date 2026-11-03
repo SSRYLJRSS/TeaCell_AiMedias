@@ -14,7 +14,7 @@ interface AssetGridProps extends LibraryActions {
   onPreview: (asset: Asset) => void;
 }
 
-export default function AssetGrid({ onPreview, onTag, onExport, onMove, onDelete }: AssetGridProps) {
+export default function AssetGrid({ onPreview, onTag, onExport, onMove, onDelete, onHandoff }: AssetGridProps) {
   const { items, total, loading, loadMore, fetchAllIds, filter, setFilter } = useLibraryStore(
     useShallow((s) => ({
       // W5h-d：合并显示开启时渲染折叠后的 viewItems（每组代表）；关闭时 store 写入原 items
@@ -63,6 +63,7 @@ export default function AssetGrid({ onPreview, onTag, onExport, onMove, onDelete
       onExport={onExport}
       onMove={onMove}
       onDelete={onDelete}
+      onHandoff={onHandoff}
       scrollRestoreKey="library"
       onSearchDominant={onSearchDominant}
     />

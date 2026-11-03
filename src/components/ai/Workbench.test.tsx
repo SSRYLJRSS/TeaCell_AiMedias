@@ -5,7 +5,7 @@
  *  - 已确认/已拒绝张只读展示（空描述显示「未生成描述」）。
  */
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import Workbench from "@/components/ai/Workbench";
 import type { AiSuggestion } from "@/types/ai";
 import type { WorkbenchFacet } from "@/types/tag";
@@ -18,6 +18,11 @@ vi.mock("@/api/thumbnail", () => ({
 vi.mock("@/api/assets", () => ({
   getAsset: vi.fn().mockResolvedValue(null),
   getAssetUrls: vi.fn().mockResolvedValue([]),
+}));
+// FacetTagInput 挂载时会读最近标签操作；jsdom 下没有 Tauri IPC，直接给空列表
+vi.mock("@/api/tags", () => ({
+  recentTagOps: vi.fn().mockResolvedValue([]),
+  searchTagCandidates: vi.fn().mockResolvedValue([]),
 }));
 
 const mkSuggestion = (over: Partial<AiSuggestion> = {}): AiSuggestion => ({
@@ -72,9 +77,21 @@ function renderWorkbench(over: Partial<AiSuggestion> = {}, description = "夜晚
   return { ...view, onTagsChange, onDescriptionChange, onConfirm };
 }
 
+/**
+ * 挂载/重渲染后的异步回写（缩略图、素材详情、标签候选）必须包在 act 内等待，
+ * 否则 React 会报 "An update to ... was not wrapped in act(...)"。
+ */
+async function flushPending() {
+  await act(async () => {
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  });
+}
+
 describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
-  it("描述为单行 input（maxLength 30），字符计数按 JS 字符迭代显示 N/30", () => {
+  it("描述为单行 input（maxLength 30），字符计数按 JS 字符迭代显示 N/30", async () => {
     const { rerender } = renderWorkbench({}, "夜晚树下多人合影");
+    await flushPending();
     const input = screen.getByRole("textbox", { name: "一句话描述" }) as HTMLInputElement;
     expect(input).toBeInTheDocument();
     expect(input.maxLength).toBe(30);
@@ -99,6 +116,7 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
         onRestore={vi.fn().mockResolvedValue(undefined)}
       />,
     );
+    await flushPending();
     expect(screen.getByText("2/30")).toBeInTheDocument();
     // 表情符号（多字节）也按字符计
     rerender(
@@ -118,18 +136,22 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
         onRestore={vi.fn().mockResolvedValue(undefined)}
       />,
     );
+    await flushPending();
     expect(screen.getByText("3/30")).toBeInTheDocument();
   });
 
-  it("标签为空但描述非空：确认按钮可点击（§7.5）", () => {
+  it("标签为空但描述非空：确认按钮可点击（§7.5）", async () => {
     const { onConfirm } = renderWorkbench({}, "纯红底色");
+    await flushPending();
     const btn = screen.getByRole("button", { name: "确认写入" });
     expect(btn.hasAttribute("disabled")).toBe(false);
     fireEvent.click(btn);
     expect(onConfirm).toHaveBeenCalledTimes(1);
+    // onConfirm 落地后组件会收尾 busy 状态，必须等它回到 act 内
+    await flushPending();
   });
 
-  it("主体为空时显示「未识别」占位，不把占位词写成标签", () => {
+  it("主体为空时显示「未识别」占位，不把占位词写成标签", async () => {
     const onTagsChange = vi.fn();
     render(
       <Workbench
@@ -148,19 +170,22 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
         onRestore={vi.fn().mockResolvedValue(undefined)}
       />,
     );
+    await flushPending();
     expect(screen.getByTestId("subject-unrecognized")).toHaveTextContent("未识别");
     expect(onTagsChange).not.toHaveBeenCalled();
   });
 
-  it("已确认张：描述只读展示（无 input）；空描述显示「未生成描述」", () => {
+  it("已确认张：描述只读展示（无 input）；空描述显示「未生成描述」", async () => {
     renderWorkbench({ status: "confirmed", confirmedTags: { subject: ["猫"] } }, "");
+    await flushPending();
     expect(screen.queryByRole("textbox", { name: "一句话描述" })).not.toBeInTheDocument();
     expect(screen.getByText("未生成描述")).toBeInTheDocument();
     expect(screen.getByText("✓ 已写入")).toBeInTheDocument();
   });
 
-  it("确认栏在标签滚动区之外并位于工作台底部", () => {
+  it("确认栏在标签滚动区之外并位于工作台底部", async () => {
     renderWorkbench();
+    await flushPending();
     const scrollArea = screen.getByTestId("workbench-facet-scroll");
     const confirmBar = screen.getByTestId("workbench-confirm-bar");
     const confirmButton = screen.getByRole("button", { name: "确认写入" });
@@ -208,8 +233,9 @@ describe("Workbench 数值建议（V24）", () => {
     return { onDecideNumberItem };
   }
 
-  it("workbench_number_items_render：确定值显示数值 + 采纳/拒绝；歧义项提示人工确认（不自动取值）", () => {
+  it("workbench_number_items_render：确定值显示数值 + 采纳/拒绝；歧义项提示人工确认（不自动取值）", async () => {
     renderWithNumbers();
+    await flushPending();
     expect(screen.getByText("数值建议")).toBeInTheDocument();
     const rows = screen.getAllByTestId("workbench-number-item");
     expect(rows).toHaveLength(2);
@@ -221,7 +247,36 @@ describe("Workbench 数值建议（V24）", () => {
 
   it("workbench_number_item_decide：点采纳调用 onDecideNumberItem(id, 'accepted')", async () => {
     const { onDecideNumberItem } = renderWithNumbers();
+    await flushPending();
     fireEvent.click(screen.getByLabelText("采纳数值建议 人数"));
     await waitFor(() => expect(onDecideNumberItem).toHaveBeenCalledWith(11, "accepted"));
+  });
+});
+
+describe("Workbench 键盘快捷键边界（审查 P0）", () => {
+  // 曾经：window 上的 Enter 处理器只豁免 INPUT，焦点在「拒绝 / 上一张 / 缩略图」等按钮上
+  // 按 Enter 会既触发按钮、又调用 handleConfirm，把没审完的结果直接写库。
+  it("焦点在按钮上按 Enter 只触发那个按钮，不确认写入", async () => {
+    const { onConfirm } = renderWorkbench();
+    await flushPending();
+    const reject = screen.getByRole("button", { name: "拒绝" });
+    fireEvent.keyDown(reject, { key: "Enter" });
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  // 只读（已确认 / 已拒绝）状态下不该再发写请求：与页脚「当前结果为只读状态」保持一致。
+  it("只读状态下按 Enter 不确认写入", async () => {
+    const { onConfirm } = renderWorkbench({ status: "confirmed" });
+    await flushPending();
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(screen.getByText("当前结果为只读状态")).toBeInTheDocument();
+  });
+
+  it("焦点不在控件上时 Enter 仍然确认（快捷键不能因修 bug 失效）", async () => {
+    const { onConfirm } = renderWorkbench();
+    await flushPending();
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
   });
 });

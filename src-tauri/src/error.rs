@@ -23,6 +23,23 @@ pub enum AppErrorCode {
     Unauthorized,
     Unsupported,
     Internal,
+    /// Agent 网络出口未就绪（未绑定可用服务/未通过外发前置检查）。历史码名沿用
+    /// A3-02；已无用户可见的「联网开关」（2026-11-01 裁决）。
+    AgentModelNetworkDisabled,
+    /// 用户还没有为 Agent 绑定 AI 服务，或绑定的服务已删除/停用。
+    AgentServiceUnbound,
+    /// 绑定的云服务还没有保存密钥（本机服务不需要密钥）。
+    AgentCredentialMissing,
+    /// Agent Host 上次是被强行中断的，需要用户明确选择恢复。
+    AgentHostInterrupted,
+    /// 另一个启动流程正在进行中，稍后重试即可（不是错误操作）。
+    AgentHostStarting,
+    /// Agent Host 不可用（平台不支持、资源缺失、启动失败已耗尽重试）。
+    AgentHostUnavailable,
+    /// Host 重启后旧会话需要重新打开。
+    AgentConversationNotOpen,
+    /// Host 上已不存在该会话（会话文件被清理/总仓重建）。
+    AgentSessionNotFound,
 }
 
 impl AppErrorCode {
@@ -43,6 +60,14 @@ impl AppErrorCode {
             Self::Unauthorized => "UNAUTHORIZED",
             Self::Unsupported => "UNSUPPORTED",
             Self::Internal => "INTERNAL",
+            Self::AgentModelNetworkDisabled => "AGENT_MODEL_NETWORK_DISABLED",
+            Self::AgentServiceUnbound => "AGENT_SERVICE_UNBOUND",
+            Self::AgentCredentialMissing => "AGENT_CREDENTIAL_MISSING",
+            Self::AgentHostInterrupted => "AGENT_HOST_INTERRUPTED",
+            Self::AgentHostStarting => "AGENT_HOST_STARTING",
+            Self::AgentHostUnavailable => "AGENT_HOST_UNAVAILABLE",
+            Self::AgentConversationNotOpen => "AGENT_CONVERSATION_NOT_OPEN",
+            Self::AgentSessionNotFound => "AGENT_SESSION_NOT_FOUND",
         }
     }
 }
@@ -86,11 +111,21 @@ impl AppError {
                     AgentErrorCode::LibraryOffline
                 }
                 AppErrorCode::Unsupported => AgentErrorCode::UnsupportedCapability,
+                // Agent 自身的门禁错误：对外只表达“服务暂时不可用/需要重新选择”，
+                // 不把内部原因（开关、绑定、Host 生命周期）泄漏给 Agent 协议。
+                AppErrorCode::AgentHostStarting
+                | AppErrorCode::AgentHostUnavailable
+                | AppErrorCode::AgentModelNetworkDisabled
+                | AppErrorCode::AgentServiceUnbound
+                | AppErrorCode::AgentCredentialMissing
+                | AppErrorCode::AgentHostInterrupted => AgentErrorCode::ServiceUnavailable,
                 // NotFound can describe more than an expired reference; do not guess.
                 AppErrorCode::NotFound
                 | AppErrorCode::Internal
                 | AppErrorCode::AiFormatUnsupported
-                | AppErrorCode::AiOutputTruncated => AgentErrorCode::Internal,
+                | AppErrorCode::AiOutputTruncated
+                | AppErrorCode::AgentConversationNotOpen
+                | AppErrorCode::AgentSessionNotFound => AgentErrorCode::Internal,
             },
             Self::Db(_) | Self::Io(_) | Self::Json(_) | Self::Image(_) | Self::Msg(_) => {
                 AgentErrorCode::Internal
@@ -157,6 +192,47 @@ impl AppError {
 
     pub fn internal(s: impl Into<String>) -> Self {
         Self::coded(AppErrorCode::Internal, s)
+    }
+
+    /// Agent 网络出口未就绪（未绑定/未启用可用服务）。历史码名沿用 A3-02；
+    /// 已无用户可见的「联网开关」（2026-11-01 裁决）。
+    pub fn agent_model_network_disabled(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentModelNetworkDisabled, s)
+    }
+
+    /// 没有为 Agent 绑定可用的 AI 服务（未绑定 / 已删除 / 已停用）。
+    pub fn agent_service_unbound(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentServiceUnbound, s)
+    }
+
+    /// 云服务缺少本机密钥（本机服务无需密钥）。
+    pub fn agent_credential_missing(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentCredentialMissing, s)
+    }
+
+    /// Host 上次被强行中断，需要用户明确选择恢复。
+    pub fn agent_host_interrupted(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentHostInterrupted, s)
+    }
+
+    /// 另一个启动流程正在进行；这是可重试的瞬时状态。
+    pub fn agent_host_starting(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentHostStarting, s)
+    }
+
+    /// Host 在本机不可用（平台不支持、资源缺失或启动失败）。
+    pub fn agent_host_unavailable(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentHostUnavailable, s)
+    }
+
+    /// 旧会话没有在当前的 Host 实例里打开过，需要重新打开后再发送。
+    pub fn agent_conversation_not_open(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentConversationNotOpen, s)
+    }
+
+    /// Host 上已不存在该会话，应新建会话而不是重试旧会话。
+    pub fn agent_session_not_found(s: impl Into<String>) -> Self {
+        Self::coded(AppErrorCode::AgentSessionNotFound, s)
     }
 
     /// 机器可判错误码。日志与序列化共用同一定义，避免两套映射漂移。

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createOfflineSession } from '../src/sdk-session.mjs';
+import { PI_TOOL_NAMES } from '../src/tools.mjs';
 
 function openAiFixtureResponse(model, finishReason = 'stop') {
   const events = [
@@ -77,8 +78,13 @@ for (const fixture of [
     try {
       sessionRecord = await createOfflineSession(agentDir, conversationId, 'new', {
         gatewayRpc,
+        capabilityRpc: { exchange: async () => ({}) },
         pinSessionFile: async () => true,
         unpinSessionFile: async () => {},
+        tools: [...PI_TOOL_NAMES],
+        // 本用例专门断言「压缩关闭时 length 不触发隐式重试」；生产默认开启 Pi 压缩
+        // （见 sdk-session.mjs SettingsManager compaction），此处显式关闭以隔离该路径。
+        autoCompaction: false,
       });
 
       await assert.rejects(sessionRecord.setGatewayLease({
@@ -113,14 +119,15 @@ for (const fixture of [
       const request = JSON.parse(Buffer.from(calls[0].body).toString('utf8'));
       assert.equal(request.model, model);
       assert.equal(request.stream, true);
-      assert.equal(request.max_tokens ?? request.max_completion_tokens, 2048);
+      // Adaptive reply budget (default 4096); Rust ceiling MAX_OUTPUT_TOKENS=8192.
+      assert.equal(request.max_tokens ?? request.max_completion_tokens, 4096);
       assert.equal(JSON.stringify(calls[0]).includes('gateway-placeholder-only'), false);
       assert.equal(JSON.stringify(calls[0]).includes('authorization'), false);
 
       returnLengthResponse = true;
       await sessionRecord.session.prompt('trigger a synthetic max-output response');
       assert.equal(assistantStops.at(-1), 'length', 'the fixture must reach Pi’s recoverable length-stop path');
-      assert.deepEqual(compactionStarts, [], 'disabled automatic compaction must not start on a recoverable length stop');
+      assert.deepEqual(compactionStarts, [], 'autoCompaction:false 时不得在可恢复 length 上启动压缩');
       assert.equal(calls.length, 2, 'a recoverable length stop must not trigger an implicit compact or retry request');
       const transcript = await readFile(join(agentDir, 'sessions', sessionRecord.pinnedSessionFile), 'utf8');
       assert.equal(transcript.includes('gateway-placeholder-only'), false);

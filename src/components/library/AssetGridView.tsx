@@ -7,7 +7,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
-import { getAssetUrls, revealInFolder } from "@/api/assets";
+import { getAssetUrls, revealInFolder, setFavorite, setRating } from "@/api/assets";
 import { openFileExternal } from "@/api/import";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -48,14 +48,20 @@ export interface AssetGridViewProps extends LibraryGridActions {
   onClearFilter?: () => void;
   /** U-7③：空结果时的归零条件列表（来自 C-2 诊断）—— 每条可单点移除 */
   zeroingActions?: { key: string; label: string; onRemove: () => void }[];
+  /** M-14b：评级/收藏的本地回写。素材库缺省写 libraryStore；超级搜索必须传自己的
+   *  superSearchStore.patchLocal，否则改的是另一个页面的数据（两页各有一份 items）。 */
+  onPatchAssets?: (ids: number[], patch: Partial<Asset>) => void;
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
 export interface LibraryGridActions {
   onTag: () => void;
   onExport: () => void;
-  onMove: () => void;
+  /** A4-01：库外移动已停用；库内分库移动属 A4-02，暂不渲染入口 */
+  onMove?: () => void;
   onDelete: () => void;
+  /** A3-08：把当前选择固定成快照交给助手（只读交接） */
+  onHandoff?: () => void;
 }
 
 const GAP = 8;
@@ -74,12 +80,14 @@ export default function AssetGridView({
   onExport,
   onMove,
   onDelete,
+  onHandoff,
   scrollElementRef,
   scrollRestoreKey,
   onSearchDominant,
   hasActiveFilter: hasActiveFilterProp,
   onClearFilter,
   zeroingActions,
+  onPatchAssets,
 }: AssetGridViewProps) {
   const { selected, truncated, selectionTotal, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -217,6 +225,8 @@ export default function AssetGridView({
   const handlePreview = useCallback((asset: Asset) => onPreview(asset), [onPreview]);
 
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // M-14b（U-04 各入口一致）：右键评级/收藏写库失败时的如实提示，与查看器、批量操作栏同口径。
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // FB2-03 护栏：滚动中及停止后 SCROLL_SUPPRESS_MS 内，网格不激活 hover 预览。
   const scrollingRef = useRef(false);
@@ -341,6 +351,49 @@ export default function AssetGridView({
     if (paths[0]) await openFileExternal(paths[0]);
   }, [selected]);
 
+  /**
+   * M-14b（PRD R-16 / QA_PLAYBOOK J-01、J-03、U-04）：恢复网格右键的「评级」子菜单。
+   *  `683628a` 大规模重构把这里的评级子菜单与被删的前端 `setRating` 入口一起删掉了，
+   *  但后端命令与字段一直在。这里走与查看器同一套乐观更新：先改本地、失败回滚，
+   *  批量语义与 `docs/QA_PLAYBOOK.md` J-03「多选后批量设星级」一致。
+   */
+  const applyRating = useCallback(
+    async (value: number) => {
+      const ids = Array.from(selected);
+      if (ids.length === 0) return;
+      const patch = onPatchAssets ?? ((list: number[], p: Partial<Asset>) => useLibraryStore.getState().patchLocal(list, p));
+      const previous = new Map(ids.map((id) => [id, items.find((a) => a.id === id)?.rating ?? 0]));
+      setActionError(null);
+      patch(ids, { rating: value });
+      try {
+        await setRating(ids, value);
+      } catch (error: unknown) {
+        // 失败逐项回滚，避免星标停在没写进库的状态；并按 U-04「各入口一致」如实提示，
+        // 与查看器、批量操作栏同一口径（只回滚不提示会让用户以为已经保存成功）。
+        for (const [id, rating] of previous) patch([id], { rating });
+        setActionError(`评级没有保存：${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [selected, onPatchAssets, items],
+  );
+
+  const toggleFavorite = useCallback(async () => {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    const patch = onPatchAssets ?? ((list: number[], p: Partial<Asset>) => useLibraryStore.getState().patchLocal(list, p));
+    const previous = new Map(ids.map((id) => [id, items.find((a) => a.id === id)?.favorite ?? 0]));
+    // 批量收藏取反：只要有一张还没收藏，就全部收藏（与批量操作栏一致的可预期语义）
+    const next = ids.some((id) => (items.find((a) => a.id === id)?.favorite ?? 0) === 0) ? 1 : 0;
+    setActionError(null);
+    patch(ids, { favorite: next });
+    try {
+      await setFavorite(ids, next === 1);
+    } catch (error: unknown) {
+      for (const [id, favorite] of previous) patch([id], { favorite });
+      setActionError(`收藏没有保存：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [selected, onPatchAssets, items]);
+
   // W5f-f1：当前是否带任何筛选/搜索条件（区分「库为空」与「筛选无结果」）
   // R0-5：超级搜索传自己的条件态（props），缺省才回退读素材库 store ——
   // 否则超搜 0 结果会误显示「素材库还是空的 / 去导入素材」。
@@ -367,14 +420,37 @@ export default function AssetGridView({
     if (selected.size === 0) return common;
     return [
       { label: "打标", onClick: guardTruncated(onTag, "批量打标") },
-      { label: "导出", onClick: guardTruncated(onExport, "导出") },
-      { label: "移动到…", onClick: guardTruncated(onMove, "移动") },
+      ...(onHandoff
+        ? [{ label: "交给助手", onClick: guardTruncated(onHandoff, "交接给助手") }]
+        : []),
+      { label: "复制导出", onClick: guardTruncated(onExport, "导出") },
+      ...(onMove
+        ? [{ label: "移动到…", onClick: guardTruncated(onMove, "移动") }]
+        : []),
       // §4.6：删除（移入回收站）在截断集合上禁止 —— 不可逆 + 集合不完整 = 最坏组合
       {
         label: "删除",
         disabled: truncated,
         title: truncated ? "当前结果超过 100000 张，请先收窄条件再删除" : undefined,
         onClick: onDelete,
+      },
+      { divider: true },
+      // M-14b（J-01/J-03/U-04）：评级子菜单。U-04 要求「删除/打标/收藏/导出在网格右键、
+      // 工具栏、查看器、批量操作栏多入口行为一致」——这里与查看器走同一对命令。
+      {
+        label: "评级",
+        children: [
+          ...[5, 4, 3, 2, 1].map((star) => ({
+            label: "★".repeat(star),
+            onClick: () => void applyRating(star),
+          })),
+          { divider: true as const },
+          { label: "清除评级", onClick: () => void applyRating(0) },
+        ],
+      },
+      {
+        label: "收藏 / 取消收藏",
+        onClick: () => void toggleFavorite(),
       },
       { divider: true },
       { label: "复制路径", onClick: () => void copyPaths() },
@@ -389,7 +465,7 @@ export default function AssetGridView({
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onTag, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear]);
+  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onTag, onExport, onMove, onDelete, onHandoff, copyPaths, revealFirst, openFirstExternal, clear, applyRating, toggleFavorite]);
 
   if (items.length === 0) {
     return (
@@ -503,6 +579,11 @@ export default function AssetGridView({
           ))}
         </div>
         {menu && <ContextMenu x={menu.x} y={menu.y} entries={menuEntries} onClose={() => setMenu(null)} />}
+        {actionError && (
+          <div role="alert" className="pointer-events-none sticky bottom-2 z-20 mx-2 rounded-md bg-[var(--color-danger)] px-3 py-2 text-xs text-white shadow-lg">
+            {actionError}
+          </div>
+        )}
       </div>
     </GridScrollingContext.Provider>
   );

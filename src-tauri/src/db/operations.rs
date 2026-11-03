@@ -975,6 +975,33 @@ pub fn complete_operation(
     Ok(())
 }
 
+/// A3-03：在调用方已持有的事务里结算操作与步骤。
+///
+/// `complete_operation` 会自行开启事务，不能用于计划提交的 effect 闭包；
+/// 这里只执行同样的两条 UPDATE，由外层事务保证原子性。
+pub fn settle_operation(
+    conn: &Connection,
+    operation_id: &str,
+    state: &str,
+    now: i64,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE operation_steps
+            SET state=?1,phase='complete',finished_at=?2,
+                revision=revision+1,updated_at=?2
+          WHERE operation_id=?3 AND state NOT IN ('succeeded','partially_succeeded','failed','cancelled')",
+        rusqlite::params![state, now, operation_id],
+    )?;
+    conn.execute(
+        "UPDATE operations
+            SET state=?1,phase='complete',finished_at=?2,
+                revision=revision+1,updated_at=?2
+          WHERE operation_id=?3",
+        rusqlite::params![state, now, operation_id],
+    )?;
+    Ok(())
+}
+
 /// Stop a running operation after its authorization generation changes while
 /// preserving it as an explicitly resumable interruption. This is scoped to
 /// one operation so an unrelated worker is not interrupted with it.

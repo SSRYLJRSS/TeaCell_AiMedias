@@ -417,7 +417,7 @@ mod tests {
             json!({"schemaVersion":1,"library":library,"selectionRef":token,"total":10,"truncated":true,"items":[{"assetRef":token,"displayName":"茶杯.jpg"}]}),
         );
         assert_strict::<PlanPreview>(
-            json!({"schemaVersion":1,"planId":token,"capability":"imports.submit","library":library,"reviewStatus":"pending","reviewKind":"ordinary","itemCount":2,"summary":"复制两项入库","reviewRef":token,"expiresAtUnixSeconds":1791500000,"scope":{"scopeRef":token,"sourceRef":token,"targetRef":token},"budget":{"maxRequests":0,"maxTokens":0,"maxSeconds":300,"maxItems":2}}),
+            json!({"schemaVersion":1,"planId":token,"capability":"imports.submit","library":library,"reviewStatus":"pending","reviewKind":"ordinary","originKind":"gui","itemCount":2,"summary":"复制两项入库","reviewRef":token,"expiresAtUnixSeconds":1791500000,"scope":{"scopeRef":token,"sourceRef":token,"targetRef":token},"budget":{"maxRequests":0,"maxTokens":0,"maxSeconds":300,"maxItems":2}}),
         );
         assert_strict::<OperationSnapshot>(
             json!({"schemaVersion":1,"operationId":token,"library":library,"revision":3,"state":"outcome_unknown","phase":"reconciling","completed":1,"failed":0,"errorCode":"OUTCOME_UNKNOWN","canCancel":false,"canResume":false}),
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn review_output_rejects_incomplete_service_and_budget_snapshots() {
         let token = "resource_0123456789abcdef";
-        let valid = json!({"schemaVersion":1,"planId":token,"capability":"tagging.submit","library":{"libraryId":token,"libraryEpoch":token},"reviewStatus":"pending","reviewKind":"ordinary","itemCount":2,"summary":"识别主题后等待标签审核","reviewRef":token,"expiresAtUnixSeconds":1791500000,"scope":{"scopeRef":token,"selectionRef":token,"serviceRef":token,"serviceRevision":token,"model":"vision-model"},"budget":{"maxRequests":2,"maxTokens":2000,"maxSeconds":300,"maxItems":2,"monetaryLimit":{"currency":"USD","amountMicrounits":1000000}}});
+        let valid = json!({"schemaVersion":1,"planId":token,"capability":"tagging.submit","library":{"libraryId":token,"libraryEpoch":token},"reviewStatus":"pending","reviewKind":"ordinary","originKind":"gui","itemCount":2,"summary":"识别主题后等待标签审核","reviewRef":token,"expiresAtUnixSeconds":1791500000,"scope":{"scopeRef":token,"selectionRef":token,"serviceRef":token,"serviceRevision":token,"model":"vision-model"},"budget":{"maxRequests":2,"maxTokens":2000,"maxSeconds":300,"maxItems":2,"monetaryLimit":{"currency":"USD","amountMicrounits":1000000}}});
         let preview: PlanPreview = serde_json::from_value(valid.clone()).unwrap();
         assert!(encode_agent_output(&preview).is_ok());
         let mut wrong_review = valid.clone();

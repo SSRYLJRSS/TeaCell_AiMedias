@@ -155,6 +155,21 @@ A2-03 的处置状态、完整哈希冲突预览、独立保留规则和可恢�
 
 预算包括步骤数、执行时长、并发、产物大小、模型请求数及用户设置的费用上限。无法准确取得服务计费时只报告估算，不显示伪精确金额。触顶进入可解释的等待/终止状态，不能让模型无限规划或反复重试。
 
+### 8.1 Agent 外发默认预算（用户可见，A3-11）
+
+以下数值是 Agent 外发对用户可见的默认硬上限，也是**唯一权威出处**；其他文档只链接、不复制。它们由 Rust 常量持有并与本表逐项一致：
+
+| 项 | 默认上限 | Rust 常量 |
+|---|---|---|
+| 每 run HTTP attempt 数 | 8 | `MAX_RUN_ATTEMPTS` |
+| 单 run 时长 | 180 秒 | `RUN_TIMEOUT` |
+| 每 attempt 请求体 | 2 MiB | `MAX_REQUEST_BYTES` |
+| 每 attempt 响应体 | 1 MiB | `MAX_RESPONSE_BYTES` |
+| 每 attempt max output | 默认 4,096，硬上限 8,192 provider tokens | `MAX_OUTPUT_TOKENS`（硬上限；Host 自适应预算默认 4096） |
+| 每连接声明上下文窗口 | 默认 32,768，硬上限 4,000,000 tokens | `DEFAULT_CONTEXT_WINDOW` / `MAX_CONTEXT_WINDOW`（来自 `ai_connections.context_window` 幂等列，随 `gatewayLease` 下发） |
+
+补充实现上限：每 Host 并发 ≤ 8 个活跃 attempt（`MAX_ACTIVE_ATTEMPTS`）、单帧 ≤ 64 KiB（`MAX_SSE_LINE_BYTES`）、请求解码块 ≤ 44 KiB（`MAX_CHUNK_BYTES`）。输出预算是**自适应**的：Host 每轮向 Pi 声明 `max_tokens`（默认 4096），且 pi-ai 会按 `contextWindow - 已用上下文 - CONTEXT_SAFETY_TOKENS(4096)` 进一步钳制；Rust `MAX_OUTPUT_TOKENS = 8192` 只是硬上限，任何请求 declared `max_tokens` 必须落在 `1..=8192`。触顶以可解释的等待/终止呈现；预算与计数在 Rust 持有，重置只由新 run 完成。上下文窗口由连接配置（`context_window` 幂等列，缺省 32768）经 `gatewayLease` 下发真实值，Host 用它驱动 Pi 内置自动压缩（阈值/overflow/可恢复 length 三路），不再写死 32768。用户可配置默认值与确认政策在 A3-11 落地后继续细化，但不得放宽上述上限而不更新本表与代码常量。
+
 ## 9. 恢复备份、升级与多入口维护
 
 维护开始先阻止新操作和 MCP/插件提交，等待或安全取消受影响任务，暂停 Pi sidecar，取得现有数据库维护锁后备份/恢复。恢复完成更新 libraryEpoch，废弃旧计划、集合、资源句柄和待批准任务。外部客户端收到明确维护/库已变更错误。

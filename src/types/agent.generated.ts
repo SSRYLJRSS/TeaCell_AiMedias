@@ -217,9 +217,7 @@ export const capabilityDescriptors = {
     "input": "PrepareSelectionInput",
     "access": "prepare",
     "callers": [
-      "gui",
-      "pi",
-      "mcp"
+      "gui"
     ],
     "approval": "none"
   },
@@ -227,9 +225,7 @@ export const capabilityDescriptors = {
     "input": "SubmitPlanInput",
     "access": "submit",
     "callers": [
-      "gui",
-      "pi",
-      "mcp"
+      "gui"
     ],
     "approval": "permanent_trash"
   },

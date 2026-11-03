@@ -22,7 +22,14 @@ export default function SideBar() {
   const activeKey = filter.trashOnly ? "trash" : filter.untaggedOnly ? null : filter.assetType;
 
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)]">
+    // pb-32 = 底部安全区（M-11 第五次真机补证：占位高度 = 底栏 56 + 入口 48 + 间距 8 = 112，原 pb-32=96 在 1200×800/DPI 下仍差 20px，打标页最后一行实测被压 108×28px²，故抬到 pb-32=128）。收起态悬浮助手入口是 fixed 浮层，固定在左下角，
+    // 会盖住左侧栏最底部约 65px 的可点内容。只给滚动内容加内边距不够——默认滚动位置下
+    // 末行仍然落在入口下面（打标页批次列表就这样被压住）。把安全区放在 aside 上，
+    // 滚动容器底边整体上移，任何滚动位置都不会有内容落到入口底下。
+    <aside
+      className="flex w-56 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)] pb-32"
+      data-testid="library-side-panel"
+    >
       {/* 类型区 */}
       <div className="border-b border-[var(--color-border)] px-3 py-3">
         <h3 className="ui-section-title px-2 pb-2">
@@ -78,7 +85,12 @@ export default function SideBar() {
             </button>
           </div>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-2">
+        {/* 滚动正文自身不再留底部安全区——安全区由 aside（library-side-panel）承担，
+            否则安全区会被算在滚动内容里，滚到底时多出一段空白却仍挡不住默认位置的行。 */}
+        <div
+          className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-2"
+          data-testid="library-tag-scroll"
+        >
           {tagMode === "smart"
             ? <TagTree onManage={() => setManageOpen(true)} />
             : <MetadataPanel />}

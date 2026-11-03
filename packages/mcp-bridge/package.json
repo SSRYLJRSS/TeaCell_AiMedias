@@ -1,0 +1,13 @@
+{
+  "name": "teacell-mcp-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": "24.19.0"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node --check src/log.mjs && node --check src/protocol.mjs && node --check src/ipc.mjs && node --check src/bridge.mjs && node --check src/server.mjs"
+  }
+}

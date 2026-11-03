@@ -1,6 +1,7 @@
 //! Host-only context. Adapters construct this after authentication, never from tool input.
 use super::agent::{
-    AgentErrorCode, CallerKind, CapabilityId, LibraryScope, ResourceRef, CAPABILITY_DESCRIPTORS,
+    AgentErrorCode, CallerKind, CapabilityDescriptor, CapabilityId, LibraryScope, ResourceRef,
+    CAPABILITY_DESCRIPTORS,
 };
 
 /// Deliberately has no serde implementation. This cannot be a Tauri/MCP input record.
@@ -19,6 +20,18 @@ pub struct CallerContext {
     pub grant_epoch: ResourceRef,
     pub library: LibraryScope,
     pub origin_chain: Vec<ResourceRef>,
+}
+
+/// The frozen descriptor for a capability, when the table has one.
+///
+/// Callers that must decide something *before* handing work to the domain layer
+/// (for example "is this a write, therefore blocked during maintenance") should
+/// read `access` from here rather than hard-code a list of write capabilities:
+/// a hand-written list silently stops covering the next capability added.
+pub fn capability_descriptor(capability: CapabilityId) -> Option<&'static CapabilityDescriptor> {
+    CAPABILITY_DESCRIPTORS
+        .iter()
+        .find(|value| value.capability == capability)
 }
 
 /// Entry visibility only. Resource ownership, grants and approval need separate checks.

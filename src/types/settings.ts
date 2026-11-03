@@ -79,6 +79,40 @@ export interface Settings {
   tutorialPromptHandled?: boolean;
   /** FB2-01/02/03/08：外观与交互设置（素材网格档位/比例、悬停预览、色条） */
   appearance: Appearance;
+  /** A3-05：底栏内置快捷项与「设置」固定项 */
+  navigation: Navigation;
+  /**
+   * A3-09：是否显示应用内悬浮助手入口。
+   *
+   * 默认开启；关掉只隐藏浮层入口，不取消任何已在执行的任务，
+   * 也不影响完整助手页。旧设置缺字段时由归一层按开启处理，
+   * 因此消费方必须按「!== false 即为开启」判断。
+   */
+  floatingAssistant?: boolean;
+}
+
+/**
+ * A3-05：底栏可放入的内置功能 id（受控目录，PRD 第 8 节）。
+ *
+ * 只接受这些稳定 id，不接受任意 URL、命令或可执行文件标识。
+ * 权威声明点在 `src-tauri/src/db/settings.rs` 的 `NAVIGATION_SHORTCUT_IDS`；
+ * 本数组只用于前端类型与展示顺序，运行期合法值仍由后端归一化决定。
+ */
+export const NAVIGATION_SHORTCUT_IDS = ["import", "library", "ai", "treasure"] as const;
+
+export type NavigationShortcutId = (typeof NAVIGATION_SHORTCUT_IDS)[number];
+
+export interface NavigationShortcut {
+  id: NavigationShortcutId;
+  /** 是否在底栏显示；隐藏不删除功能或数据 */
+  visible: boolean;
+}
+
+export interface Navigation {
+  /** 用户排序后的内置快捷项；空数组 = 用户主动隐藏了全部入口 */
+  shortcuts: NavigationShortcut[];
+  /** 把「设置」固定到底栏 */
+  settingsPinned: boolean;
 }
 
 /** FB2-01 格子尺寸档位表（约 1.25× 等比）。索引存入设置，不存像素值——

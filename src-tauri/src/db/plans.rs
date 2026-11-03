@@ -46,6 +46,10 @@ pub struct PlanRecord {
     pub approval_expires_at: Option<i64>,
     pub consumed_at: Option<i64>,
     pub consumed_operation_id: Option<String>,
+    /// Which adapter identity created the plan (gui/pi/mcp). A5-02 needs this so
+    /// the review surface can name an external caller instead of guessing from
+    /// the principal id, and `None` on pre-A5-02 rows is honest: unknown origin.
+    pub origin_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +83,7 @@ pub struct NewPlan {
     pub grant_epoch: String,
     pub created_at: i64,
     pub expires_at: i64,
+    pub origin_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +210,12 @@ pub(super) fn migrate_structure(conn: &Connection) -> AppResult<()> {
     if !columns.iter().any(|column| column == "details_json") {
         conn.execute_batch("ALTER TABLE plans ADD COLUMN details_json TEXT")?;
     }
+    // A5-02: which adapter prepared the plan. Nullable on purpose so rows written
+    // before this column existed stay "unknown" instead of being back-filled with
+    // a guess the review surface would then display as fact.
+    if !columns.iter().any(|column| column == "origin_kind") {
+        conn.execute_batch("ALTER TABLE plans ADD COLUMN origin_kind TEXT")?;
+    }
     Ok(())
 }
 
@@ -215,9 +226,9 @@ pub fn insert_plan(conn: &Connection, plan: &NewPlan) -> AppResult<()> {
             plan_hash,scope_ref,source_ref,selection_ref,target_ref,service_ref,
             service_revision,model,item_count,summary,details_json,max_requests,max_tokens,max_seconds,
             max_items,currency,amount_microunits,library_id,library_epoch,grant_epoch,
-            review_status,created_at,expires_at
+            review_status,created_at,expires_at,origin_kind
          ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-                  ?21,?22,?23,?24,?25,?26,?27,'pending',?28,?29)",
+                  ?21,?22,?23,?24,?25,?26,?27,'pending',?28,?29,?30)",
         rusqlite::params![
             plan.plan_id,
             plan.principal_id,
@@ -248,6 +259,7 @@ pub fn insert_plan(conn: &Connection, plan: &NewPlan) -> AppResult<()> {
             plan.grant_epoch,
             plan.created_at,
             plan.expires_at,
+            plan.origin_kind,
         ],
     )?;
     Ok(())
@@ -259,7 +271,7 @@ const PLAN_COLUMNS: &str =
         service_revision,model,item_count,summary,details_json,max_requests,max_tokens,max_seconds,
         max_items,currency,amount_microunits,library_id,library_epoch,grant_epoch,
         review_status,created_at,expires_at,approved_at,approval_expires_at,
-        consumed_at,consumed_operation_id";
+        consumed_at,consumed_operation_id,origin_kind";
 
 fn map_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
     Ok(PlanRecord {
@@ -297,6 +309,7 @@ fn map_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
         approval_expires_at: row.get(31)?,
         consumed_at: row.get(32)?,
         consumed_operation_id: row.get(33)?,
+        origin_kind: row.get(34)?,
     })
 }
 
@@ -323,6 +336,45 @@ pub fn pending_plans_for_library(
           ORDER BY created_at DESC"
     ))?;
     let rows = statement.query_map(rusqlite::params![library_id, library_epoch, now], map_plan)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 会话归属：按计划行上持久化的 `session_id` 精确取回该会话产生的计划。
+///
+/// A3-04：计划归属必须由可信后端裁决。`plans.session_id` 由 `plans::prepare_plan`
+/// 从调用方上下文写入（Pi 适配器的 session 就是会话引用，见
+/// `agent_runtime::capabilities::build_caller`），不是前端传参，因此可以据此把助手在
+/// 某个会话里产生的计划还原到该会话，而不必按「这段时间新增了哪些计划」猜测。
+///
+/// 这里**不**做 pending 过滤：已批准、已过期、已被消费的计划同样是该会话的历史卡片，
+/// 过滤掉会让用户重开会话后看不到自己批准过的计划。
+pub fn plans_for_session(
+    conn: &Connection,
+    library_id: &str,
+    library_epoch: &str,
+    session_id: &str,
+    limit: i64,
+) -> AppResult<Vec<PlanRecord>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {PLAN_COLUMNS} FROM plans
+          WHERE library_id=?1 AND library_epoch=?2 AND session_id=?3
+          ORDER BY created_at DESC LIMIT ?4"
+    ))?;
+    let rows = statement.query_map(
+        rusqlite::params![library_id, library_epoch, session_id, limit],
+        map_plan,
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 一个计划派生出的全部任务。A3-04 的任务卡按计划归属还原，操作本身不存会话。
+pub fn operations_for_plan(conn: &Connection, plan_id: &str) -> AppResult<Vec<OperationRecord>> {
+    let mut statement = conn.prepare(
+        "SELECT operation_id,plan_id,principal_id,capability,idempotency_key,library_id,
+                library_epoch,state,phase,revision,total,completed,failed
+           FROM operations WHERE plan_id=?1 ORDER BY rowid",
+    )?;
+    let rows = statement.query_map([plan_id], map_operation)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -365,6 +417,18 @@ pub fn invalidate_plan(conn: &Connection, plan_id: &str, status: &str) -> AppRes
     Ok(())
 }
 
+/// A5-02 rejection. Unlike `invalidate_plan` this reports whether it actually hit,
+/// so a trusted reviewer is never told a plan was rejected when a concurrent
+/// approval had already moved it on.
+pub fn reject_plan(conn: &Connection, plan_id: &str) -> AppResult<bool> {
+    let changed = conn.execute(
+        "UPDATE plans SET review_status='invalidated'
+          WHERE plan_id=?1 AND review_status='pending'",
+        [plan_id],
+    )?;
+    Ok(changed == 1)
+}
+
 pub fn operation(conn: &Connection, operation_id: &str) -> AppResult<Option<OperationRecord>> {
     Ok(conn
         .query_row(
@@ -394,6 +458,41 @@ pub fn operation_by_idempotency(
             map_operation,
         )
         .optional()?)
+}
+
+/// 未结束的操作用于「开始迁移会影响哪些任务」的投影。
+///
+/// 只看当前总仓代次：旧代次的遗留行已被换根语义废弃，把它们算进影响面会让用户
+/// 永远无法开始迁移，而它们也不可能再被派发。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightOperations {
+    pub total: i64,
+    pub by_capability: Vec<(String, i64)>,
+}
+
+/// A4-06：卡片要求预检区展示「任务影响」。`queued`/`running`/`interrupted`/
+/// `outcome_unknown` 都还没有确定终态，进入维护都会被打断或搁置。
+pub fn in_flight_operations(
+    conn: &Connection,
+    library_id: &str,
+    library_epoch: &str,
+) -> AppResult<InFlightOperations> {
+    let mut statement = conn.prepare(
+        "SELECT capability, count(*) FROM operations
+          WHERE library_id=?1 AND library_epoch=?2
+            AND state IN ('queued','running','interrupted','outcome_unknown')
+          GROUP BY capability ORDER BY capability",
+    )?;
+    let by_capability = statement
+        .query_map(rusqlite::params![library_id, library_epoch], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = by_capability.iter().map(|(_, count)| *count).sum();
+    Ok(InFlightOperations {
+        total,
+        by_capability,
+    })
 }
 
 fn map_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRecord> {

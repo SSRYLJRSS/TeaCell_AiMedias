@@ -277,6 +277,35 @@ pub enum CapabilityId {
     WorkflowsSubmit,
 }
 
+impl CapabilityId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AssetsSearch => "assets.search",
+            Self::ImportsPrepare => "imports.prepare",
+            Self::ImportsSubmit => "imports.submit",
+            Self::TaggingPrepare => "tagging.prepare",
+            Self::TaggingSubmit => "tagging.submit",
+            Self::ExportsPrepare => "exports.prepare",
+            Self::ExportsSubmit => "exports.submit",
+            Self::AssetsMovePrepare => "assets.move.prepare",
+            Self::AssetsMoveSubmit => "assets.move.submit",
+            Self::AssetsTrashPrepare => "assets.trash.prepare",
+            Self::AssetsTrashSubmit => "assets.trash.submit",
+            Self::AssetsRestorePrepare => "assets.restore.prepare",
+            Self::AssetsRestoreSubmit => "assets.restore.submit",
+            Self::TrashEmptyPrepare => "trash.empty.prepare",
+            Self::TrashEmptySubmit => "trash.empty.submit",
+            Self::OperationsGet => "operations.get",
+            Self::OperationsCancel => "operations.cancel",
+            Self::OperationsResume => "operations.resume",
+            Self::PlansApprove => "plans.approve",
+            Self::WorkflowsLoad => "workflows.load",
+            Self::WorkflowsPrepare => "workflows.prepare",
+            Self::WorkflowsSubmit => "workflows.submit",
+        }
+    }
+}
+
 pub const MAX_RESPONSE_BYTES: usize = 65536;
 pub const MAX_PAGE_ITEMS: usize = 100;
 pub const MAX_WORKFLOW_STEPS: usize = 8;
@@ -408,7 +437,7 @@ pub const CAPABILITY_DESCRIPTORS: &[CapabilityDescriptor] = &[
         input_type: "PrepareSelectionInput",
         output_type: "PlanPreview",
         access: AccessKind::Prepare,
-        callers: &[CallerKind::Gui, CallerKind::Pi, CallerKind::Mcp],
+        callers: &[CallerKind::Gui],
         approval: ApprovalRequirement::None,
     },
     CapabilityDescriptor {
@@ -416,7 +445,7 @@ pub const CAPABILITY_DESCRIPTORS: &[CapabilityDescriptor] = &[
         input_type: "SubmitPlanInput",
         output_type: "SubmissionResult",
         access: AccessKind::Submit,
-        callers: &[CallerKind::Gui, CallerKind::Pi, CallerKind::Mcp],
+        callers: &[CallerKind::Gui],
         approval: ApprovalRequirement::PermanentTrash,
     },
     CapabilityDescriptor {

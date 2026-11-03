@@ -1318,7 +1318,7 @@ function EnumMultiSelect({ items, showCount = true, values, onChange }: { items:
       {items.slice(0, 200).map((item) => {
         const on = selected.has(item.value);
         return (
-          <button key={item.value} type="button" role="checkbox" aria-checked={on} onClick={() => toggle(item.value)} className={`inline-flex h-6 max-w-full items-center gap-1 rounded-full border px-2 text-[11px] ${on ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-accent)]" : "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)]"}`}>
+          <button key={item.value} type="button" role="checkbox" aria-checked={on} onClick={() => toggle(item.value)} title={item.label} className={`inline-flex h-6 max-w-full items-center gap-1 rounded-full border px-2 text-[11px] ${on ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-accent)]" : "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)]"}`}>
             <span className="truncate">{item.label}</span>
             {showCount && <span className="shrink-0 text-[10px] opacity-70">({item.count})</span>}
           </button>

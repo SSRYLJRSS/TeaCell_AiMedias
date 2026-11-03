@@ -1,18 +1,33 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import BottomBar, { type TabKey } from "@/components/layout/BottomBar";
 import TitleBar from "@/components/layout/TitleBar";
 import StartupSkeleton from "@/components/common/StartupSkeleton";
-import ImportPage from "@/pages/ImportPage";
-import LibraryPage from "@/pages/LibraryPage";
-import SuperSearchPage from "@/pages/SuperSearchPage";
-import AiTaggingPage from "@/pages/AiTaggingPage";
-import SettingsPage from "@/pages/SettingsPage";
+import AssistantSkeleton from "@/components/assistant/AssistantSkeleton";
+// 助手页刻意保持静态导入：它的重依赖（Markdown/shiki/mermaid/katex）都在组件内部按需
+// 动态 import，静态壳本身很轻；而它的首屏必须与其他页共用同一个 `main` 壳层、同步可见
+// （见 App 统一视觉体系测试）。其余页面走路由懒加载，避免首屏下载全部页面 chunk。
+import AssistantPage from "@/pages/AssistantPage";
+
+// WF-1 P0-2：路由级懒加载。首屏只加载当前页 chunk，切页时才下载其余页面，
+// 显著降低首屏 JS 体积与解析时间；`showSkeleton` 仍负责启动期（设置/平台未就绪）。
+const ImportPage = lazy(() => import("@/pages/ImportPage"));
+const LibraryPage = lazy(() => import("@/pages/LibraryPage"));
+const SuperSearchPage = lazy(() => import("@/pages/SuperSearchPage"));
+const AiTaggingPage = lazy(() => import("@/pages/AiTaggingPage"));
+const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
+const TreasurePage = lazy(() => import("@/pages/TreasurePage"));
 import PageErrorBoundary from "@/components/common/PageErrorBoundary";
-import Modal from "@/components/common/Modal";
-import Button from "@/components/common/Button";
+import OnboardingWizard from "@/components/onboarding/OnboardingWizard";
+import FloatingAssistant from "@/components/assistant/FloatingAssistant";
+import WorkflowPanel from "@/components/workflows/WorkflowPanel";
+import PendingPlansPanel from "@/components/plans/PendingPlansPanel";
+import { LibraryMaintenanceBanner } from "@/components/settings/MigrationWizard";
 import { getHelpPageUrl, openHelpPage } from "@/api/settings";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useWorkflowPanelStore } from "@/stores/workflowPanelStore";
+import { usePendingPlansStore } from "@/stores/pendingPlansStore";
+import { useAgentSessionStore } from "@/stores/agentSessionStore";
 import { selectNativeWindowControls, usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
@@ -22,7 +37,7 @@ import { on } from "@/api/client";
 import { startImportDropDispatcher, stopImportDropDispatcher } from "@/utils/importDropDispatcher";
 import { logger } from "@/utils/logger";
 
-type PageKey = TabKey | "settings" | "superSearch";
+type PageKey = TabKey | "settings" | "superSearch" | "assistant";
 
 /** FB4-03（§6.5）：导入后置色板完成事件（只允许 import 来源发送；手动回算不发） */
 interface PaletteUpdatedEvent {
@@ -36,6 +51,13 @@ interface PaletteUpdatedEvent {
 
 /** 首屏骨架最长等待：设置/素材 IPC 若异常挂起，最多等这么久就放行页面（§3.2 超时兜底） */
 const STARTUP_MAX_WAIT_MS = 6000;
+
+/**
+ * WP3-B「极限秒开」：进入应用后延迟这么久再在空闲窗口预热 Agent Host。
+ * 刻意晚于首屏 IPC（设置/平台/素材），避免冷启动的 node 拉起与解压抢首屏主线程；
+ * 用户在库里停留期间即可完成预热，切到助手页时 Host 通常已 ready。
+ */
+const HOST_WARMUP_DELAY_MS = 1200;
 
 /** 路由骨架：4 页 + 全局底栏（设置入口位于库页顶栏左侧，底栏仅 3 个主入口） */
 export default function App() {
@@ -51,6 +73,8 @@ export default function App() {
   const [tutorialCopied, setTutorialCopied] = useState(false);
   const tutorialPromptChecked = useRef(false);
   const pageRef = useRef<PageKey>("library");
+  const workflowPanelOpen = useWorkflowPanelStore((s) => s.open);
+  const pendingPlansOpen = usePendingPlansStore((s) => s.open);
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
@@ -94,6 +118,47 @@ export default function App() {
       logger.error("导入拖拽监听启动失败", { error: error instanceof Error ? error.message : String(error) });
     });
     return stopImportDropDispatcher;
+  }, []);
+
+  // WP3-B「极限秒开」：进入应用并让首屏交互稳定后，在空闲窗口后台预热 Agent Host。
+  // 幂等（ensureHost 模块级去重 + Rust 侧多实例保护）、失败静默、不弹横幅、绝不阻塞首屏。
+  // 测试环境跳过，避免改变既有 App/助手用例的调用时序与断言。
+  useEffect(() => {
+    if (typeof import.meta.env !== "undefined" && import.meta.env.MODE === "test") return;
+    let cancelled = false;
+    const warm = () => {
+      if (cancelled) return;
+      markStartup("host_warmup_started");
+      void useAgentSessionStore
+        .getState()
+        .ensureHost()
+        .then(() => {
+          if (!cancelled) markStartup("host_warmup_ready");
+        })
+        .catch(() => {
+          // 非 Tauri / Host 资源缺失时静默；助手页会自行呈现启动中/错误四态。
+        });
+    };
+    const w = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    let idleHandle: number | null = null;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      if (typeof w.requestIdleCallback === "function") {
+        idleHandle = w.requestIdleCallback(warm, { timeout: 2000 });
+      } else {
+        warm();
+      }
+    }, HOST_WARMUP_DELAY_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (idleHandle !== null && typeof w.cancelIdleCallback === "function") {
+        w.cancelIdleCallback(idleHandle);
+      }
+    };
   }, []);
 
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）
@@ -216,73 +281,75 @@ export default function App() {
         </div>
       )}
 
+      {/* A4-05：维护期间只停写入与自动清理，读取和旧会话继续可用。 */}
+      <LibraryMaintenanceBanner />
+
       <main className={viewerOpen ? "flex-1 min-h-0" : "flex-1 min-h-0 pb-14"}>
         {showSkeleton ? (
           <StartupSkeleton />
         ) : (
           /* A-1：页面级 Error Boundary——路由页运行时异常不白屏；key 切换让每个页面独立边界 */
           <PageErrorBoundary key={page} onReset={() => setPage(page)} onBack={() => setPage("library")}>
-            {page === "import" && <ImportPage />}
-            {page === "library" && <LibraryPage />}
-            {page === "superSearch" && <SuperSearchPage />}
-            {page === "ai" && <AiTaggingPage />}
-            {page === "settings" && <SettingsPage onBack={() => setPage(prevPage)} />}
+            <Suspense fallback={<StartupSkeleton />}>
+              {page === "import" && <ImportPage />}
+              {page === "library" && <LibraryPage />}
+              {page === "superSearch" && <SuperSearchPage />}
+              {page === "ai" && <AiTaggingPage />}
+              {page === "settings" && <SettingsPage onBack={() => setPage(prevPage)} />}
+              {page === "assistant" && (
+                <Suspense fallback={<AssistantSkeleton />}>
+                  <AssistantPage />
+                </Suspense>
+              )}
+              {page === "treasure" && <TreasurePage />}
+            </Suspense>
           </PageErrorBoundary>
         )}
       </main>
 
       {!viewerOpen && (
-        <BottomBar current={page} onNavigate={navigate} onOpenSuperSearch={() => navigate("superSearch")} />
+        <BottomBar
+          current={page}
+          onNavigate={navigate}
+          onOpenSuperSearch={() => navigate("superSearch")}
+          onOpenAssistant={() => navigate("assistant")}
+        />
       )}
 
-      <Modal
+      {/* A3-09：应用内悬浮助手。查看器打开时隐藏（避免遮挡全屏预览），
+          完整助手页里也不显示（入口已在那里）；关掉开关只隐藏，不影响任务。 */}
+      {!viewerOpen && page !== "assistant" && settings?.floatingAssistant !== false && (
+        <FloatingAssistant />
+      )}
+
+      {/* A4-07：常用流程面板。入口有两处（任务卡的「保存为常用流程」与助手页 header），
+          面板本身挂在应用层只渲染一次，避免两处各存一份流程列表状态。
+          助手页把它嵌进右侧栏（选项卡），所以那一页不渲染这里的模态框，
+          否则同一份内容会同时以「模态框 + 侧栏」出现两次。 */}
+      {page !== "assistant" && workflowPanelOpen && <WorkflowPanel />}
+
+      {/* A5-02：待审计划面板。外部客户端（MCP）准备的计划不属于任何本地会话，
+          `linkedPlans` 结构上装不进它们，所以「外部准备 → 茶馆确认」需要一个
+          不依赖会话的入口。入口在助手页头部与 MCP 设置面板，面板挂应用层只渲染一次。
+          同样地，助手页里它以右侧栏选项卡的形式出现，那份模态框不重复渲染。 */}
+      {page !== "assistant" && pendingPlansOpen && <PendingPlansPanel />}
+
+      <OnboardingWizard
         open={showTutorialPrompt}
-        title="使用教程"
-        onClose={() => void finishTutorialPrompt()}
-        footer={
-          <>
-            <Button disabled={tutorialBusy} onClick={() => void finishTutorialPrompt()}>
-              以后再看
-            </Button>
-            {tutorialSaveFailed ? (
-              <Button variant="primary" disabled={tutorialBusy} onClick={continueAfterTutorialSaveFailure}>
-                继续使用
-              </Button>
-            ) : tutorialError ? (
-              <Button variant="primary" disabled={tutorialBusy} onClick={() => void finishTutorialPrompt()}>
-                {tutorialCopied ? "已复制，关闭" : "关闭"}
-              </Button>
-            ) : (
-              <Button variant="primary" disabled={tutorialBusy} onClick={() => void openTutorial()}>
-                {tutorialBusy ? "正在打开…" : "查看新手教程"}
-              </Button>
-            )}
-          </>
-        }
-      >
-        <div className="flex flex-col gap-3">
-          <p>欢迎使用茶馆，是否查看使用教程？</p>
-          {tutorialError && <p role="alert" className="text-xs text-[var(--color-danger)]">{tutorialError}</p>}
-          {tutorialUrl && (
-            <div className="flex flex-col gap-2">
-              <label htmlFor="tutorial-help-url" className="text-xs text-[var(--color-text-secondary)]">
-                自动打开失败时，可复制此地址到浏览器：
-              </label>
-              <textarea
-                id="tutorial-help-url"
-                readOnly
-                rows={3}
-                value={tutorialUrl}
-                onFocus={(event) => event.currentTarget.select()}
-                className="ui-control w-full resize-y rounded-md px-2 py-1.5 text-xs"
-              />
-              <Button onClick={() => void copyTutorialUrl()}>
-                {tutorialCopied ? "已复制文档地址" : "复制文档地址"}
-              </Button>
-            </div>
-          )}
-        </div>
-      </Modal>
+        persistError={tutorialSaveFailed ? (tutorialError ?? "无法把「已完成引导」写回设置。") : null}
+        onFinish={() => void finishTutorialPrompt()}
+        onContinueAnyway={continueAfterTutorialSaveFailure}
+        onOpenTutorial={openTutorial}
+        tutorialBusy={tutorialBusy}
+        tutorialError={tutorialError}
+        tutorialUrl={tutorialUrl}
+        tutorialCopied={tutorialCopied}
+        onCopyTutorialUrl={copyTutorialUrl}
+        onOpenSettings={() => {
+          navigate("settings");
+          setShowTutorialPrompt(false);
+        }}
+      />
     </div>
   );
 }

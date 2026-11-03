@@ -11,12 +11,21 @@ import { dirname, join, resolve } from 'node:path';
 import { URL, fileURLToPath } from 'node:url';
 import { FrameDecoder, encodeFrame, SCHEMA_VERSION } from '../src/protocol.mjs';
 import { ensureSessionsDirectory, verifyAgentDirectory } from '../src/paths.mjs';
+import { PI_TOOL_NAMES } from '../src/tools.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const nodePath = join(repositoryRoot, 'artifacts', 'agent-runtime', 'node-v24.19.0-win-x64', 'node.exe');
 const bootstrapPath = fileURLToPath(new URL('../src/bootstrap.mjs', import.meta.url));
 const appBuild = '1.0.2';
 const supportedRuntime = process.platform === 'win32' && process.arch === 'x64';
+
+/**
+ * A3-10 的 `conversation.open` 载荷：档位 + 该档应注册的工具集合。
+ * 除权限档位用例之外，其它用例都用 `full` 保持既有行为不变。
+ */
+function openArgs(conversationId, mode, permission = 'full', tools = [...PI_TOOL_NAMES]) {
+  return { conversationId, mode, permission, tools };
+}
 
 class HostClient {
   constructor(child, instance) {
@@ -187,7 +196,7 @@ test('session discovery rejects a junction entry before reading its target', {
 
     client = spawnHost(agentDir);
     await client.waitFor(frame => frame.type === 'ready');
-    const opened = await client.request('conversation.open', { conversationId, mode: 'resume' });
+    const opened = await client.request('conversation.open', openArgs(conversationId, 'resume'));
     assert.equal(opened.type, 'error');
     assert.equal(opened.code, 'SESSION_OPEN_FAILED');
     assert.equal(await readFile(join(outside, 'session.jsonl'), 'utf8'), outsideSession);
@@ -222,6 +231,32 @@ async function waitForExit(child) {
   }
 }
 
+test('resuming a conversation with no session file reports SESSION_NOT_FOUND, not SESSION_OPEN_FAILED', {
+  skip: !supportedRuntime,
+  timeout: 30000,
+}, async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), 'teacell-agent-missing-session-'));
+  let client;
+  try {
+    client = spawnHost(agentDir);
+    await client.waitFor(frame => frame.type === 'ready');
+    const conversationId = `conversation_${randomUUID().replaceAll('-', '')}`;
+    const resumed = await client.request('conversation.open', openArgs(conversationId, 'resume'));
+    assert.equal(resumed.type, 'error');
+    // 前端只有在拿到这个码时才允许把 resume 降级成 new；其余错误都必须保留会话。
+    assert.equal(resumed.code, 'SESSION_NOT_FOUND');
+    assert.equal(client.child.exitCode, null, 'a command rejection must not terminate the Host');
+
+    const recreated = await client.request('conversation.open', openArgs(conversationId, 'new'));
+    assert.equal(recreated.type, 'ack');
+    assert.equal((await client.request('host.shutdown')).type, 'ack');
+    assert.equal(await waitForExit(client.child), 0);
+  } finally {
+    await stopClient(client);
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
 test('bundled Windows Node runs an offline Pi session, resumes it, and exits cleanly', {
   skip: !supportedRuntime,
   timeout: 30000,
@@ -237,13 +272,13 @@ test('bundled Windows Node runs an offline Pi session, resumes it, and exits cle
     client = spawnHost(agentDir);
     const ready = await client.waitFor(frame => frame.type === 'ready');
     assert.equal(ready.protocol, 1);
-    assert.equal(ready.schemaVersion, 3);
+    assert.equal(ready.schemaVersion, SCHEMA_VERSION);
     assert.equal(ready.sdk, '1.0.4');
     assert.equal(ready.modelNetwork, false);
     assert.equal(ready.gatewayProtocol, 1);
-    assert.deepEqual(ready.tools, []);
+    assert.deepEqual(ready.tools, [...PI_TOOL_NAMES]);
 
-    const opened = await client.request('conversation.open', { conversationId, mode: 'new' });
+    const opened = await client.request('conversation.open', openArgs(conversationId, 'new'));
     assert.equal(opened.type, 'ack');
     const sessionId = opened.sessionId;
     const runId = `run_${randomUUID().replaceAll('-', '')}`;
@@ -254,9 +289,18 @@ test('bundled Windows Node runs an offline Pi session, resumes it, and exits cle
     const settled = await client.waitFor(frame => frame.type === 'settled' && frame.runId === runId);
     assert.equal(settled.aborted, false);
 
+    // conversation.history 只读回读：已打开会话直接投影，必须包含本轮用户文本；
+    // 不写库、不重放，且 ACK 精确回本会话 id。
+    const history = await client.request('conversation.history', { conversationId });
+    assert.equal(history.type, 'ack');
+    assert.equal(history.conversationId, conversationId);
+    assert.ok(Array.isArray(history.messages));
+    assert.ok(history.messages.some(message => message.role === 'user' && message.text === '测试离线 Host'));
+    assert.ok(history.messages.every(message => typeof message.id === 'string' && message.id.length > 0));
+
     const closed = await client.request('conversation.close', { conversationId });
     assert.equal(closed.type, 'ack');
-    const resumed = await client.request('conversation.open', { conversationId, mode: 'resume' });
+    const resumed = await client.request('conversation.open', openArgs(conversationId, 'resume'));
     assert.equal(resumed.type, 'ack');
     assert.equal(resumed.sessionId, sessionId);
 
@@ -285,9 +329,9 @@ test('schema v3 validates a model lease before accepting the run', {
   try {
     client = spawnHost(agentDir);
     const ready = await client.waitFor(frame => frame.type === 'ready');
-    assert.equal(ready.schemaVersion, 3);
+    assert.equal(ready.schemaVersion, SCHEMA_VERSION);
     assert.equal(ready.gatewayProtocol, 1);
-    await client.request('conversation.open', { conversationId, mode: 'new' });
+    await client.request('conversation.open', openArgs(conversationId, 'new'));
 
     const rejectedLease = await client.request('conversation.send', {
       conversationId,
@@ -332,8 +376,8 @@ test('schema v3 forwards a safe gateway failure category and status with the run
     client = spawnHost(agentDir);
     client.gatewayFailure = { code: 'UPSTREAM_HTTP', status: 429 };
     const ready = await client.waitFor(frame => frame.type === 'ready');
-    assert.equal(ready.schemaVersion, 3);
-    await client.request('conversation.open', { conversationId, mode: 'new' });
+    assert.equal(ready.schemaVersion, SCHEMA_VERSION);
+    await client.request('conversation.open', openArgs(conversationId, 'new'));
     const requestId = client.send('conversation.send', {
       conversationId,
       runId,
@@ -404,20 +448,84 @@ test('recoverable command rejection keeps the Host and other sessions alive', {
     await client.waitFor(frame => frame.type === 'ready');
     const firstConversation = `conversation_${randomUUID().replaceAll('-', '')}`;
     const secondConversation = `conversation_${randomUUID().replaceAll('-', '')}`;
-    const first = await client.request('conversation.open', { conversationId: firstConversation, mode: 'new' });
+    const first = await client.request('conversation.open', openArgs(firstConversation, 'new'));
     assert.equal(first.type, 'ack');
 
-    const duplicate = await client.request('conversation.open', { conversationId: firstConversation, mode: 'new' });
+    const duplicate = await client.request('conversation.open', openArgs(firstConversation, 'new'));
     assert.equal(duplicate.type, 'error');
     assert.equal(duplicate.code, 'CONVERSATION_EXISTS');
     assert.equal(client.child.exitCode, null, 'a command rejection must not terminate the Host');
 
-    const second = await client.request('conversation.open', { conversationId: secondConversation, mode: 'new' });
+    const second = await client.request('conversation.open', openArgs(secondConversation, 'new'));
     assert.equal(second.type, 'ack');
-    const resumed = await client.request('conversation.open', { conversationId: firstConversation, mode: 'resume' });
+    const resumed = await client.request('conversation.open', openArgs(firstConversation, 'resume'));
     assert.equal(resumed.type, 'ack');
     assert.equal(resumed.sessionId, first.sessionId);
     assert.ok(client.pinRequests.every(frame => frame.fileName.endsWith(`_${frame.conversationId}.jsonl`)));
+
+    assert.equal((await client.request('host.shutdown')).type, 'ack');
+    assert.equal(await waitForExit(client.child), 0);
+  } finally {
+    await stopClient(client);
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test('A3-10 the Host registers exactly the session tool subset Rust sends', {
+  skip: !supportedRuntime,
+  timeout: 30000,
+}, async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), 'teacell-agent-permission-'));
+  let client;
+  try {
+    client = spawnHost(agentDir);
+    await client.waitFor(frame => frame.type === 'ready');
+
+    // 档位 → 工具集合的映射只存在于 Rust；Host 侧只证明「照单注册、不做加法」。
+    const readTools = [
+      'tea_assets_search',
+      'tea_operations_cancel',
+      'tea_operations_get',
+      'tea_workflows_load',
+    ];
+    const readConversation = `conversation_${randomUUID().replaceAll('-', '')}`;
+    const read = await client.request('conversation.open', openArgs(readConversation, 'new', 'read', readTools));
+    assert.equal(read.type, 'ack');
+    assert.deepEqual(read.tools, readTools);
+
+    // 重开会话不重建工具表，回读的仍必须是原来的裁剪结果。
+    const resumedRead = await client.request('conversation.open', openArgs(readConversation, 'resume', 'read', readTools));
+    assert.equal(resumedRead.type, 'ack');
+    assert.equal(resumedRead.sessionId, read.sessionId);
+    assert.deepEqual(resumedRead.tools, readTools);
+
+    const fullConversation = `conversation_${randomUUID().replaceAll('-', '')}`;
+    const full = await client.request('conversation.open', openArgs(fullConversation, 'new', 'full', [...PI_TOOL_NAMES]));
+    assert.equal(full.type, 'ack');
+    assert.deepEqual([...full.tools].sort(), [...PI_TOOL_NAMES].sort());
+
+    const rejections = [
+      ['unknown permission', openArgs(`conversation_${randomUUID().replaceAll('-', '')}`, 'new', 'admin')],
+      ['empty tool set', openArgs(`conversation_${randomUUID().replaceAll('-', '')}`, 'new', 'read', [])],
+      [
+        'tool outside the registered surface',
+        openArgs(`conversation_${randomUUID().replaceAll('-', '')}`, 'new', 'read', [...readTools, 'tea_plans_approve']),
+      ],
+      [
+        'duplicate tool name',
+        openArgs(`conversation_${randomUUID().replaceAll('-', '')}`, 'new', 'read', [...readTools, readTools[0]]),
+      ],
+      [
+        'missing tool set',
+        { conversationId: `conversation_${randomUUID().replaceAll('-', '')}`, mode: 'new', permission: 'read' },
+      ],
+    ];
+    for (const [label, payload] of rejections) {
+      const rejected = await client.request('conversation.open', payload);
+      assert.equal(rejected.type, 'error', label);
+      assert.equal(rejected.code, 'INVALID_COMMAND', label);
+    }
+    assert.equal(client.child.exitCode, null, 'a rejected permission payload must not terminate the Host');
 
     assert.equal((await client.request('host.shutdown')).type, 'ack');
     assert.equal(await waitForExit(client.child), 0);

@@ -2,10 +2,11 @@ import { TextDecoder } from 'node:util';
 import { Buffer } from 'node:buffer';
 
 export const PROTOCOL_VERSION = 1;
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 6;
 export const SDK_VERSION = '1.0.4';
 export const MAX_FRAME_BYTES = 64 * 1024;
 export const MAX_PROMPT_BYTES = 4096;
+export const MAX_CAPABILITY_PAYLOAD_BYTES = 32 * 1024;
 export const RESOURCE_TOKEN = /^[A-Za-z0-9_-]{16,128}$/;
 
 // Decode incrementally without retaining an unbounded stdout/stdin buffer.

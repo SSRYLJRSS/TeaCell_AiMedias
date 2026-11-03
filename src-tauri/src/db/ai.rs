@@ -1128,7 +1128,8 @@ fn confirm_suggestion_inner(
         "ai_local"
     };
 
-    let tag_ids = categorized_tag_ids(conn, tags)?;
+    // 让最终标签先在标签树里建好（父分面 + 子标签），下面的 final_pairs 才反查到 id。
+    categorized_tag_ids(conn, tags)?;
     let final_pairs: Vec<(String, String, i64)> = tags
         .iter()
         .flat_map(|(category, names)| {
@@ -1150,18 +1151,57 @@ fn confirm_suggestion_inner(
             })
         })
         .collect();
-    asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
+    // M-07（真机走查发现）：审核时**新增**的标签不是 AI 产出的，必须按人工来源落库。
+    // 否则 source=ai_local、source_batch_id=批次 → 撤销该批次会把用户手填的标签一起删掉
+    //（违反 docs/PRD.md R-37）且界面给手工标签挂「AI」角标。
+    // 判据：确认前 ai_suggestion_items 里是否已有同 (facet_key, normalized_name) 项。
+    // 必须在下面「补插审核期新增项」之前取快照，否则补插后所有标签都「已存在」。
+    let mut suggested_pairs: std::collections::HashSet<(String, String)> = Default::default();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT facet_key, normalized_name FROM ai_suggestion_items WHERE suggestion_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            suggested_pairs.insert(row?);
+        }
+    }
+    let mut ai_tag_ids: Vec<i64> = Vec::new();
+    let mut manual_tag_ids: Vec<i64> = Vec::new();
+    for (facet, normalized, tag_id) in &final_pairs {
+        let bucket = if suggested_pairs.contains(&(facet.clone(), normalized.clone())) {
+            &mut ai_tag_ids
+        } else {
+            &mut manual_tag_ids
+        };
+        if !bucket.contains(tag_id) {
+            bucket.push(*tag_id);
+        }
+    }
+    if !ai_tag_ids.is_empty() {
+        asset_tags::assign_inner(conn, &[asset_id], &ai_tag_ids, source, Some(batch_id))?;
+    }
+    if !manual_tag_ids.is_empty() {
+        // 人工来源：source='manual'、source_batch_id=NULL、review_state='manual'，
+        // 因此不被 undo_batch（`source_batch_id = 批次 AND source != 'manual'`）删除。
+        asset_tags::assign_inner(conn, &[asset_id], &manual_tag_ids, "manual", None)?;
+    }
     // A3：确认 = 用户审核通过。assign_inner 可能把同一批次的同一组标签同步给
     // RAW/JPG 同源文件，因此按批次 + 本次确认的 tag_id 晋升全部实际写入行。
-    // 这样同源副本也受“审核后永不被重打清理”的铁律保护；manual 行保持 manual。
-    let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "UPDATE asset_tags SET review_state = 'ai_reviewed'
-          WHERE source_batch_id = ?1 AND source != 'manual'
-            AND review_state = 'ai_unreviewed' AND tag_id IN ({placeholders})"
-    );
-    let params = std::iter::once(batch_id).chain(tag_ids.iter().copied());
-    conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    // 这样同源副本也受“审核后永不被重打清理”的铁律保护；manual 行保持 manual
+    //（人工来源没有 source_batch_id，下面这条按批次匹配的 UPDATE 不会命中它们）。
+    if !ai_tag_ids.is_empty() {
+        let placeholders = ai_tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE asset_tags SET review_state = 'ai_reviewed'
+              WHERE source_batch_id = ?1 AND source != 'manual'
+                AND review_state = 'ai_unreviewed' AND tag_id IN ({placeholders})"
+        );
+        let params = std::iter::once(batch_id).chain(ai_tag_ids.iter().copied());
+        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    }
     let original: String = conn.query_row(
         "SELECT suggested_tags FROM ai_suggestions WHERE id = ?1",
         [id],

@@ -1,9 +1,11 @@
 //! Strict request-body validation and lease-bound brokering for A3-02.
 //!
 //! The broker validates Pi 1.0.4 text routes, resolves credentials only inside
-//! Rust, and sends requests through an injected transport. Production currently
-//! installs the disabled transport until external routing is separately
-//! validated; tests inject deterministic in-memory fixtures.
+//! Rust, and sends requests through an injected transport. Production installs a
+//! `SwitchableGatewayTransport` that always forwards once a service is bound and
+//! its credential resolves — there is no user-visible online/offline switch
+//! (2026-11-01 ruling); only Rust-owned proxy configuration can be swapped live.
+//! Tests inject deterministic in-memory fixtures.
 
 use base64::Engine;
 use serde::Serialize;
@@ -15,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::error::{AppError, AppResult};
 use crate::services::ai_rate_limit::OwnedRequestPermit;
 use crate::services::credentials::{self, CredentialBackend};
 use crate::state::Database;
@@ -27,8 +30,120 @@ pub const MAX_RUN_ATTEMPTS: u8 = 8;
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_MESSAGES: usize = 512;
 const MAX_SYSTEM_BLOCKS: usize = 64;
-const MAX_OUTPUT_TOKENS: u64 = 2048;
+/// Upper bound (ceiling) for a single turn's `max_tokens`. The Host requests an
+/// adaptive budget (default 4096) that fails safe under long contexts; 8192 is
+/// the hard ceiling a leased request may ever declare. Raise together with
+/// docs (plans/v2/06-permissions-and-data-safety.md §8.1).
+pub const MAX_OUTPUT_TOKENS: u64 = 8192;
+const MAX_DECLARED_TOOLS: usize = 20;
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
+const MAX_TOOL_CALLS: usize = 20;
+const MAX_TOOL_CALL_ID_BYTES: usize = 128;
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 32 * 1024;
+const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
+const MAX_REASONING_DETAILS: usize = 64;
+const MAX_REASONING_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+
+/// Conservative model-window default when a connection has no sane value.
+const DEFAULT_CONTEXT_WINDOW: i64 = 32768;
+/// Adaptive per-turn reply budget default (must stay ≤ MAX_OUTPUT_TOKENS).
+const DEFAULT_OUTPUT_BUDGET: i64 = 4096;
+const MAX_CONTEXT_WINDOW: i64 = 4_000_000;
+
+fn normalized_context_window(value: i64) -> u32 {
+    if (1024..=MAX_CONTEXT_WINDOW).contains(&value) {
+        value as u32
+    } else {
+        DEFAULT_CONTEXT_WINDOW as u32
+    }
+}
+
+fn normalized_output_budget(value: i64) -> u32 {
+    let ceiling = MAX_OUTPUT_TOKENS as i64;
+    if (1..=ceiling).contains(&value) {
+        value as u32
+    } else {
+        DEFAULT_OUTPUT_BUDGET.min(ceiling) as u32
+    }
+}
+
+/// Thinking levels recognized end-to-end (`off`..`xhigh`). Anything else is
+/// dropped rather than forwarded, so an invalid UI value cannot reach a provider.
+const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+
+fn normalized_thinking_level(level: Option<&str>) -> Option<String> {
+    level
+        .map(str::trim)
+        .filter(|value| THINKING_LEVELS.contains(value))
+        .map(str::to_ascii_lowercase)
+}
+
+/// Keys that must never appear in a chat request body, compared after
+/// normalization (lowercase + strip every non-alphanumeric character) so that
+/// `Authorization`, `api-key`, `api_key` and `x-api-key` all collapse onto a
+/// covered token. The scan is deliberately shallow (only the direct keys of the
+/// top-level object, each message, each content block and each tool envelope),
+/// never descending into tool `parameters`/`input_schema` so that legitimate
+/// argument names are not false-positived.
+const BLACKLIST_KEYS: &[&str] = &[
+    "apikey",
+    "authorization",
+    "auth",
+    "headers",
+    "header",
+    "url",
+    "endpoint",
+    "baseurl",
+    "baseuri",
+    "proxy",
+    "httpproxy",
+    "httpsproxy",
+    "noproxy",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "bearer",
+];
+
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn reject_blacklisted_keys(object: &Map<String, Value>) -> Result<(), &'static str> {
+    for key in object.keys() {
+        if BLACKLIST_KEYS.contains(&normalize_key(key).as_str()) {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    Ok(())
+}
+
+/// Reject parameters that amplify cost beyond the per-attempt token budget or
+/// legacy function-calling shapes that would bypass the registered tool names.
+fn reject_cost_or_legacy(object: &Map<String, Value>) -> Result<(), &'static str> {
+    if object.contains_key("functions") || object.contains_key("function_call") {
+        return Err("REQUEST_INVALID");
+    }
+    if object.contains_key("best_of") {
+        return Err("REQUEST_INVALID");
+    }
+    if let Some(n) = object.get("n") {
+        if n.as_u64() != Some(1) {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    Ok(())
+}
 
 const MAX_ENCODED_CHUNK_BYTES: usize = MAX_CHUNK_BYTES.div_ceil(3) * 4;
 
@@ -85,11 +200,11 @@ impl Route {
             Self::OpenAiChat => "/chat/completions",
             Self::AnthropicMessages => "/messages",
         };
-        let path = if path.ends_with("/v1") {
-            format!("{path}{suffix}")
-        } else {
-            format!("{path}/v1{suffix}")
-        };
+        // 与连接测试、打标、超级搜索同一规则：用户填写的 base URL 就是连接
+        // 测试验证过的地址，接口路径直接追加，不再自行补 `/v1`。自动补 `/v1`
+        // 会让智谱（`/api/paas/v4`）、火山方舟（`/api/v3`）等非 `/v1` 路径的
+        // 服务在助手里 404，而同一服务在打标里却正常。
+        let path = format!("{path}{suffix}");
         url.set_path(&path);
         Ok(url.to_string())
     }
@@ -108,6 +223,16 @@ pub struct AgentGatewayLease {
     config_revision: String,
     route: Route,
     model: String,
+    /// Real model context window from the connection (Host declares it to Pi so
+    /// pi-ai clamps the reply budget against the true window, not a guess).
+    context_window: u32,
+    /// Adaptive per-turn reply budget for this model (never above MAX_OUTPUT_TOKENS).
+    max_output_tokens: u32,
+    /// Whether the connection declares reasoning support; gates thinking-level passthrough.
+    reasoning: bool,
+    /// Optional per-run thinking level (off/minimal/low/medium/high/xhigh). Only
+    /// forwarded when the connection supports reasoning; else dropped.
+    thinking_level: Option<String>,
     budget: RunBudget,
 }
 
@@ -161,19 +286,35 @@ impl AgentGatewayLease {
             config_revision: connection.config_revision.clone(),
             route,
             model: connection.model.clone(),
+            context_window: normalized_context_window(connection.context_window),
+            max_output_tokens: normalized_output_budget(connection.max_output_tokens),
+            reasoning: connection.reasoning_supported,
+            thinking_level: None,
             budget: RunBudget::new_at(now, RUN_TIMEOUT),
         })
     }
 
-    /// The exact metadata the Pi SDK needs to select its registered codec.
-    /// Credentials, URL, connection ID, and config revision never cross stdio.
+    /// The exact metadata the Pi SDK needs to select its registered codec and
+    /// configure its window/reply budget. Credentials, URL, connection ID, and
+    /// config revision never cross stdio.
     pub fn wire_payload(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "leaseId": self.lease_id,
             "provider": self.route.provider(),
             "protocol": self.route.protocol(),
             "model": self.model,
-        })
+            "contextWindow": self.context_window,
+            "maxOutputTokens": self.max_output_tokens,
+            "reasoning": self.reasoning,
+        });
+        if self.reasoning {
+            if let (Some(level), Some(object)) =
+                (self.thinking_level.as_ref(), payload.as_object_mut())
+            {
+                object.insert("thinkingLevel".to_string(), Value::String(level.clone()));
+            }
+        }
+        payload
     }
 
     pub fn matches_scope(
@@ -887,7 +1028,15 @@ impl RunBudget {
     }
 }
 
-/// Validate the exact text-only Pi request shape and leased model identity.
+/// Validate a Pi request body against the leased model identity and the
+/// conversation-layer blacklist policy.
+///
+/// The conversation layer is now a **denylist + passthrough**: unknown message
+/// and generation parameters are forwarded to the user's own provider, while
+/// credentials/endpoints/headers, cost amplifiers and legacy function shapes are
+/// rejected, and message `content` stays text-only so the untrusted Node host can
+/// never base64-exfiltrate arbitrary local bytes. Capability safety is enforced
+/// downstream (`capabilities::execute` + permission + approval), not here.
 ///
 /// The caller owns the original bytes and must send those bytes only after it
 /// rechecks the lease, binding, connection revision, cancellation, and budget.
@@ -911,21 +1060,16 @@ pub fn validate_request(
 
 fn validate_openai(value: &Value, leased_model: &str) -> Result<(), &'static str> {
     let object = value.as_object().ok_or("REQUEST_INVALID")?;
-    require_fields(
-        object,
-        &[
-            "model",
-            "messages",
-            "stream",
-            "stream_options",
-            "max_tokens",
-            "max_completion_tokens",
-            "temperature",
-        ],
-        &["model", "messages", "stream"],
-    )?;
+    // Denylist + passthrough: no top-level allowlist. Required identity/stream
+    // fields are checked by `require_model_stream`, `messages` by
+    // `validate_messages`, and the token budget by `validate_token_limit`.
+    reject_blacklisted_keys(object)?;
+    reject_cost_or_legacy(object)?;
     require_model_stream(object, leased_model)?;
     validate_messages(object.get("messages").ok_or("REQUEST_INVALID")?, true)?;
+    if let Some(tools) = object.get("tools") {
+        validate_declared_tools(tools, Route::OpenAiChat)?;
+    }
 
     if let Some(options) = object.get("stream_options") {
         let options = options.as_object().ok_or("REQUEST_INVALID")?;
@@ -943,26 +1087,96 @@ fn validate_openai(value: &Value, leased_model: &str) -> Result<(), &'static str
 
 fn validate_anthropic(value: &Value, leased_model: &str) -> Result<(), &'static str> {
     let object = value.as_object().ok_or("REQUEST_INVALID")?;
-    require_fields(
-        object,
-        &[
-            "model",
-            "messages",
-            "system",
-            "stream",
-            "max_tokens",
-            "temperature",
-        ],
-        &["model", "messages", "stream", "max_tokens"],
-    )?;
+    // Denylist + passthrough, same policy as the OpenAI route. `max_tokens` is
+    // still required (checked by `validate_token_limit`), and `system` stays
+    // text-only.
+    reject_blacklisted_keys(object)?;
+    reject_cost_or_legacy(object)?;
     require_model_stream(object, leased_model)?;
     validate_token_limit(object, &["max_tokens"])?;
     validate_messages(object.get("messages").ok_or("REQUEST_INVALID")?, false)?;
+    if let Some(tools) = object.get("tools") {
+        validate_declared_tools(tools, Route::AnthropicMessages)?;
+    }
     if let Some(system) = object.get("system") {
         validate_text_blocks(system, MAX_SYSTEM_BLOCKS)?;
     }
     if let Some(temperature) = object.get("temperature") {
         validate_temperature(temperature, 1.0)?;
+    }
+    Ok(())
+}
+
+/// Tool declarations keep the capability gate (registered names, unique, bounded
+/// description) but the argument schema is forwarded as an arbitrary JSON object
+/// (`parameters`/`input_schema`); real safety lives in `capabilities::execute`.
+/// An empty `tools` array is allowed because pi emits `tools: []` when a turn has
+/// tool history but no request tools.
+fn validate_declared_tools(value: &Value, route: Route) -> Result<(), &'static str> {
+    let tools = value.as_array().ok_or("REQUEST_INVALID")?;
+    if tools.len() > MAX_DECLARED_TOOLS {
+        return Err("REQUEST_INVALID");
+    }
+    let registered = super::capabilities::supported_tool_names();
+    let mut seen: Vec<&str> = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let object = tool.as_object().ok_or("REQUEST_INVALID")?;
+        let (name, description, schema) = match route {
+            Route::OpenAiChat => {
+                require_fields(object, &["type", "function"], &["type", "function"])?;
+                if object.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err("REQUEST_INVALID");
+                }
+                let function = object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or("REQUEST_INVALID")?;
+                require_fields(
+                    function,
+                    &["name", "description", "parameters"],
+                    &["name", "description", "parameters"],
+                )?;
+                (
+                    function.get("name").and_then(Value::as_str),
+                    function.get("description").and_then(Value::as_str),
+                    function.get("parameters"),
+                )
+            }
+            Route::AnthropicMessages => {
+                require_fields(
+                    object,
+                    &[
+                        "name",
+                        "description",
+                        "eager_input_streaming",
+                        "input_schema",
+                    ],
+                    &["name", "description", "input_schema"],
+                )?;
+                (
+                    object.get("name").and_then(Value::as_str),
+                    object.get("description").and_then(Value::as_str),
+                    object.get("input_schema"),
+                )
+            }
+        };
+        let name = name.ok_or("REQUEST_INVALID")?;
+        let description = description.ok_or("REQUEST_INVALID")?;
+        let schema = schema.and_then(Value::as_object).ok_or("REQUEST_INVALID")?;
+        if !registered.contains(&name) || seen.contains(&name) {
+            return Err("REQUEST_INVALID");
+        }
+        seen.push(name);
+        if description.is_empty()
+            || description.len() > MAX_TOOL_DESCRIPTION_BYTES
+            || description.contains('\0')
+        {
+            return Err("REQUEST_INVALID");
+        }
+        let encoded = serde_json::to_vec(schema).map_err(|_| "REQUEST_INVALID")?;
+        if encoded.len() > MAX_TOOL_SCHEMA_BYTES {
+            return Err("REQUEST_LIMIT");
+        }
     }
     Ok(())
 }
@@ -986,29 +1200,330 @@ fn validate_messages(value: &Value, openai_roles: bool) -> Result<(), &'static s
     }
     for message in messages {
         let object = message.as_object().ok_or("REQUEST_INVALID")?;
-        require_fields(object, &["role", "content"], &["role", "content"])?;
-        let role = object
-            .get("role")
-            .and_then(Value::as_str)
-            .ok_or("REQUEST_INVALID")?;
-        if !(matches!(role, "user" | "assistant")
-            || (openai_roles && matches!(role, "system" | "developer")))
-        {
-            return Err("REQUEST_INVALID");
-        }
-        let content = object.get("content").ok_or("REQUEST_INVALID")?;
         if openai_roles {
-            if !content.is_string() {
-                if !matches!(role, "user" | "assistant") {
-                    return Err("REQUEST_INVALID");
-                }
-                validate_text_blocks(content, MAX_MESSAGES)?;
-            }
-        } else if !content.is_string() {
-            validate_text_blocks(content, MAX_MESSAGES)?;
+            validate_openai_message(object)?;
+        } else {
+            validate_anthropic_message(object)?;
         }
     }
     Ok(())
+}
+
+/// OpenAI Chat messages: `system`/`developer`/`user`/`assistant`, plus the
+/// `tool` result role that Pi sends after a capability call. Message-level extra
+/// keys are forwarded (denylist-filtered) so reasoning metadata such as
+/// `reasoning_details`/`reasoning`/`reasoning_content` can be replayed, but
+/// `content` stays text-only and tool calls still go through the capability gate.
+fn validate_openai_message(object: &Map<String, Value>) -> Result<(), &'static str> {
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+        return Err("REQUEST_INVALID");
+    }
+    if !object.contains_key("content") {
+        return Err("REQUEST_INVALID");
+    }
+    reject_blacklisted_keys(object)?;
+    match role {
+        "system" | "developer" => {
+            if !object.get("content").is_some_and(Value::is_string) {
+                return Err("REQUEST_INVALID");
+            }
+        }
+        "user" => {
+            let content = object.get("content").ok_or("REQUEST_INVALID")?;
+            if !content.is_string() {
+                validate_text_blocks(content, MAX_MESSAGES)?;
+            }
+        }
+        "assistant" => validate_openai_assistant(object)?,
+        "tool" => validate_openai_tool_result(object)?,
+        _ => return Err("REQUEST_INVALID"),
+    }
+    Ok(())
+}
+
+fn validate_openai_assistant(object: &Map<String, Value>) -> Result<(), &'static str> {
+    if !object.contains_key("content") {
+        return Err("REQUEST_INVALID");
+    }
+    let content = object.get("content").ok_or("REQUEST_INVALID")?;
+    let tool_calls = object.get("tool_calls");
+    match content {
+        Value::Null => {
+            if tool_calls.is_none() {
+                return Err("REQUEST_INVALID");
+            }
+        }
+        Value::String(_) => {}
+        other => validate_text_blocks(other, MAX_MESSAGES)?,
+    }
+    if let Some(reasoning) = object.get("reasoning_content") {
+        if !reasoning.is_string() {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    if let Some(details) = object.get("reasoning_details") {
+        validate_reasoning_details(details)?;
+    }
+    if let Some(calls) = tool_calls {
+        validate_tool_calls(calls)?;
+    }
+    Ok(())
+}
+
+/// Replayed provider reasoning metadata (Pi stores Anthropic thinking signatures
+/// and OpenAI `reasoning_details` here and replays them on the assistant turn).
+/// It is opaque; only bound its size and require each element be an object with a
+/// string `type`, so no unbounded blob or opaque non-JSON payload slips through.
+fn validate_reasoning_details(value: &Value) -> Result<(), &'static str> {
+    let items = value.as_array().ok_or("REQUEST_INVALID")?;
+    if items.len() > MAX_REASONING_DETAILS {
+        return Err("REQUEST_LIMIT");
+    }
+    for item in items {
+        let object = item.as_object().ok_or("REQUEST_INVALID")?;
+        if object.get("type").and_then(Value::as_str).is_none() {
+            return Err("REQUEST_INVALID");
+        }
+        let encoded = serde_json::to_vec(item).map_err(|_| "REQUEST_INVALID")?;
+        if encoded.len() > MAX_REASONING_DETAIL_BYTES {
+            return Err("REQUEST_LIMIT");
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_tool_result(object: &Map<String, Value>) -> Result<(), &'static str> {
+    for required in ["content", "tool_call_id"] {
+        if !object.contains_key(required) {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    let content = object
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if content.len() > MAX_TOOL_RESULT_BYTES {
+        return Err("REQUEST_LIMIT");
+    }
+    let call_id = object
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !is_bounded_identifier(call_id, MAX_TOOL_CALL_ID_BYTES) {
+        return Err("REQUEST_INVALID");
+    }
+    // The result `name` is informational; a restored/retired tool must not break
+    // replay, so only require a bounded identifier here.
+    if let Some(name) = object.get("name") {
+        let Some(name) = name.as_str() else {
+            return Err("REQUEST_INVALID");
+        };
+        if !is_bounded_identifier(name, MAX_TOOL_CALL_ID_BYTES) {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_calls(value: &Value) -> Result<(), &'static str> {
+    let calls = value.as_array().ok_or("REQUEST_INVALID")?;
+    if calls.is_empty() || calls.len() > MAX_TOOL_CALLS {
+        return Err("REQUEST_LIMIT");
+    }
+    let registered = super::capabilities::supported_tool_names();
+    for call in calls {
+        let object = call.as_object().ok_or("REQUEST_INVALID")?;
+        require_fields(
+            object,
+            &["id", "type", "function"],
+            &["id", "type", "function"],
+        )?;
+        if object.get("type").and_then(Value::as_str) != Some("function") {
+            return Err("REQUEST_INVALID");
+        }
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("REQUEST_INVALID")?;
+        if !is_bounded_identifier(id, MAX_TOOL_CALL_ID_BYTES) {
+            return Err("REQUEST_INVALID");
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or("REQUEST_INVALID")?;
+        require_fields(function, &["name", "arguments"], &["name", "arguments"])?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("REQUEST_INVALID")?;
+        if !registered.contains(&name) {
+            return Err("REQUEST_INVALID");
+        }
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or("REQUEST_INVALID")?;
+        if arguments.is_empty() || arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+            return Err("REQUEST_LIMIT");
+        }
+        let parsed: Value = serde_json::from_str(arguments).map_err(|_| "REQUEST_INVALID")?;
+        if !parsed.is_object() {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    Ok(())
+}
+
+/// Anthropic messages: plain text content or blocks. A tool round trip is an
+/// assistant `tool_use` block followed by a user `tool_result` block; both are
+/// bounded and `tool_use` names must be registered tools.
+fn validate_anthropic_message(object: &Map<String, Value>) -> Result<(), &'static str> {
+    if !object.contains_key("role") || !object.contains_key("content") {
+        return Err("REQUEST_INVALID");
+    }
+    reject_blacklisted_keys(object)?;
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !matches!(role, "user" | "assistant") {
+        return Err("REQUEST_INVALID");
+    }
+    let content = object.get("content").ok_or("REQUEST_INVALID")?;
+    if content.is_string() {
+        return Ok(());
+    }
+    let blocks = content.as_array().ok_or("REQUEST_INVALID")?;
+    if blocks.len() > MAX_MESSAGES {
+        return Err("REQUEST_LIMIT");
+    }
+    for block in blocks {
+        let block = block.as_object().ok_or("REQUEST_INVALID")?;
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                require_fields(block, &["type", "text"], &["type", "text"])?;
+                if !block.get("text").is_some_and(Value::is_string) {
+                    return Err("REQUEST_INVALID");
+                }
+            }
+            Some("tool_use") if role == "assistant" => validate_anthropic_tool_use(block)?,
+            Some("tool_result") if role == "user" => validate_anthropic_tool_result(block)?,
+            Some("thinking") if role == "assistant" => validate_anthropic_thinking(block, false)?,
+            Some("redacted_thinking") if role == "assistant" => {
+                validate_anthropic_thinking(block, true)?
+            }
+            _ => return Err("REQUEST_INVALID"),
+        }
+    }
+    Ok(())
+}
+
+/// Replayed Anthropic extended-thinking blocks. They are opaque reasoning
+/// metadata (text + signature, or redacted `data`); bound their size, keep them
+/// assistant-only, and never treat them as user-visible content.
+fn validate_anthropic_thinking(
+    object: &Map<String, Value>,
+    redacted: bool,
+) -> Result<(), &'static str> {
+    if redacted {
+        require_fields(object, &["type", "data"], &["type", "data"])?;
+        let data = object
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or("REQUEST_INVALID")?;
+        if data.len() > MAX_REASONING_DETAIL_BYTES {
+            return Err("REQUEST_LIMIT");
+        }
+    } else {
+        require_fields(
+            object,
+            &["type", "thinking", "signature"],
+            &["type", "thinking"],
+        )?;
+        if !object.get("thinking").is_some_and(Value::is_string) {
+            return Err("REQUEST_INVALID");
+        }
+        if let Some(signature) = object.get("signature") {
+            let signature = signature.as_str().ok_or("REQUEST_INVALID")?;
+            if signature.len() > MAX_REASONING_DETAIL_BYTES {
+                return Err("REQUEST_LIMIT");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_tool_use(object: &Map<String, Value>) -> Result<(), &'static str> {
+    require_fields(
+        object,
+        &["type", "id", "name", "input"],
+        &["type", "id", "name", "input"],
+    )?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !is_bounded_identifier(id, MAX_TOOL_CALL_ID_BYTES) {
+        return Err("REQUEST_INVALID");
+    }
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !super::capabilities::supported_tool_names().contains(&name) {
+        return Err("REQUEST_INVALID");
+    }
+    let input = object.get("input").ok_or("REQUEST_INVALID")?;
+    if !input.is_object() {
+        return Err("REQUEST_INVALID");
+    }
+    let encoded = serde_json::to_vec(input).map_err(|_| "REQUEST_INVALID")?;
+    if encoded.len() > MAX_TOOL_ARGUMENTS_BYTES {
+        return Err("REQUEST_LIMIT");
+    }
+    Ok(())
+}
+
+fn validate_anthropic_tool_result(object: &Map<String, Value>) -> Result<(), &'static str> {
+    require_fields(
+        object,
+        &["type", "tool_use_id", "content", "is_error"],
+        &["type", "tool_use_id", "content"],
+    )?;
+    let id = object
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .ok_or("REQUEST_INVALID")?;
+    if !is_bounded_identifier(id, MAX_TOOL_CALL_ID_BYTES) {
+        return Err("REQUEST_INVALID");
+    }
+    if let Some(is_error) = object.get("is_error") {
+        if !is_error.is_boolean() {
+            return Err("REQUEST_INVALID");
+        }
+    }
+    let content = object.get("content").ok_or("REQUEST_INVALID")?;
+    if !content.is_string() {
+        validate_text_blocks(content, MAX_MESSAGES)?;
+    }
+    let encoded = serde_json::to_vec(content).map_err(|_| "REQUEST_INVALID")?;
+    if encoded.len() > MAX_TOOL_RESULT_BYTES {
+        return Err("REQUEST_LIMIT");
+    }
+    Ok(())
+}
+
+fn is_bounded_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn validate_text_blocks(value: &Value, max_blocks: usize) -> Result<(), &'static str> {
@@ -1081,6 +1596,9 @@ pub struct GatewayUpstreamRequest {
     pub body: Vec<u8>,
     pub authorization: Option<String>,
     pub anthropic_version: Option<&'static str>,
+    /// Shared with the active attempt. Transports may poll it while opening
+    /// headers or waiting for the next response chunk.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 pub struct GatewayTransportResponse {
@@ -1094,8 +1612,10 @@ pub struct GatewayTransportResponse {
 
 pub type GatewayCancelHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
-/// The A3-02 transport seam. Production currently uses the disabled adapter;
-/// local end-to-end tests inject a deterministic fixture transport.
+/// The A3-02 transport seam. Production installs `SwitchableGatewayTransport`
+/// (real HTTP, proxy-only user configuration) without any user-visible on/off
+/// switch; `DisabledGatewayTransport` stays as the explicit fail-closed seam so a
+/// test or a future degraded wiring can prove "no egress" instead of assuming it.
 pub trait GatewayTransport: Send + Sync + 'static {
     fn enabled(&self) -> bool {
         true
@@ -1138,7 +1658,7 @@ struct GatewayActiveAttempt {
     cancel_hook: Mutex<Option<GatewayCancelHook>>,
     usage: Mutex<SseUsageTracker>,
     permit: Mutex<Option<OwnedRequestPermit>>,
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -1157,6 +1677,12 @@ pub struct GatewayBroker {
     db: Arc<Database>,
     credential_backend: Arc<dyn CredentialBackend>,
     transport: Arc<dyn GatewayTransport>,
+    /// 该传输是否会真的打开网络连接。由构造方显式声明，默认 false（测试替身、
+    /// 关断传输都属于这一类），只有生产真实 HTTP 传输才允许置 true。
+    real_network: bool,
+    /// 迁仓/恢复期间的总仓维护门（A4-05）。Host 的写能力必须与 GUI、MCP 一样被它挡住：
+    /// 只挡外部 MCP 客户端等于留下「Pi 可以在总仓搬家中途写入」的洞。
+    maintenance: Option<Arc<crate::services::library_migration::LibraryMaintenanceGate>>,
     state: Mutex<GatewayBrokerState>,
 }
 
@@ -1167,13 +1693,58 @@ impl GatewayBroker {
         credential_backend: Arc<dyn CredentialBackend>,
         transport: Arc<dyn GatewayTransport>,
     ) -> Self {
+        Self::with_real_network(instance_id, db, credential_backend, transport, false)
+    }
+
+    /// 显式声明「该传输会真的走网络」，用于准确上报模型外发状态。
+    pub fn with_real_network(
+        instance_id: String,
+        db: Arc<Database>,
+        credential_backend: Arc<dyn CredentialBackend>,
+        transport: Arc<dyn GatewayTransport>,
+        real_network: bool,
+    ) -> Self {
         Self {
             instance_id,
             db,
             credential_backend,
             transport,
+            real_network,
+            maintenance: None,
             state: Mutex::new(GatewayBrokerState::default()),
         }
+    }
+
+    /// 接线总仓维护门。构造后链式调用，避免为了一个可选依赖改动所有既有构造点。
+    pub fn with_maintenance(
+        mut self,
+        maintenance: Option<Arc<crate::services::library_migration::LibraryMaintenanceGate>>,
+    ) -> Self {
+        self.maintenance = maintenance;
+        self
+    }
+
+    /// Host 能力执行时使用的维护门；未接线时为空，视为未维护。
+    pub fn maintenance(
+        &self,
+    ) -> Option<&Arc<crate::services::library_migration::LibraryMaintenanceGate>> {
+        self.maintenance.as_ref()
+    }
+
+    pub fn database(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    /// 当前注入的传输是否会真的走网络（A3-02）。
+    ///
+    /// 注意这里**不能**用 `GatewayTransport::enabled()` 代替：那个语义是「这条传输
+    /// 能否承载一次尝试」，本地测试替身同样返回 true，却全程不开 socket。若拿它上报
+    /// “模型外发已开启”，会把进程内 Mock 误报成联网。
+    ///
+    /// 目前只有生产传输选择（`select_production_transport`）会构造真实 HTTP 传输，
+    /// 因此这里按「是否已启用真实传输」判断，并叠加传输自身的可用性。
+    pub fn uses_real_network_transport(&self) -> bool {
+        self.real_network && self.transport.enabled()
     }
 
     pub fn register_lease(&self, lease: AgentGatewayLease) -> Result<(), &'static str> {
@@ -1190,17 +1761,66 @@ impl GatewayBroker {
         Ok(())
     }
 
+    /// 发送前的廉价检查：网络出口就绪 → 服务绑定 → 云服务密钥存在性。
+    ///
+    /// 没有「允许联网」这道用户开关：配置好服务就能直接对话。唯一的前置是
+    /// 传输本身可承载请求——测试替身恒为就绪，`DisabledGatewayTransport`
+    /// 表示当前平台/安装包没有网络出口，仍以失败关闭，绝不明文外发。
+    ///
+    /// 只读设置与连接元数据，不签发租约、不排队、不发请求，因此失败时界面
+    /// 能拿到可操作的错误码，而不是等一次“回答失败”。任何一项不满足都不外发。
+    pub fn preflight(&self) -> AppResult<()> {
+        if !self.transport.enabled() {
+            return Err(AppError::agent_model_network_disabled(
+                "Agent 网络出口没有就绪：当前平台或安装包不含 Agent 运行资源，请确认支持范围后重试。",
+            ));
+        }
+        let connection = credentials::resolve_agent_model_connection_metadata(&self.db, None)?;
+        if connection.deployment == "cloud" {
+            // 走注入的 CredentialBackend（与真正发送时同一后端），测试替身因此
+            // 不会被这一步挡下；读到的密钥立即丢弃，不落日志。
+            let resolved = credentials::resolve_agent_model_connection_with_credential(
+                &self.db,
+                self.credential_backend.as_ref(),
+                None,
+            )?;
+            if resolved
+                .credential()
+                .is_none_or(|secret| secret.trim().is_empty())
+            {
+                return Err(AppError::agent_credential_missing(format!(
+                    "Agent 绑定的云服务「{}」还没有保存密钥，请在 AI 服务里补充后重试。",
+                    connection.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn issue_run_lease(
         &self,
         conversation_id: &str,
         run_id: &str,
     ) -> crate::error::AppResult<Value> {
+        self.issue_run_lease_with_thinking(conversation_id, run_id, None)
+    }
+
+    /// Issue a lease carrying an optional thinking level. The level is only
+    /// forwarded when the resolved connection declares reasoning support; an
+    /// unknown/blank level is silently dropped (treated as "off").
+    pub fn issue_run_lease_with_thinking(
+        &self,
+        conversation_id: &str,
+        run_id: &str,
+        thinking_level: Option<&str>,
+    ) -> crate::error::AppResult<Value> {
         let connection = credentials::resolve_agent_model_connection_metadata(&self.db, None)?;
-        let lease =
+        let mut lease =
             AgentGatewayLease::issue(&self.instance_id, conversation_id, run_id, &connection)
                 .map_err(|_| {
                     crate::error::AppError::conflict("Agent 服务无法为本次回答签发模型租约")
                 })?;
+        lease.thinking_level = normalized_thinking_level(thinking_level);
         let payload = lease.wire_payload();
         self.register_lease(lease)
             .map_err(|_| crate::error::AppError::conflict("Agent 模型租约当前不可用"))?;
@@ -1392,7 +2012,7 @@ impl GatewayBroker {
             cancel_hook: Mutex::new(None),
             usage: Mutex::new(SseUsageTracker::new(route)),
             permit: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         {
             let mut state = self.state.lock().map_err(|_| "LEASE_REVOKED")?;
@@ -1577,7 +2197,24 @@ impl GatewayBroker {
             fail("UPSTREAM_UNAVAILABLE");
             return;
         }
-        let endpoint = match attempt.route.endpoint_url(&resolved.connection.base_url) {
+        // Reading the credential deliberately happens outside the DB guard. The
+        // Agent connection can therefore be edited while the keyring call is in
+        // flight. Re-read the metadata after that call and fail closed if the
+        // captured revision is no longer current; otherwise an old secret could
+        // be paired with a newly saved endpoint/model.
+        let current_connection =
+            match credentials::resolve_agent_model_connection_metadata(&self.db, expected) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    fail(gateway_error_for_app(&error));
+                    return;
+                }
+            };
+        if current_connection != resolved.connection {
+            fail("CONNECTION_CHANGED");
+            return;
+        }
+        let endpoint = match attempt.route.endpoint_url(&current_connection.base_url) {
             Ok(endpoint) => endpoint,
             Err(code) => {
                 fail(code);
@@ -1607,7 +2244,7 @@ impl GatewayBroker {
                 }
             };
             match lease.consume_attempt_if_current(
-                &resolved.connection,
+                &current_connection,
                 attempt.cancelled.load(Ordering::Acquire),
                 Instant::now(),
             ) {
@@ -1636,13 +2273,14 @@ impl GatewayBroker {
         let request = GatewayUpstreamRequest {
             route: attempt.route,
             endpoint,
-            model: resolved.connection.model.clone(),
+            model: current_connection.model.clone(),
             body,
             authorization: match attempt.route {
                 Route::OpenAiChat => credential.map(|secret| format!("Bearer {secret}")),
                 Route::AnthropicMessages => credential,
             },
             anthropic_version: (attempt.route == Route::AnthropicMessages).then_some("2023-06-01"),
+            cancelled: Arc::clone(&attempt.cancelled),
         };
         let response = match self.transport.open(request) {
             Ok(response) => response,
@@ -1652,6 +2290,10 @@ impl GatewayBroker {
             }
         };
         if attempt.cancelled.load(Ordering::Acquire) {
+            // The response is not installed on the attempt until below, so the
+            // normal finish path cannot reach its transport cancellation hook.
+            // Cancel the just-opened response explicitly before dropping it.
+            (response.cancel)();
             fail("CANCELLED");
             return;
         }
@@ -1661,6 +2303,11 @@ impl GatewayBroker {
             .map_err(|_| "STREAM_FAILED")
             .and_then(|mut state| state.begin_streaming(response.status, &response.content_type));
         if let Err(code) = result {
+            // The response has not been installed into the attempt yet, so
+            // finish_attempt cannot reach its cancellation hook. Explicitly
+            // interrupt the transport before dropping the response, including
+            // redirects and non-SSE upstream replies.
+            (response.cancel)();
             self.finish_attempt(&identity.gateway_request_id, &attempt);
             reply_error(
                 &reply,
@@ -2143,7 +2790,7 @@ mod tests {
         AgentGatewayLease, GatewayAttemptState, GatewayBroker, GatewayTransport,
         GatewayTransportResponse, GatewayUpstreamRequest, HostGatewayFrame, Route, SseUsageTracker,
         UsageSnapshot, MAX_CHUNK_BYTES, MAX_ENCODED_CHUNK_BYTES, MAX_REQUEST_BYTES,
-        MAX_RUN_ATTEMPTS,
+        MAX_RUN_ATTEMPTS, MAX_TOOL_CALLS,
     };
     use crate::services::credentials::CredentialBackend;
     use crate::state::Database;
@@ -2151,7 +2798,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -2165,6 +2812,48 @@ mod tests {
         fn get(&self, id: &str) -> crate::error::AppResult<Option<String>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.entries.lock().unwrap().get(id).cloned())
+        }
+
+        fn save(&self, id: &str, secret: &str) -> crate::error::AppResult<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), secret.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, id: &str) -> crate::error::AppResult<()> {
+            self.entries.lock().unwrap().remove(id);
+            Ok(())
+        }
+    }
+
+    struct RebindingCredentials {
+        db: Arc<Database>,
+        entries: Mutex<HashMap<String, String>>,
+        rebind_on_get: AtomicBool,
+    }
+
+    impl CredentialBackend for RebindingCredentials {
+        fn get(&self, id: &str) -> crate::error::AppResult<Option<String>> {
+            let value = self.entries.lock().unwrap().get(id).cloned();
+            if self.rebind_on_get.swap(false, Ordering::SeqCst) {
+                let conn = self.db.lock()?;
+                crate::db::ai_connections::upsert_with_limits(
+                    &conn,
+                    "connection_fixture_gateway_0001",
+                    "Gateway fixture replacement",
+                    "cloud",
+                    "openai_chat",
+                    "https://api.example.test/v1",
+                    "replacement-model",
+                    Some("connection_fixture_gateway_0001"),
+                    1,
+                    10,
+                    20,
+                )?;
+            }
+            Ok(value)
         }
 
         fn save(&self, id: &str, secret: &str) -> crate::error::AppResult<()> {
@@ -2212,6 +2901,54 @@ mod tests {
                     b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n".to_vec(),
                 )),
                 cancel: Arc::new(|| {}),
+            })
+        }
+    }
+
+    struct RejectedResponseTransport {
+        status: u16,
+        content_type: &'static str,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    struct CancelAfterOpenTransport {
+        cancel_calls: Arc<AtomicUsize>,
+        on_open: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+
+    impl GatewayTransport for CancelAfterOpenTransport {
+        fn open(
+            &self,
+            _request: GatewayUpstreamRequest,
+        ) -> Result<GatewayTransportResponse, &'static str> {
+            if let Some(on_open) = self.on_open.lock().unwrap().as_ref() {
+                on_open();
+            }
+            let cancel_calls = Arc::clone(&self.cancel_calls);
+            Ok(GatewayTransportResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                body: Box::new(Cursor::new(Vec::new())),
+                cancel: Arc::new(move || {
+                    cancel_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        }
+    }
+
+    impl GatewayTransport for RejectedResponseTransport {
+        fn open(
+            &self,
+            _request: GatewayUpstreamRequest,
+        ) -> Result<GatewayTransportResponse, &'static str> {
+            let cancel_calls = Arc::clone(&self.cancel_calls);
+            Ok(GatewayTransportResponse {
+                status: self.status,
+                content_type: self.content_type.to_string(),
+                body: Box::new(Cursor::new(Vec::new())),
+                cancel: Arc::new(move || {
+                    cancel_calls.fetch_add(1, Ordering::SeqCst);
+                }),
             })
         }
     }
@@ -2311,6 +3048,16 @@ mod tests {
     }
 
     fn broker_exchange(broker: &Arc<GatewayBroker>, frame: serde_json::Value) -> serde_json::Value {
+        broker_exchange_within(broker, frame, Duration::from_secs(3))
+    }
+
+    /// 同 `broker_exchange`，但可指定等待上限：真实外发测试要走网络，
+    /// 3 秒的离线夹具预算不足以覆盖真实上游延迟。
+    fn broker_exchange_within(
+        broker: &Arc<GatewayBroker>,
+        frame: serde_json::Value,
+        budget: Duration,
+    ) -> serde_json::Value {
         let (sender, receiver) = mpsc::sync_channel(1);
         broker
             .handle_host_frame(
@@ -2320,7 +3067,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        receiver.recv_timeout(Duration::from_secs(3)).unwrap()
+        receiver.recv_timeout(budget).unwrap()
     }
 
     #[test]
@@ -2476,6 +3223,159 @@ mod tests {
     }
 
     #[test]
+    fn preflight_reports_network_disabled_before_touching_credentials() {
+        let (broker, credentials) = fixture_broker(Arc::new(super::DisabledGatewayTransport));
+        let error = broker.preflight().unwrap_err();
+        assert_eq!(error.code(), "AGENT_MODEL_NETWORK_DISABLED");
+        assert_eq!(credentials.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preflight_reports_unbound_service_when_nothing_is_bound() {
+        let conn = crate::db::init_memory().unwrap();
+        let db = Arc::new(Database::new(conn));
+        let broker = Arc::new(GatewayBroker::new(
+            "instance_0123456789abcdef".to_string(),
+            db,
+            Arc::new(FixtureCredentials::default()),
+            Arc::new(FixtureTransport::default()),
+        ));
+        let error = broker.preflight().unwrap_err();
+        assert_eq!(error.code(), "AGENT_SERVICE_UNBOUND");
+    }
+
+    #[test]
+    fn preflight_reports_missing_credential_for_a_bound_cloud_service() {
+        let connection_id = "connection_fixture_gateway_0001";
+        let conn = crate::db::init_memory().unwrap();
+        crate::db::ai_connections::upsert_with_limits(
+            &conn,
+            connection_id,
+            "Gateway fixture",
+            "cloud",
+            "openai_chat",
+            "https://api.example.test/v1",
+            "fixture-model",
+            Some(connection_id),
+            1,
+            10,
+            20,
+        )
+        .unwrap();
+        crate::db::ai_connections::bind_usage(&conn, "agent", connection_id).unwrap();
+        let db = Arc::new(Database::new(conn));
+        // No credential saved: preflight must fail closed before any transport use.
+        let broker = Arc::new(GatewayBroker::new(
+            "instance_0123456789abcdef".to_string(),
+            db,
+            Arc::new(FixtureCredentials::default()),
+            Arc::new(FixtureTransport::default()),
+        ));
+        let error = broker.preflight().unwrap_err();
+        assert_eq!(error.code(), "AGENT_CREDENTIAL_MISSING");
+    }
+
+    #[test]
+    fn connection_rebind_during_credential_read_fails_before_transport_open() {
+        let conn = crate::db::init_memory().unwrap();
+        crate::db::ai_connections::upsert_with_limits(
+            &conn,
+            "connection_fixture_gateway_0001",
+            "Gateway fixture",
+            "cloud",
+            "openai_chat",
+            "https://api.example.test/v1",
+            "fixture-model",
+            Some("connection_fixture_gateway_0001"),
+            1,
+            10,
+            20,
+        )
+        .unwrap();
+        crate::db::ai_connections::bind_usage(&conn, "agent", "connection_fixture_gateway_0001")
+            .unwrap();
+        let db = Arc::new(Database::new(conn));
+        let credentials = Arc::new(RebindingCredentials {
+            db: Arc::clone(&db),
+            entries: Mutex::new(HashMap::from([(
+                "connection_fixture_gateway_0001".to_string(),
+                "fixture-secret-never-on-stdio".to_string(),
+            )])),
+            rebind_on_get: AtomicBool::new(true),
+        });
+        let transport = Arc::new(FixtureTransport::default());
+        let broker = Arc::new(GatewayBroker::new(
+            "instance_0123456789abcdef".to_string(),
+            db,
+            credentials,
+            transport.clone(),
+        ));
+        let run_id = "run_0123456789abcdef";
+        let conversation_id = "conversation_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let response = commit_fixture_request(&broker, run_id, lease["leaseId"].as_str().unwrap());
+
+        assert_eq!(response["type"], "gateway.response.error");
+        assert_eq!(response["code"], "CONNECTION_CHANGED");
+        assert!(transport.observed.lock().unwrap().is_none());
+        assert_eq!(broker.lease_count(), 1);
+    }
+
+    #[test]
+    fn rejected_upstream_response_invokes_transport_cancel_hook() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(RejectedResponseTransport {
+            status: 302,
+            content_type: "text/event-stream",
+            cancel_calls: Arc::clone(&cancel_calls),
+        });
+        let (broker, _) = fixture_broker(transport);
+        let run_id = "run_0123456789abcdef";
+        let conversation_id = "conversation_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let response = commit_fixture_request(&broker, run_id, lease["leaseId"].as_str().unwrap());
+
+        assert_eq!(response["type"], "gateway.response.error");
+        assert_eq!(response["code"], "REDIRECT_DENIED");
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.lease_count(), 1);
+    }
+
+    #[test]
+    fn cancellation_after_transport_open_invokes_transport_cancel_hook() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(CancelAfterOpenTransport {
+            cancel_calls: Arc::clone(&cancel_calls),
+            on_open: Mutex::new(None),
+        });
+        let (broker, _) = fixture_broker(transport.clone());
+        *transport.on_open.lock().unwrap() = Some(Box::new({
+            let broker = Arc::clone(&broker);
+            move || {
+                let attempt = broker
+                    .state
+                    .lock()
+                    .unwrap()
+                    .attempts
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap();
+                attempt.cancelled.store(true, Ordering::Release);
+            }
+        }));
+        let run_id = "run_0123456789abcdef";
+        let conversation_id = "conversation_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let response = commit_fixture_request(&broker, run_id, lease["leaseId"].as_str().unwrap());
+
+        assert_eq!(response["type"], "gateway.response.error");
+        assert_eq!(response["code"], "CANCELLED");
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.lease_count(), 1);
+    }
+
+    #[test]
     fn connection_revision_change_revokes_an_open_stream_before_next_chunk() {
         let transport = Arc::new(FixtureTransport::default());
         let (broker, credentials) = fixture_broker(transport);
@@ -2567,6 +3467,9 @@ mod tests {
             max_concurrency: 1,
             requests_per_minute: 10,
             requests_per_hour: 20,
+            context_window: 32768,
+            max_output_tokens: 4096,
+            reasoning_supported: false,
             enabled: true,
             created_at: 0,
             updated_at: 0,
@@ -2602,10 +3505,13 @@ mod tests {
         let payload = lease.wire_payload();
         let object = payload.as_object().unwrap();
 
-        assert_eq!(object.len(), 4);
+        assert_eq!(object.len(), 7);
         assert_eq!(payload["provider"], "openai");
         assert_eq!(payload["protocol"], "openai_chat");
         assert_eq!(payload["model"], "fixture-model");
+        assert_eq!(payload["contextWindow"], 32768);
+        assert_eq!(payload["maxOutputTokens"], 4096);
+        assert_eq!(payload["reasoning"], false);
         assert!(payload["leaseId"].as_str().unwrap().starts_with("lease_"));
         for forbidden in [
             "connectionId",
@@ -2941,12 +3847,188 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_text_unknown_fields_wrong_model_and_unbounded_tokens() {
+    fn accepts_only_registered_closed_tool_declarations() {
+        let openai = |name: &str, additional: &str| {
+            format!(
+                r#"{{"model":"fixture-model","messages":[{{"role":"user","content":"x"}}],"stream":true,"max_tokens":2048,"tools":[{{"type":"function","function":{{"name":"{name}","description":"search","parameters":{{"type":"object","properties":{{"text":{{"type":"string"}}}},"required":["text"],"additionalProperties":{additional}}}}}}}]}}"#
+            )
+            .into_bytes()
+        };
+        let anthropic = |name: &str, additional: &str| {
+            format!(
+                r#"{{"model":"fixture-model","messages":[{{"role":"user","content":"x"}}],"stream":true,"max_tokens":2048,"tools":[{{"name":"{name}","description":"search","eager_input_streaming":true,"input_schema":{{"type":"object","properties":{{"text":{{"type":"string"}}}},"additionalProperties":{additional}}}}}]}}"#
+            )
+            .into_bytes()
+        };
+        assert_eq!(
+            validate_request(
+                Route::OpenAiChat,
+                "fixture-model",
+                &openai("tea_assets_search", "false")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                &anthropic("tea_assets_search", "false")
+            ),
+            Ok(())
+        );
+        for body in [
+            openai("tea_plans_approve", "false"),
+            openai("tea_operations_resume", "false"),
+            openai("assets.search", "false"),
+        ] {
+            assert_eq!(
+                validate_request(Route::OpenAiChat, "fixture-model", &body),
+                Err("REQUEST_INVALID")
+            );
+        }
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                &anthropic("tea_plans_approve", "false")
+            ),
+            Err("REQUEST_INVALID")
+        );
+        // Argument schema is forwarded opaquely now, so a registered tool with a
+        // non-closed `additionalProperties` is still accepted.
+        assert_eq!(
+            validate_request(
+                Route::OpenAiChat,
+                "fixture-model",
+                &openai("tea_assets_search", "true")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                &anthropic("tea_assets_search", "true")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                br#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":2048,"tools":[{"name":"tea_assets_search","description":"search","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"additionalProperties":false}},{"name":"tea_assets_search","description":"search","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"additionalProperties":false}}]}"#
+            ),
+            Err("REQUEST_INVALID")
+        );
+    }
+
+    #[test]
+    fn accepts_registered_tool_follow_up_and_rejects_forged_shapes() {
+        let openai_tools = r#""tools":[{"type":"function","function":{"name":"tea_assets_search","description":"search","parameters":{"type":"object","properties":{"text":{"type":"string"}},"additionalProperties":false}}}]"#;
+        let anthropic_tools = r#""tools":[{"name":"tea_assets_search","description":"search","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"additionalProperties":false}}]"#;
+        let openai = |assistant: &str, tool: &str| {
+            format!(
+                r#"{{"model":"fixture-model","messages":[{{"role":"user","content":"搜索茶馆"}},{assistant},{tool}],"stream":true,"max_tokens":2048,{openai_tools}}}"#
+            )
+            .into_bytes()
+        };
+        let openai_assistant = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"tea_assets_search","arguments":"{\"text\":\"茶馆\"}"}}]}"#;
+        let openai_tool = r#"{"role":"tool","content":"{\"total\":0}","tool_call_id":"call_abc","name":"tea_assets_search"}"#;
+        assert_eq!(
+            validate_request(
+                Route::OpenAiChat,
+                "fixture-model",
+                &openai(openai_assistant, openai_tool)
+            ),
+            Ok(())
+        );
+
+        let unknown_assistant = openai_assistant.replace("tea_assets_search", "tea_plans_approve");
+        let missing_call_id = r#"{"role":"tool","content":"{}"}"#;
+        let null_without_calls = r#"{"role":"assistant","content":null}"#;
+        let custom_call = openai_assistant.replace("\"type\":\"function\"", "\"type\":\"custom\"");
+        let malformed_arguments = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"tea_assets_search","arguments":"not-json"}}]}"#;
+        let unknown_tool_name = r#"{"role":"tool","content":"{}","tool_call_id":"call_abc","name":"tea_plans_approve"}"#;
+        for (assistant, tool) in [
+            (unknown_assistant.as_str(), openai_tool),
+            (openai_assistant, missing_call_id),
+            (null_without_calls, openai_tool),
+            (custom_call.as_str(), openai_tool),
+            (malformed_arguments, openai_tool),
+            (unknown_assistant.as_str(), unknown_tool_name),
+        ] {
+            assert_eq!(
+                validate_request(Route::OpenAiChat, "fixture-model", &openai(assistant, tool)),
+                Err("REQUEST_INVALID"),
+                "assistant={assistant} tool={tool}"
+            );
+        }
+
+        let many_calls = (0..=MAX_TOOL_CALLS)
+            .map(|index| {
+                format!(
+                    r#"{{"id":"call_{index}","type":"function","function":{{"name":"tea_assets_search","arguments":"{{}}"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let many_assistant =
+            format!(r#"{{"role":"assistant","content":null,"tool_calls":[{many_calls}]}}"#);
+        assert_eq!(
+            validate_request(
+                Route::OpenAiChat,
+                "fixture-model",
+                &openai(&many_assistant, openai_tool)
+            ),
+            Err("REQUEST_LIMIT")
+        );
+
+        let anthropic = |assistant: &str, tool: &str| {
+            format!(
+                r#"{{"model":"fixture-model","messages":[{{"role":"user","content":"搜索茶馆"}},{assistant},{tool}],"stream":true,"max_tokens":2048,{anthropic_tools}}}"#
+            )
+            .into_bytes()
+        };
+        let assistant_tool_use = r#"{"role":"assistant","content":[{"type":"text","text":"我来搜索"},{"type":"tool_use","id":"call_abc","name":"tea_assets_search","input":{"text":"茶馆"}}]}"#;
+        let user_tool_result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_abc","content":[{"type":"text","text":"{\"total\":0}"}],"is_error":false}]}"#;
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                &anthropic(assistant_tool_use, user_tool_result)
+            ),
+            Ok(())
+        );
+
+        let forged_name = assistant_tool_use.replace("tea_assets_search", "plans.approve");
+        let string_input =
+            assistant_tool_use.replace(r#""input":{"text":"茶馆"}"#, r#""input":"茶馆""#);
+        let result_in_assistant = r#"{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"call_abc","content":"{}"}]}"#;
+        let bad_error_flag = user_tool_result.replace("\"is_error\":false", "\"is_error\":\"no\"");
+        for (assistant, tool) in [
+            (forged_name.as_str(), user_tool_result),
+            (string_input.as_str(), user_tool_result),
+            (result_in_assistant, user_tool_result),
+            (assistant_tool_use, bad_error_flag.as_str()),
+        ] {
+            assert_eq!(
+                validate_request(
+                    Route::AnthropicMessages,
+                    "fixture-model",
+                    &anthropic(assistant, tool)
+                ),
+                Err("REQUEST_INVALID"),
+                "assistant={assistant} tool={tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_text_wrong_model_and_unbounded_tokens() {
         let cases = [
             r#"{"model":"fixture-model","messages":[{"role":"user","content":[{"type":"image","source":{"data":"x"}}]}],"stream":true,"max_tokens":10}"#,
             r#"{"model":"other","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10}"#,
-            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":2049}"#,
-            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"tools":[]}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":8193}"#,
         ];
         for body in cases {
             assert_eq!(
@@ -2954,11 +4036,92 @@ mod tests {
                 Err("REQUEST_INVALID")
             );
         }
+        // Ceiling boundary: 8192 (adaptive budget ceiling) is accepted.
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                br#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":8192}"#
+            ),
+            Ok(())
+        );
+        // An empty tools array is allowed: pi emits `tools: []` when a turn keeps
+        // tool history but has no request tools.
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                br#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"tools":[]}"#
+            ),
+            Ok(())
+        );
 
         let openai_image = br#"{"model":"fixture-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"stream":true,"max_tokens":10}"#;
         assert_eq!(
             validate_request(Route::OpenAiChat, "fixture-model", openai_image),
             Err("REQUEST_INVALID")
+        );
+    }
+
+    #[test]
+    fn forwards_reasoning_metadata_and_generation_params_but_rejects_dangerous_keys() {
+        // Multi-turn Pi history: the assistant turn replays `reasoning_details`
+        // (the original bug), unknown generation params (`top_p`) pass through,
+        // and `tools: []` is accepted.
+        let ok_body = r#"{"model":"fixture-model","messages":[{"role":"user","content":"你好"},{"role":"assistant","content":"你好！","reasoning_details":[{"type":"reasoning.text","text":"internal"}],"reasoning_content":"internal"}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":2048,"top_p":0.9,"tools":[]}"#;
+        assert_eq!(
+            validate_request(Route::OpenAiChat, "fixture-model", ok_body.as_bytes()),
+            Ok(())
+        );
+
+        // Top-level credential / endpoint / header keys are rejected.
+        for bad in [
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"api_key":"sk"}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"base_url":"http://evil"}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"headers":{"x":"y"}"}"#,
+        ] {
+            assert_eq!(
+                validate_request(Route::OpenAiChat, "fixture-model", bad.as_bytes()),
+                Err("REQUEST_INVALID"),
+                "body={bad}"
+            );
+        }
+        // Message-level credential key rejected (normalized casing).
+        let bad_msg = r#"{"model":"fixture-model","messages":[{"role":"user","content":"x","apiKey":"sk"}],"stream":true,"max_tokens":10}"#;
+        assert_eq!(
+            validate_request(Route::OpenAiChat, "fixture-model", bad_msg.as_bytes()),
+            Err("REQUEST_INVALID")
+        );
+        // Cost amplifiers and legacy function-calling shapes rejected.
+        for bad in [
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"n":2}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"best_of":2}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"functions":[]}"#,
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":10,"function_call":"auto"}"#,
+        ] {
+            assert_eq!(
+                validate_request(Route::OpenAiChat, "fixture-model", bad.as_bytes()),
+                Err("REQUEST_INVALID"),
+                "body={bad}"
+            );
+        }
+        // Message content stays text-only even though message keys are open.
+        let image_msg = r#"{"model":"fixture-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}],"stream":true,"max_tokens":10}"#;
+        assert_eq!(
+            validate_request(Route::OpenAiChat, "fixture-model", image_msg.as_bytes()),
+            Err("REQUEST_INVALID")
+        );
+
+        // Anthropic thinking / redacted_thinking blocks are accepted on assistant
+        // turns (they are replayed reasoning metadata).
+        let anthropic_ok = r#"{"model":"fixture-model","messages":[{"role":"user","content":"你好"},{"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"redacted_thinking","data":"abc"},{"type":"text","text":"你好"}]}],"stream":true,"max_tokens":2048}"#;
+        assert_eq!(
+            validate_request(
+                Route::AnthropicMessages,
+                "fixture-model",
+                anthropic_ok.as_bytes()
+            ),
+            Ok(())
         );
     }
 
@@ -2989,6 +4152,69 @@ mod tests {
             Route::from_wire("https://example.invalid"),
             Err("ROUTE_DENIED")
         );
+    }
+
+    #[test]
+    fn endpoint_appends_route_path_to_the_user_base_url_verbatim() {
+        // 用户填写的就是连接测试验证过的地址：接口路径直接追加，不自行补 /v1。
+        let cases = [
+            // (base, openai 结果, anthropic 结果)
+            (
+                "https://api.example.test/v1",
+                "https://api.example.test/v1/chat/completions",
+                "https://api.example.test/v1/messages",
+            ),
+            (
+                "https://api.example.test/v1/",
+                "https://api.example.test/v1/chat/completions",
+                "https://api.example.test/v1/messages",
+            ),
+            (
+                "https://api.example.test",
+                "https://api.example.test/chat/completions",
+                "https://api.example.test/messages",
+            ),
+            (
+                "https://open.bigmodel.cn/api/paas/v4",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                "https://open.bigmodel.cn/api/paas/v4/messages",
+            ),
+            (
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+                "https://ark.cn-beijing.volces.com/api/v3/messages",
+            ),
+            (
+                "http://127.0.0.1:11434/v1",
+                "http://127.0.0.1:11434/v1/chat/completions",
+                "http://127.0.0.1:11434/v1/messages",
+            ),
+        ];
+        for (base, openai, anthropic) in cases {
+            assert_eq!(
+                Route::OpenAiChat.endpoint_url(base),
+                Ok(openai.to_string()),
+                "openai base={base}"
+            );
+            assert_eq!(
+                Route::AnthropicMessages.endpoint_url(base),
+                Ok(anthropic.to_string()),
+                "anthropic base={base}"
+            );
+        }
+        for rejected in [
+            "ftp://api.example.test/v1",
+            "https://user:pw@api.example.test/v1",
+            "https://api.example.test/v1?x=1",
+            "https://api.example.test/v1#frag",
+            "not-a-url",
+        ] {
+            assert_eq!(
+                Route::OpenAiChat.endpoint_url(rejected),
+                Err("ROUTE_DENIED"),
+                "base={rejected}"
+            );
+        }
     }
 
     #[test]
@@ -3062,5 +4288,476 @@ mod tests {
             overlong.push(&vec![b'x'; super::MAX_SSE_LINE_BYTES + 1]),
             Err("STREAM_FAILED")
         );
+    }
+
+    // ---- A3-02 真实外发端到端验收（显式 opt-in，默认不跑） --------------------
+    //
+    // 该测试默认被 `#[ignore]`，不会进入任何默认门禁；仅当负责人显式提供真实
+    // provider 网关参数并手动运行 `cargo test -- --ignored real_provider` 时才执行。
+    // 参数全部来自环境变量，仓库内不含任何密钥：
+    //   TEACELL_A302_E2E_BASE_URL  例如 http://127.0.0.1:3425
+    //   TEACELL_A302_E2E_KEY       真实 API Key（仅存内存，绝不写入文件/stdio）
+    //   TEACELL_A302_E2E_MODEL     例如 opencode-zen-free/mimo-v2.6-flash-free
+    // 断言：
+    //   1) 真实 HttpGatewayTransport 拿到 200 且下发非空 SSE 流（含 data: 帧）；
+    //   2) 密钥与端点从不出现在任何回给 Host 的帧里（隐私边界）；
+    //   3) 关断传输对同一连接必须以 UPSTREAM_UNAVAILABLE 拒绝（默认安全）。
+    #[test]
+    #[ignore = "A3-02 real egress: requires TEACELL_A302_E2E_BASE_URL/KEY/MODEL and network access"]
+    fn real_provider_egress_streams_and_keeps_endpoint_and_key_off_stdio() {
+        use crate::services::agent_runtime::gateway::DisabledGatewayTransport;
+        use crate::services::agent_runtime::gateway_http::HttpGatewayTransport;
+
+        let (Ok(base_url), Ok(key), Ok(model)) = (
+            std::env::var("TEACELL_A302_E2E_BASE_URL"),
+            std::env::var("TEACELL_A302_E2E_KEY"),
+            std::env::var("TEACELL_A302_E2E_MODEL"),
+        ) else {
+            panic!(
+                "缺少 A3-02 真实外发参数：请设置 TEACELL_A302_E2E_BASE_URL / TEACELL_A302_E2E_KEY / TEACELL_A302_E2E_MODEL"
+            );
+        };
+
+        let connection_id = "connection_fixture_gateway_0001";
+        let conn = crate::db::init_memory().unwrap();
+        crate::db::ai_connections::upsert_with_limits(
+            &conn,
+            connection_id,
+            "A3-02 real provider",
+            "cloud",
+            "openai_chat",
+            &base_url,
+            &model,
+            Some(connection_id),
+            1,
+            60,
+            600,
+        )
+        .unwrap();
+        crate::db::ai_connections::bind_usage(&conn, "agent", connection_id).unwrap();
+        let db = Arc::new(Database::new(conn));
+        let credentials = Arc::new(FixtureCredentials::default());
+        credentials.save(connection_id, &key).unwrap();
+
+        let transport: Arc<dyn GatewayTransport> =
+            Arc::new(HttpGatewayTransport::new(Duration::from_secs(120), None).unwrap());
+        assert!(transport.enabled(), "真实传输应处于启用状态");
+        let broker = Arc::new(GatewayBroker::with_real_network(
+            "instance_0123456789abcdef".to_string(),
+            db,
+            credentials.clone(),
+            transport,
+            true,
+        ));
+        assert!(
+            broker.uses_real_network_transport(),
+            "真实 HTTP 传输必须上报为会走网络"
+        );
+
+        let run_id = "run_0123456789abcdef";
+        let conversation_id = "conversation_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let lease_id = lease["leaseId"].as_str().unwrap();
+
+        let mut open = broker_frame(1, "gateway.request.open", run_id, lease_id);
+        open["route"] = json!("openai_chat");
+        open["method"] = json!("POST");
+        let mut replies = vec![broker_exchange(&broker, open)];
+        assert_eq!(replies[0]["type"], "gateway.request.credit");
+
+        let body = format!(
+            "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"用一句话回答：你好\"}}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}},\"max_tokens\":64}}",
+            model
+        );
+        let body = body.into_bytes();
+        let mut chunk = broker_frame(2, "gateway.request.chunk", run_id, lease_id);
+        chunk["chunkSequence"] = json!(0);
+        chunk["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&body));
+        replies.push(broker_exchange(&broker, chunk));
+        assert_eq!(replies[1]["type"], "gateway.request.credit");
+
+        let mut commit = broker_frame(3, "gateway.request.commit", run_id, lease_id);
+        commit["chunkCount"] = json!(1);
+        commit["byteLength"] = json!(body.len());
+        // 真实外发走网络：3 秒离线预算不够，commit 要等真实上游首包。
+        replies.push(broker_exchange_within(&broker, commit, REAL_EGRESS_BUDGET));
+        assert_eq!(
+            replies[2]["type"], "gateway.response.head",
+            "真实 provider 未返回 head：{:#}",
+            replies[2]
+        );
+        let status = replies[2]["status"].as_u64().unwrap_or(0);
+        assert_eq!(status, 200, "真实 provider 返回非 200：{:#}", replies[2]);
+
+        // 拉取 SSE 流，直到 response.end 或耗尽；累计 payload 用于判定与隐私检查。
+        let mut streamed = Vec::<u8>::new();
+        let mut seq: u64 = 0;
+        let mut saw_sse = false;
+        loop {
+            let mut pull = broker_frame(4 + seq, "gateway.response.pull", run_id, lease_id);
+            pull["pullSequence"] = json!(seq);
+            // 真实上游按 token 回流，相邻帧的间隔可能远超 3 秒离线预算，
+            // 因此拉流同样必须使用真实外发预算而不是夹具预算。
+            let reply = broker_exchange_within(&broker, pull, REAL_EGRESS_BUDGET);
+            match reply["type"].as_str().unwrap_or("") {
+                "gateway.response.chunk" => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(reply["base64"].as_str().unwrap())
+                        .unwrap();
+                    if bytes.windows(5).any(|w| w == b"data:") {
+                        saw_sse = true;
+                    }
+                    streamed.extend_from_slice(&bytes);
+                    replies.push(reply);
+                }
+                "gateway.response.end" => {
+                    replies.push(reply);
+                    break;
+                }
+                "gateway.response.error" => {
+                    panic!("真实 provider 流式期间报错：{:#}", reply);
+                }
+                other => panic!("意外的拉取回应类型：{other}：{reply:#}"),
+            }
+            seq += 1;
+            assert!(seq < 10_000, "流式拉取次数异常");
+        }
+        assert!(saw_sse, "真实 provider 未下发 SSE 数据帧");
+        assert!(!streamed.is_empty(), "真实 provider 回流为空");
+
+        // 隐私边界：任何回给 Host 的帧都不得泄露 endpoint 或 key。
+        let wire = replies
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!wire.contains(&key), "密钥泄漏到 Host 帧！");
+        assert!(!wire.contains(&base_url), "端点泄漏到 Host 帧！");
+        assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+
+        broker.revoke_run(conversation_id, run_id);
+
+        // 默认安全：关断传输对同一连接必须拒绝外发。
+        let (disabled, _) = fixture_broker(Arc::new(DisabledGatewayTransport));
+        let lease = disabled.issue_run_lease(conversation_id, run_id).unwrap();
+        let rejected =
+            commit_fixture_request(&disabled, run_id, lease["leaseId"].as_str().unwrap());
+        assert_eq!(rejected["type"], "gateway.response.error");
+        assert_eq!(rejected["code"], "UPSTREAM_UNAVAILABLE");
+        assert!(
+            !disabled.uses_real_network_transport(),
+            "关断传输不得上报为会走网络"
+        );
+    }
+
+    // ---- A3-02 真实外发：错误 / 取消 / 限流 三个场景 -------------------------
+    //
+    // 与上一个测试同一套 opt-in 约定（`--ignored real_provider`）。它们补齐
+    // A3-02 卡面要求的「错误、取消、限流」实测，而不是只靠离线 fixture。
+    // 参数仍是 TEACELL_A302_E2E_BASE_URL / _KEY / _MODEL。
+
+    /// 读取真实外发参数；缺失时给出明确提示（仅 opt-in 测试调用）。
+    fn real_egress_params() -> (String, String, String) {
+        let (Ok(base_url), Ok(key), Ok(model)) = (
+            std::env::var("TEACELL_A302_E2E_BASE_URL"),
+            std::env::var("TEACELL_A302_E2E_KEY"),
+            std::env::var("TEACELL_A302_E2E_MODEL"),
+        ) else {
+            panic!(
+                "缺少 A3-02 真实外发参数：请设置 TEACELL_A302_E2E_BASE_URL / TEACELL_A302_E2E_KEY / TEACELL_A302_E2E_MODEL"
+            );
+        };
+        (base_url, key, model)
+    }
+
+    /// 用真实端点搭一个 broker；`requests_per_minute` 可用来压我们自己的限流门。
+    fn real_egress_broker(
+        base_url: &str,
+        key: &str,
+        model: &str,
+        requests_per_minute: i64,
+    ) -> (Arc<GatewayBroker>, Arc<FixtureCredentials>) {
+        use crate::services::agent_runtime::gateway_http::HttpGatewayTransport;
+
+        let connection_id = "connection_fixture_gateway_0001";
+        let conn = crate::db::init_memory().unwrap();
+        crate::db::ai_connections::upsert_with_limits(
+            &conn,
+            connection_id,
+            "A3-02 real provider",
+            "cloud",
+            "openai_chat",
+            base_url,
+            model,
+            Some(connection_id),
+            1,
+            requests_per_minute,
+            600,
+        )
+        .unwrap();
+        crate::db::ai_connections::bind_usage(&conn, "agent", connection_id).unwrap();
+        let db = Arc::new(Database::new(conn));
+        let credentials = Arc::new(FixtureCredentials::default());
+        credentials.save(connection_id, key).unwrap();
+        let transport: Arc<dyn GatewayTransport> =
+            Arc::new(HttpGatewayTransport::new(Duration::from_secs(120), None).unwrap());
+        let broker = Arc::new(GatewayBroker::with_real_network(
+            "instance_0123456789abcdef".to_string(),
+            db,
+            credentials.clone(),
+            transport,
+            true,
+        ));
+        (broker, credentials)
+    }
+
+    /// 真实外发单步等待预算：真实上游可能在数秒后才回头，3 秒离线预算不够。
+    const REAL_EGRESS_BUDGET: Duration = Duration::from_secs(180);
+
+    fn real_open_body(model: &str, prompt: &str) -> Vec<u8> {
+        format!(
+            "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}},\"max_tokens\":32}}",
+            model, prompt
+        )
+        .into_bytes()
+    }
+
+    /// 走到 commit 并返回 commit 的回应（head 或 error）。
+    fn real_commit(
+        broker: &Arc<GatewayBroker>,
+        run_id: &str,
+        lease_id: &str,
+        body: &[u8],
+    ) -> serde_json::Value {
+        let mut open = broker_frame(1, "gateway.request.open", run_id, lease_id);
+        open["route"] = json!("openai_chat");
+        open["method"] = json!("POST");
+        assert_eq!(
+            broker_exchange(broker, open)["type"],
+            "gateway.request.credit"
+        );
+
+        let mut chunk = broker_frame(2, "gateway.request.chunk", run_id, lease_id);
+        chunk["chunkSequence"] = json!(0);
+        chunk["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(body));
+        assert_eq!(
+            broker_exchange(broker, chunk)["type"],
+            "gateway.request.credit"
+        );
+
+        let mut commit = broker_frame(3, "gateway.request.commit", run_id, lease_id);
+        commit["chunkCount"] = json!(1);
+        commit["byteLength"] = json!(body.len());
+        broker_exchange_within(broker, commit, REAL_EGRESS_BUDGET)
+    }
+
+    /// 真实 provider 返回错误时，必须是结构化失败而不是静默换供应商或挂住。
+    ///
+    /// 用一个不存在的模型名制造上游错误：期望 commit 阶段就拿到
+    /// `gateway.response.error`（`UPSTREAM_HTTP` 带状态码，或 `UPSTREAM_UNAVAILABLE`），
+    /// 且错误帧里不得出现端点或密钥。
+    #[test]
+    #[ignore = "A3-02 real egress: requires TEACELL_A302_E2E_BASE_URL/KEY/MODEL and network access"]
+    fn real_provider_error_is_structured_and_keeps_secrets_off_stdio() {
+        let (base_url, key, model) = real_egress_params();
+        // 故意篡改模型名，确保上游不会 200。
+        let bogus_model = format!("{model}-definitely-not-a-model");
+        let (broker, _credentials) = real_egress_broker(&base_url, &key, &bogus_model, 60);
+
+        let conversation_id = "conversation_0123456789abcdef";
+        let run_id = "run_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let lease_id = lease["leaseId"].as_str().unwrap();
+
+        let body = real_open_body(&bogus_model, "hi");
+        let reply = real_commit(&broker, run_id, lease_id, &body);
+        assert_eq!(
+            reply["type"], "gateway.response.error",
+            "上游错误必须以结构化 error 返回，实际：{reply:#}"
+        );
+        let code = reply["code"].as_str().unwrap_or("");
+        assert!(
+            matches!(code, "UPSTREAM_HTTP" | "UPSTREAM_UNAVAILABLE"),
+            "上游错误码应为 UPSTREAM_HTTP 或 UPSTREAM_UNAVAILABLE，实际：{code}"
+        );
+        // 隐私边界同样适用于错误路径。
+        let wire = reply.to_string();
+        assert!(!wire.contains(&key), "密钥泄漏到错误帧！");
+        assert!(!wire.contains(&base_url), "端点泄漏到错误帧！");
+        broker.revoke_run(conversation_id, run_id);
+    }
+
+    /// 真实流式传输进行中取消：必须回 `gateway.request.cancelled`，
+    /// 且取消之后不再有正常分块。
+    #[test]
+    #[ignore = "A3-02 real egress: requires TEACELL_A302_E2E_BASE_URL/KEY/MODEL and network access"]
+    fn real_provider_stream_can_be_cancelled_mid_flight() {
+        let (base_url, key, model) = real_egress_params();
+        let (broker, _credentials) = real_egress_broker(&base_url, &key, &model, 60);
+
+        let conversation_id = "conversation_0123456789abcdef";
+        let run_id = "run_0123456789abcdef";
+        let lease = broker.issue_run_lease(conversation_id, run_id).unwrap();
+        let lease_id = lease["leaseId"].as_str().unwrap();
+
+        let body = real_open_body(&model, "请写一段较长的文字，便于中途取消");
+        let head = real_commit(&broker, run_id, lease_id, &body);
+        assert_eq!(
+            head["type"], "gateway.response.head",
+            "取消场景前置要求能拿到 head，实际：{head:#}"
+        );
+        assert_eq!(head["status"], 200);
+
+        // 拉一到两块，然后立刻取消。
+        let mut pulled = 0;
+        loop {
+            let mut pull = broker_frame(4 + pulled, "gateway.response.pull", run_id, lease_id);
+            pull["pullSequence"] = json!(pulled);
+            let reply = broker_exchange_within(&broker, pull, REAL_EGRESS_BUDGET);
+            match reply["type"].as_str().unwrap_or("") {
+                "gateway.response.chunk" => {
+                    pulled += 1;
+                    if pulled >= 1 {
+                        break;
+                    }
+                }
+                "gateway.response.end" => break,
+                other => panic!("取消前置：意外的回应 {other}: {reply:#}"),
+            }
+        }
+
+        let cancel = broker_frame(90, "gateway.request.cancel", run_id, lease_id);
+        let cancelled = broker_exchange_within(&broker, cancel, REAL_EGRESS_BUDGET);
+        assert_eq!(
+            cancelled["type"], "gateway.request.cancelled",
+            "取消必须回 gateway.request.cancelled，实际：{cancelled:#}"
+        );
+
+        // 取消后继续拉，不应再出现正常 chunk（只能是 error / end 或直接失败）。
+        let mut pull = broker_frame(91, "gateway.response.pull", run_id, lease_id);
+        pull["pullSequence"] = json!(pulled);
+        let after = broker_exchange_within(&broker, pull, REAL_EGRESS_BUDGET);
+        let after_type = after["type"].as_str().unwrap_or("");
+        assert!(
+            after_type != "gateway.response.chunk",
+            "取消之后不应再下发正常数据块，实际：{after:#}"
+        );
+        broker.revoke_run(conversation_id, run_id);
+    }
+
+    /// 我们自己的请求额度门（每分 1 次）：第二个请求必须被本地限流拒绝，
+    /// 而不是被静默放行到上游。
+    #[test]
+    #[ignore = "A3-02 real egress: requires TEACELL_A302_E2E_BASE_URL/KEY/MODEL and network access"]
+    fn real_provider_requests_are_gated_by_our_own_rate_limit() {
+        let (base_url, key, model) = real_egress_params();
+        // 每分钟只允许 1 次，第二个请求必然等待超时或被拒。
+        let (broker, _credentials) = real_egress_broker(&base_url, &key, &model, 1);
+
+        let conversation_id = "conversation_0123456789abcdef";
+        let lease = broker
+            .issue_run_lease(conversation_id, "run_0123456789abcdef")
+            .unwrap();
+        let lease_id = lease["leaseId"].as_str().unwrap();
+
+        // 第一请求占满额度。
+        // 第一请求占满额度。额度门在 open 阶段就会判定，因此这里只断言
+        // 「第一个请求被放行到上游」（credit 继续 + commit 给出 head），
+        // 而把「第二个请求被拒」留给下面的断言。
+        let body = real_open_body(&model, "第一个请求");
+        let first = real_commit(&broker, "run_0123456789abcdef", lease_id, &body);
+        assert_eq!(
+            first["type"], "gateway.response.head",
+            "第一请求应被完整放行（额度未满时不得被限流），实际：{first:#}"
+        );
+        assert_eq!(
+            first["status"], 200,
+            "第一请求 head 状态码应为 200：{first:#}"
+        );
+
+        // 第二请求：额度已耗尽，必须在本地就被拒绝，且错误码明确是额度类问题。
+        let body2 = real_open_body(&model, "第二个请求");
+        let lease2 = broker
+            .issue_run_lease(conversation_id, "run_0123456789abcdea")
+            .unwrap();
+        let lease2_id = lease2["leaseId"].as_str().unwrap();
+
+        let mut open2 = broker_frame(
+            11,
+            "gateway.request.open",
+            "run_0123456789abcdea",
+            lease2_id,
+        );
+        // 每个 attempt 的 gatewayRequestId 必须严格递增（base36 序号），
+        // 否则 broker 以 REQUEST_INVALID 拒绝，永远走不到额度门。
+        open2["gatewayRequestId"] = json!(format!(
+            "gateway_attempt_2_{}",
+            &"instance_0123456789abcdef"[..12]
+        ));
+        open2["route"] = json!("openai_chat");
+        open2["method"] = json!("POST");
+        let second_open = broker_exchange_within(&broker, open2, REAL_EGRESS_BUDGET);
+        assert_eq!(
+            second_open["type"], "gateway.request.credit",
+            "第二请求的 open 阶段不设额度门（额度在 commit 前统一获取），应拿到 credit，实际：{second_open:#}"
+        );
+        let second_id = "gateway_attempt_2_instance_012";
+        let mut chunk2 = broker_frame(
+            12,
+            "gateway.request.chunk",
+            "run_0123456789abcdea",
+            lease2_id,
+        );
+        chunk2["gatewayRequestId"] = json!(second_id);
+        chunk2["chunkSequence"] = json!(0);
+        chunk2["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&body2));
+        assert_eq!(
+            broker_exchange_within(&broker, chunk2, REAL_EGRESS_BUDGET)["type"],
+            "gateway.request.credit"
+        );
+        let mut commit2 = broker_frame(
+            13,
+            "gateway.request.commit",
+            "run_0123456789abcdea",
+            lease2_id,
+        );
+        commit2["gatewayRequestId"] = json!(second_id);
+        commit2["chunkCount"] = json!(1);
+        commit2["byteLength"] = json!(body2.len());
+
+        // 额度门是「等待型」：额度/速率耗尽时，第二请求不会静默放行到上游，
+        // 而是阻塞在 acquire_until_owned 直到 run deadline 才以 TIMEOUT 结束。
+        // run deadline 远长于本地预算，因此这里用较短预算去证明「这段窗口内
+        // 它确实没有被放行」——被放行（拿到 head）才是不变量被破坏。
+        //
+        // 注意超时是通过 broker_exchange_within 内部的 recv_timeout(...).unwrap()
+        // panic 暴露的，所以下面 catch_unwind 接住的 Err 正是「窗口内无回应」。
+        let short_budget = Duration::from_secs(15);
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broker_exchange_within(&broker, commit2, short_budget)
+        }));
+        match blocked {
+            Ok(reply) => {
+                // 若额度门即时拒绝，也只会是结构化错误；出现 head 才是缺陷。
+                assert_ne!(
+                    reply["type"], "gateway.response.head",
+                    "额度/速率耗尽时第二请求竟然被放行到上游拿到 head：{reply:#}"
+                );
+                let code = reply["code"].as_str().unwrap_or("");
+                assert!(
+                    matches!(
+                        code,
+                        "TIMEOUT" | "CANCELLED" | "REQUEST_LIMIT" | "BUDGET_EXCEEDED"
+                    ),
+                    "第二请求被拒时的错误码应为额度类，实际：{code}"
+                );
+            }
+            Err(_) => {
+                // 15 秒内没有任何回应 = 正在额度门上等待，正是期望行为。
+                eprintln!("A3-02 限流：第二请求在 15 秒窗口内被阻塞在额度门（未放行），符合预期");
+            }
+        }
+        broker.revoke_run(conversation_id, "run_0123456789abcdef");
+        broker.revoke_run(conversation_id, "run_0123456789abcdea");
     }
 }

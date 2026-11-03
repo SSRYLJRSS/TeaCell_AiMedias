@@ -91,6 +91,19 @@ describe("SideBar 标签区（FB4-02）", () => {
     expect(getHeader().className).not.toContain("overflow-y-auto");
   });
 
+  /**
+   * M-11 真机补证（960×640，真实安装包）：收起态的悬浮助手入口是 fixed 浮层、停在左下，
+   * 它压在筛选树上时最后一行永远点不到。真机复验还证明只给滚动内容加内边距不够——默认滚动
+   * 位置的行仍落在入口底下，所以安全区必须由 aside 容器承担（滚动可视区整体上移）。
+   */
+  it("左侧栏容器留出悬浮入口安全区，任何滚动位置最后一行都不在入口底下（M-11）", () => {
+    render(<SideBar />);
+    const panel = screen.getByTestId("library-side-panel");
+    expect(panel.className).toContain("pb-32");
+    // 安全区不能改成滚动内容里的内边距：那样滚到底只是多一段空白，默认位置仍被遮挡。
+    expect(screen.getByTestId("library-tag-scroll").className).not.toContain("pb-32");
+  });
+
   it("智能标签 / 文件属性切换正常", () => {
     render(<SideBar />);
     expect(screen.getByTestId("tag-tree")).toBeInTheDocument();

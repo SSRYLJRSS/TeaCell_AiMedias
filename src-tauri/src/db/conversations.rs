@@ -84,7 +84,7 @@ pub(super) fn migrate_structure(conn: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS conversation_links (
             conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id)
                 ON DELETE CASCADE,
-            link_kind TEXT NOT NULL CHECK(link_kind IN ('plan','operation','batch')),
+            link_kind TEXT NOT NULL CHECK(link_kind IN ('plan','operation','batch','selection')),
             link_ref TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             PRIMARY KEY(conversation_id, link_kind, link_ref),
@@ -92,6 +92,40 @@ pub(super) fn migrate_structure(conn: &Connection) -> AppResult<()> {
         );
         ",
     )?;
+    // A3-08: a handed-off library selection is a first-class link so the assistant
+    // can show the exact collection that was handed over. Widening the CHECK
+    // constraint needs the table rebuild pattern used elsewhere (SQLite cannot
+    // ALTER a CHECK). The guard keeps re-running this on an already-migrated
+    // database a no-op.
+    let needs_selection_link = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_links'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .is_some_and(|sql| !sql.contains("'selection'"));
+    if needs_selection_link {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE conversation_links RENAME TO conversation_links_previous;
+             CREATE TABLE conversation_links (
+                conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id)
+                    ON DELETE CASCADE,
+                link_kind TEXT NOT NULL CHECK(link_kind IN ('plan','operation','batch','selection')),
+                link_ref TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(conversation_id, link_kind, link_ref),
+                UNIQUE(link_kind, link_ref)
+             );
+             INSERT INTO conversation_links(conversation_id, link_kind, link_ref, created_at)
+                SELECT conversation_id, link_kind, link_ref, created_at
+                  FROM conversation_links_previous;
+             DROP TABLE conversation_links_previous;",
+        )?;
+        tx.commit()?;
+    }
     Ok(())
 }
 

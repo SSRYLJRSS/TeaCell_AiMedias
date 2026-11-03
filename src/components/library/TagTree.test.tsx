@@ -5,7 +5,7 @@
  *  - 空树按钮隐藏；按钮只改展开状态，不改选中筛选。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import TagTree from "@/components/library/TagTree";
 import { useTagStore } from "@/stores/tagStore";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -66,8 +66,8 @@ beforeEach(() => {
 });
 
 describe("TagTree 分面折叠（与文件属性统一）", () => {
-  it("默认收起分面，标题行可全部展开再全部收起", () => {
-    render(<TagTree />);
+  it("默认收起分面，标题行可全部展开再全部收起", async () => {
+    await act(async () => { render(<TagTree />); });
     expect(screen.getByText("智能标签")).toBeInTheDocument();
     expect(screen.queryByText("人像")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
@@ -76,8 +76,8 @@ describe("TagTree 分面折叠（与文件属性统一）", () => {
     expect(screen.queryByText("人像")).not.toBeInTheDocument();
   });
 
-  it("分面标题可独立收起，且标签树节点仍可展开", () => {
-    render(<TagTree />);
+  it("分面标题可独立收起，且标签树节点仍可展开", async () => {
+    await act(async () => { render(<TagTree />); });
     fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     fireEvent.click(screen.getByRole("button", { name: "标签" }));
     expect(screen.queryByText("人像")).not.toBeInTheDocument();
@@ -86,25 +86,36 @@ describe("TagTree 分面折叠（与文件属性统一）", () => {
     expect(screen.getByText("特写")).toBeVisible();
   });
 
-  it("标签项使用无圆角的连续列表样式", () => {
-    render(<TagTree />);
+  it("标签项使用无圆角的连续列表样式", async () => {
+    await act(async () => { render(<TagTree />); });
     fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     expect(screen.getByText("人像").closest("button")).toHaveClass("ui-nav-list-item");
   });
 
-  it("空树时展开控制按钮隐藏", () => {
+  it("空树时展开控制按钮隐藏", async () => {
     useTagStore.setState({ tree: [], expanded: new Set() });
-    render(<TagTree />);
+    await act(async () => { render(<TagTree />); });
     expect(screen.queryByRole("button", { name: "全部展开" })).toBeNull();
     expect(screen.queryByRole("button", { name: "全部收起" })).toBeNull();
     expect(screen.getByText("智能标签")).toBeInTheDocument();
   });
 
-  it("点击全局按钮不改变选中筛选", () => {
-    render(<TagTree />);
+  it("点击全局按钮不改变选中筛选", async () => {
+    await act(async () => { render(<TagTree />); });
     fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     const { filter } = useLibraryStore.getState();
     expect(filter.facetFilters).toEqual([]);
     expect(filter.untaggedOnly).toBe(false);
+  });
+
+  // M-13：长中文标签在窄侧栏里会被 truncate，必须能 hover 看到全量
+  it("标签行带 title 全量提示，长中文标签被截断后仍可看到完整内容", async () => {
+    await act(async () => { render(<TagTree />); });
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
+    expect(screen.getByText("人像").closest("button")).toHaveAttribute("title", "人像");
+    expect(screen.getByText("风景").closest("button")).toHaveAttribute("title", "风景");
+    // 子节点同样带全量提示
+    fireEvent.click(screen.getAllByRole("button", { name: "展开" })[0]);
+    expect(screen.getByText("特写").closest("button")).toHaveAttribute("title", "特写");
   });
 });

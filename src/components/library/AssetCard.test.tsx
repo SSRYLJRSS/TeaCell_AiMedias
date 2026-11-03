@@ -8,7 +8,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import AssetCard from "@/components/library/AssetCard";
-import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import { useSettingsStore, DEFAULT_APPEARANCE, DEFAULT_NAVIGATION } from "@/stores/settingsStore";
 import type { Settings } from "@/types/settings";
 import type { Asset } from "@/types/asset";
 
@@ -97,6 +97,7 @@ function mkMinimalSettings(): Settings {
     customDownloadSources: [],
     modelDownloadProxy: "",
     appearance: DEFAULT_APPEARANCE,
+    navigation: DEFAULT_NAVIGATION,
   };
 }
 
@@ -437,5 +438,24 @@ describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () 
       expect((screen.getByRole("button") as HTMLElement).style.borderRadius).toBe("");
       expect(container.querySelector(".ui-colorstrip")).toBeNull();
     });
+  });
+
+  // M-13：超长中文文件名只能截断显示，必须能 hover 看到全量，否则用户无法确认是哪个文件
+  it("hover 文件名层带 title 全量提示，超长中文文件名不被截断后失去可读途径", () => {
+    const longName = "旅行-2026-秋-第一天-上午-这是一个非常非常长的中文文件名用来验证截断后仍可读.png";
+    render(
+      <AssetCard
+        asset={mkAsset({ fileName: longName } as Partial<Asset>)}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    const hoverLayer = screen.getByTitle(longName);
+    expect(hoverLayer).toBeInTheDocument();
+    expect(hoverLayer.className).toContain("truncate");
   });
 });

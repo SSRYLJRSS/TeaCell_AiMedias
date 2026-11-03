@@ -98,6 +98,9 @@ pub fn reset_db(
     // 先完成；若同时勾选原文件，commands 层会关闭此全表分支以保留删除失败的记录。
     if sel.assets {
         tx.execute("DELETE FROM video_proxies", [])?;
+        // Agent selection snapshots point at asset rows; they must not survive the
+        // rows they describe and then be re-used as plan targets.
+        tx.execute("DELETE FROM agent_selections", [])?;
         tx.execute("DELETE FROM assets", [])?;
         report.assets_deleted = tx.changes() as i64;
     }
